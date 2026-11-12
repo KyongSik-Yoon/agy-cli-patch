@@ -757,6 +757,14 @@ fn resolve_banner(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
     }
 }
 
+/// 릴리즈 노트 본문. `release-notes` 패치(배너 주입)와 `--notes` 출력이 같은 문구를 쓴다.
+fn release_notes_text() -> String {
+    format!(
+        " \x1b[1mWhat's new in agy-cli-patch v{}:\x1b[0m\n \x1b[32m•\x1b[0m \x1b[1mbatch\x1b[0m: instant full render on completion\n \x1b[32m•\x1b[0m \x1b[1mnodrip\x1b[0m: zero typing delay (16ms removed)\n \x1b[32m•\x1b[0m \x1b[1mmarkdown\x1b[0m: clean H2-H6 headings & CJK bold fix\n \x1b[90mGitHub: https://github.com/KyongSik-Yoon/agy-cli-patch\x1b[0m\n \x1b[90mAccount: KyongSik-Yoon <sam1287@gmail.com>\x1b[0m",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
 fn resolve_release_notes(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
     match ctx.arch {
         Arch::X86_64 => {
@@ -764,10 +772,7 @@ fn resolve_release_notes(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
             let (concat3_start, _) = ctx.get_func("runtime.concatstring3")?;
             let cave_offset = find_cave(ctx)?;
 
-            let notes = format!(
-                "\n\n \x1b[1mWhat's new in agy-cli-patch v{}:\x1b[0m\n \x1b[32m•\x1b[0m \x1b[1mbatch\x1b[0m: instant full render on completion\n \x1b[32m•\x1b[0m \x1b[1mnodrip\x1b[0m: zero typing delay (16ms removed)\n \x1b[32m•\x1b[0m \x1b[1mmarkdown\x1b[0m: clean H2-H6 headings & CJK bold fix\n \x1b[90mGitHub: https://github.com/KyongSik-Yoon/agy-cli-patch\x1b[0m\n \x1b[90mAccount: KyongSik-Yoon <sam1287@gmail.com>\x1b[0m",
-                env!("CARGO_PKG_VERSION")
-            ).into_bytes();
+            let notes = format!("\n\n{}", release_notes_text()).into_bytes();
 
             let notes_va = cave_offset + CAVE_NOTES_OFF;
             let notes_len = notes.len();
@@ -1278,6 +1283,7 @@ fn print_help() {
   agy-cli-patch --preset                  기본 프리셋 2종(agy-batch, agy-nodrip) 일괄 생성
   agy-cli-patch -p all --in-place         원본 백업(antigravity.orig) 후 기본 agy에 직접 적용
   agy-cli-patch --restore                 antigravity.orig 백업에서 원본 복구
+  agy-cli-patch --notes                   패치 릴리즈 노트 출력
 
 옵션:
   --bin <경로>       원본 antigravity 바이너리 경로 직접 지정 (미지정 시 자동 탐색)
@@ -1286,6 +1292,7 @@ fn print_help() {
   --preset           프롬프트 없이 agy-batch와 agy-nodrip 생성
   --in-place         원본 백업 후 기본 바이너리 덮어쓰기
   --restore          --in-place 백업 복구
+  --notes            패치 릴리즈 노트 출력 (agy 화면에 넣으려면 -p all,release-notes)
   -h, --help         도움말 출력"
     );
 }
@@ -1307,6 +1314,10 @@ fn run() -> Result<(), String> {
                 return Ok(());
             }
             "--list" | "-l" => list_mode = true,
+            "--notes" => {
+                println!("{}", release_notes_text());
+                return Ok(());
+            }
             "--preset" => preset_mode = true,
             "--in-place" => in_place = true,
             "--restore" => restore_mode = true,

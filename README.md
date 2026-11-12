@@ -53,6 +53,9 @@ agy-cli-patch -p all -o agy-batch
 # 릴리즈 노트 배너까지 포함
 agy-cli-patch -p all,release-notes -o agy-batch
 
+# 릴리즈 노트를 터미널에서 확인 (바이너리는 건드리지 않음)
+agy-cli-patch --notes
+
 # 일괄 출력(batch)만 빼고 나머지 패치를 적용해 agy-nodrip 생성
 agy-cli-patch -p nodrip,heading,cjk-bold,tilde-strike,banner -o agy-nodrip
 
