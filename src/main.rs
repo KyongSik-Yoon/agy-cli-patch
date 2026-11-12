@@ -954,6 +954,20 @@ fn which_in_path(cmd: &str) -> Option<PathBuf> {
     None
 }
 
+fn binary_version(path: &Path) -> String {
+    Command::new(path)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.lines().next().map(|l| l.trim().to_string()))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "확인 불가".to_string())
+}
+
 fn detect_default_binary() -> PathBuf {
     let home = env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
     let mut candidates = Vec::new();
@@ -1326,6 +1340,13 @@ fn run() -> Result<(), String> {
     } else {
         target_bin.clone()
     };
+
+    // mise 설치 디렉토리명(예: 1.5.6)은 agy 자체 업데이트 후 실제 버전과 어긋날 수 있으므로
+    // 바이너리가 보고하는 버전을 함께 출력한다.
+    println!("[*] 대상 바이너리: {} (버전 {})", target_bin.display(), binary_version(&target_bin));
+    if src_bin != target_bin {
+        println!("[*] 패치 원본:     {} (버전 {})", src_bin.display(), binary_version(&src_bin));
+    }
 
     let mmap = MmapFile::open(&src_bin)?;
     let ctx = BinaryContext::parse(mmap.as_slice())?;
