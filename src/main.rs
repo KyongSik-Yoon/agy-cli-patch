@@ -677,7 +677,7 @@ fn resolve_tilde_strike(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
 
 // banner / release-notes 패치가 공유하는 0xcc 패딩 공간(cave) 배치.
 // 두 패치를 따로 적용해도 겹치지 않도록 고정 오프셋을 쓴다.
-const CAVE_MIN: usize = 512;
+const CAVE_MIN: usize = 1024;
 const CAVE_CHAN_OFF: usize = 0; // "patch v{ver}" (≤ 32바이트)
 const CAVE_NOTES_OFF: usize = 64; // 릴리즈 노트 문자열 + 트램펄린
 
@@ -759,10 +759,24 @@ fn resolve_banner(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
 
 /// 릴리즈 노트 본문. `release-notes` 패치(배너 주입)와 `--notes` 출력이 같은 문구를 쓴다.
 fn release_notes_text() -> String {
-    format!(
-        " \x1b[1mWhat's new in agy-cli-patch v{}:\x1b[0m\n \x1b[32m•\x1b[0m \x1b[1mbatch\x1b[0m: instant full render on completion\n \x1b[32m•\x1b[0m \x1b[1mnodrip\x1b[0m: zero typing delay (16ms removed)\n \x1b[32m•\x1b[0m \x1b[1mmarkdown\x1b[0m: clean H2-H6 headings & CJK bold fix\n \x1b[90mGitHub: https://github.com/KyongSik-Yoon/agy-cli-patch\x1b[0m\n \x1b[90mAccount: KyongSik-Yoon <sam1287@gmail.com>\x1b[0m",
+    const ITEMS: &[(&str, &str)] = &[
+        ("nodrip", "instant streaming (16ms typewriter drip removed)"),
+        ("batch", "full answer rendered at once on completion"),
+        ("heading", "'##' prefixes hidden on H2-H6"),
+        ("cjk-bold", "**bold** kept before Korean particles"),
+        ("tilde-strike", "only '~~' strikes through, single '~' stays"),
+        ("banner", "patch version shown next to the product name"),
+    ];
+    let mut out = format!(
+        " \x1b[1mWhat's new in agy-cli-patch v{}:\x1b[0m",
         env!("CARGO_PKG_VERSION")
-    )
+    );
+    for (id, desc) in ITEMS {
+        out.push_str(&format!("\n \x1b[32m•\x1b[0m \x1b[1m{id}\x1b[0m: {desc}"));
+    }
+    out.push_str("\n \x1b[90mGitHub: https://github.com/KyongSik-Yoon/agy-cli-patch\x1b[0m");
+    out.push_str("\n \x1b[90mAccount: KyongSik-Yoon <sam1287@gmail.com>\x1b[0m");
+    out
 }
 
 fn resolve_release_notes(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
