@@ -706,8 +706,13 @@ fn resolve_banner(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
             // 트램펄린 루틴 생성:
             // lea notes(%rip), %r8
             // mov $notes_len, %r9d
-            // call concatstring3
-            // ret
+            // jmp concatstring3   (tail call)
+            //
+            // call 이 아니라 jmp 여야 한다. call 로 들어가면 concatstring3 의 리턴 주소가
+            // pclntab 에 없는 동굴(cave)을 가리켜 GC/스택 확장 시 Go 언와인더가 실패하고,
+            // morestack 경로의 레지스터 인자 스필(SP+8~)이 트램펄린의 리턴 주소를 덮어쓴다.
+            // tail jmp 면 BuildHeader 가 concatstring3 를 직접 호출한 것과 동일한 프레임이 된다
+            // (BuildHeader 의 outgoing 인자 영역은 7워드 스필을 충분히 수용함).
             let mut tramp = Vec::new();
             let pc = tramp_va + 7;
             let disp = (notes_va as i64) - (pc as i64);
@@ -719,10 +724,8 @@ fn resolve_banner(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
 
             let pc = tramp_va + tramp.len() + 5;
             let rel_c3 = (concat3_start as i64) - (pc as i64);
-            tramp.push(0xe8);
+            tramp.push(0xe9);
             tramp.extend_from_slice(&(rel_c3 as i32).to_le_bytes());
-
-            tramp.push(0xc3);
 
             let mut edits = Vec::new();
 
@@ -783,6 +786,7 @@ fn resolve_banner(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
             for i in 0..bwi_body.len().saturating_sub(55) {
                 if &bwi_body[i..i + 5] == &[0x48, 0x85, 0xd2, 0x0f, 0x84]
                     && &bwi_body[i + 9..i + 17] == &[0x48, 0x89, 0x9c, 0x24, 0xb0, 0x02, 0x00, 0x00]
+                    && &bwi_body[i + 17..i + 21] == &[0x48, 0x89, 0x84, 0x24]
                 {
                     bwi_matches.push(bwi_start + i);
                 }
@@ -796,8 +800,12 @@ fn resolve_banner(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
             let chan_site = bwi_matches[0];
             let chan_site_end = chan_site + 55;
 
-            let mut chan_patch = Vec::new();
-            let pc = chan_site + 7;
+            // 원본은 채널 분기 진입 시 제품명 문자열(rax=ptr, rbx=len)을 스택 슬롯에 저장하고,
+            // Sprintf 이후 그 슬롯을 다시 읽어 concatstring2 로 이어 붙인다.
+            // 이 두 저장(mov %rbx,0x2b0(%rsp) / mov %rax,0x320(%rsp))을 건너뛰면
+            // 초기화되지 않은 슬롯을 이어 붙이다 SIGSEGV 가 나므로 그대로 보존한다.
+            let mut chan_patch = ctx.data[chan_site + 9..chan_site + 25].to_vec();
+            let pc = chan_site + chan_patch.len() + 7;
             let disp_chan = (chan_va as i64) - (pc as i64);
             chan_patch.extend_from_slice(&[0x48, 0x8d, 0x0d]);
             chan_patch.extend_from_slice(&(disp_chan as i32).to_le_bytes());
