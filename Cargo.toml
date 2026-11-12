@@ -1,8 +1,10 @@
 [package]
-name = "agy-patch"
-version = "0.1.0"
+name = "agy-cli-patch"
+version = "0.2.0"
 edition = "2021"
+authors = ["KyongSik-Yoon <sam1287@gmail.com>"]
 description = "Modular dynamic binary patcher for Antigravity CLI (agy)"
+repository = "https://github.com/KyongSik-Yoon/agy-cli-patch"
 license = "MIT"
 
 [profile.release]

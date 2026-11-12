@@ -1,4 +1,4 @@
-# agy-patch
+# agy-cli-patch
 
 `agy`(Antigravity CLI — **Linux & macOS**, **x86_64 & ARM64/Apple Silicon**) 바이너리의 스트리밍 출력 방식과 마크다운 렌더링 결함을 동적 심볼/시그니처 탐색으로 패치하는 초고속 모듈형 도구(Rust)입니다.
 
@@ -13,16 +13,17 @@
 | `heading` | `render.glamourStyleForScheme` | 마크다운 헤딩(`H2`~`H6`) 앞에 붙는 `## `~`###### ` 프리픽스를 숨기고 색상·볼드만 유지 |
 | `cjk-bold` | `goldmark/parser.ScanDelimiter` | `` **"문구"**라는 ``, `` **용어(`code`)**는 ``처럼 닫는 `**` 앞 구두점과 뒤 한글 조사가 결합될 때 볼드가 풀리는 현상 수정 |
 | `tilde-strike` | `goldmark/extension.(*strikethroughParser).Parse` | `1.5.0~1.5.6`, `H2~H6` 같은 범위 표기용 단일 물결표(`~`)에 취소선이 그어지는 현상 방지 (`~~` 2개만 취소선으로 인식) |
+| `banner` | `render.BuildHeader` | 상단 로고 배너 영역에 패치 버전, 기능 릴리즈 노트 및 GitHub 저장소 정보 표시 (`x86_64`) |
 
 ## 빌드 및 설치
 
-외부 의존성이 없으므로 Rust 툴체인만 있으면 인터넷 연결 없이도 1초 내에 빌드됩니다.
+외부 의존성이 없으므로 Rust 툴체인만 있으면 인터넷 연결 없이도 빠르게 빌드됩니다.
 
 ```bash
-git clone <저장소-URL>
-cd agy-patch
+git clone https://github.com/KyongSik-Yoon/agy-cli-patch.git
+cd agy-cli-patch
 cargo build --release
-ln -sf "$(pwd)/target/release/agy-patch" ~/.local/bin/agy-patch
+ln -sf "$(pwd)/target/release/agy-cli-patch" ~/.local/bin/agy-cli-patch
 ```
 
 또는 `cargo install --path .`로 설치할 수 있습니다.
@@ -34,7 +35,7 @@ ln -sf "$(pwd)/target/release/agy-patch" ~/.local/bin/agy-patch
 터미널에서 인자 없이 실행하면 화살표/스페이스바/숫자키로 원하는 패치만 골라 체크하고, 생성할 실행 파일 이름까지 직접 입력할 수 있습니다.
 
 ```bash
-agy-patch
+agy-cli-patch
 ```
 
 ### 2. CLI 옵션 모드
@@ -43,26 +44,26 @@ agy-patch
 
 ```bash
 # 사용 가능한 패치 ID 및 설명 확인
-agy-patch --list
+agy-cli-patch --list
 
 # 모든 패치를 적용해 agy-batch 생성
-agy-patch -p all -o agy-batch
+agy-cli-patch -p all -o agy-batch
 
 # 일괄 출력(batch)만 빼고 나머지 패치를 적용해 agy-nodrip 생성
-agy-patch -p nodrip,heading,cjk-bold,tilde-strike -o agy-nodrip
+agy-cli-patch -p nodrip,heading,cjk-bold,tilde-strike,banner -o agy-nodrip
 
 # 마크다운 패치 3종만 적용해 agy-md 생성
-agy-patch -p heading,cjk-bold,tilde-strike -o agy-md
+agy-cli-patch -p heading,cjk-bold,tilde-strike -o agy-md
 
 # 기본 프리셋 2종(agy-batch, agy-nodrip) 한 번에 갱신
-agy-patch --preset
+agy-cli-patch --preset
 
 # 원본 바이너리 경로를 직접 지정할 때
-agy-patch --bin /path/to/antigravity -p all -o agy-batch
+agy-cli-patch --bin /path/to/antigravity -p all -o agy-batch
 
 # 원본을 antigravity.orig로 백업하고 기본 agy 바이너리에 직접 덮어쓰기 / 복구
-agy-patch -p all --in-place
-agy-patch --restore
+agy-cli-patch -p all --in-place
+agy-cli-patch --restore
 ```
 
 ## 새로운 패치 추가하기

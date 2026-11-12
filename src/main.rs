@@ -289,6 +289,9 @@ impl<'a> BinaryContext<'a> {
             "render.glamourStyleForScheme",
             "parser.ScanDelimiter",
             "extension.(*strikethroughParser).Parse",
+            "render.BuildHeader",
+            "render.BannerWithInfo",
+            "runtime.concatstring3",
         ];
 
         let mut funcs = HashMap::with_capacity(target_suffixes.len());
@@ -672,6 +675,156 @@ fn resolve_tilde_strike(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
     }
 }
 
+fn resolve_banner(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
+    match ctx.arch {
+        Arch::X86_64 => {
+            let (bh_start, bh_end) = ctx.get_func("render.BuildHeader")?;
+            let (bwi_start, bwi_end) = ctx.get_func("render.BannerWithInfo")?;
+            let (concat3_start, _) = ctx.get_func("runtime.concatstring3")?;
+
+            // 1. 실행 파일 내 미사용 0xcc 패딩 공간(512바이트 이상) 탐색
+            let needle = [0xccu8; 512];
+            let cave_offset = ctx
+                .data
+                .windows(needle.len())
+                .position(|w| w == needle)
+                .ok_or_else(|| "실행 파일 내 0xcc 여유 공간(512바이트)을 찾을 수 없습니다.".to_string())?;
+
+            let version = env!("CARGO_PKG_VERSION");
+            let notes = format!(
+                "\n\n \x1b[1mWhat's new in agy-cli-patch v{}:\x1b[0m\n \x1b[32m•\x1b[0m \x1b[1mbatch\x1b[0m: instant full render on completion\n \x1b[32m•\x1b[0m \x1b[1mnodrip\x1b[0m: zero typing delay (16ms removed)\n \x1b[32m•\x1b[0m \x1b[1mmarkdown\x1b[0m: clean H2-H6 headings & CJK bold fix\n \x1b[90mGitHub: https://github.com/KyongSik-Yoon/agy-cli-patch\x1b[0m\n \x1b[90mAccount: KyongSik-Yoon <sam1287@gmail.com>\x1b[0m",
+                version
+            ).into_bytes();
+
+            let chan = format!("v{}", version).into_bytes();
+
+            let notes_va = cave_offset;
+            let notes_len = notes.len();
+            let tramp_va = notes_va + notes_len + 32;
+            let chan_va = tramp_va + 32;
+
+            // 트램펄린 루틴 생성:
+            // lea notes(%rip), %r8
+            // mov $notes_len, %r9d
+            // call concatstring3
+            // ret
+            let mut tramp = Vec::new();
+            let pc = tramp_va + 7;
+            let disp = (notes_va as i64) - (pc as i64);
+            tramp.extend_from_slice(&[0x4c, 0x8d, 0x05]);
+            tramp.extend_from_slice(&(disp as i32).to_le_bytes());
+
+            tramp.extend_from_slice(&[0x41, 0xb9]);
+            tramp.extend_from_slice(&(notes_len as u32).to_le_bytes());
+
+            let pc = tramp_va + tramp.len() + 5;
+            let rel_c3 = (concat3_start as i64) - (pc as i64);
+            tramp.push(0xe8);
+            tramp.extend_from_slice(&(rel_c3 as i32).to_le_bytes());
+
+            tramp.push(0xc3);
+
+            let mut edits = Vec::new();
+
+            // 릴리즈 노트 문자열 주입
+            edits.push(ByteEdit {
+                offset: notes_va,
+                payload: notes,
+            });
+
+            // 트램펄린 코드 주입
+            edits.push(ByteEdit {
+                offset: tramp_va,
+                payload: tramp,
+            });
+
+            // 채널 버전 문자열 주입
+            edits.push(ByteEdit {
+                offset: chan_va,
+                payload: chan.clone(),
+            });
+
+            // 2. BuildHeader 패치: concatstring2 호출을 트램펄린(concatstring3) 호출로 변경
+            let bh_body = &ctx.data[bh_start..bh_end];
+            let bh_pat = [0x48, 0x89, 0xc7, 0x48, 0x89, 0xde, 0x31, 0xc0, 0x48, 0x8d, 0x1d];
+            let bh_matches: Vec<_> = bh_body
+                .windows(bh_pat.len())
+                .enumerate()
+                .filter(|(_, w)| *w == bh_pat)
+                .map(|(i, _)| bh_start + i)
+                .collect();
+
+            if bh_matches.len() != 1 {
+                return Err(format!(
+                    "BuildHeader concatstring2 패턴 매칭 실패 (매칭 수: {})",
+                    bh_matches.len()
+                ));
+            }
+            let call_site = bh_matches[0] + 17;
+            if ctx.data[call_site] != 0xe8 {
+                return Err(format!(
+                    "BuildHeader call site op 불일치 (기대: 0xe8, 실제: 0x{:02x})",
+                    ctx.data[call_site]
+                ));
+            }
+
+            let pc = call_site + 5;
+            let rel_tramp = (tramp_va as i64) - (pc as i64);
+            let mut call_bytes = vec![0xe8];
+            call_bytes.extend_from_slice(&(rel_tramp as i32).to_le_bytes());
+            edits.push(ByteEdit {
+                offset: call_site,
+                payload: call_bytes,
+            });
+
+            // 3. BannerWithInfo 패치: 빈 채널 대신 주입된 v{version} 채널 포맷 루틴 활성화
+            let bwi_body = &ctx.data[bwi_start..bwi_end];
+            let mut bwi_matches = Vec::new();
+            for i in 0..bwi_body.len().saturating_sub(55) {
+                if &bwi_body[i..i + 5] == &[0x48, 0x85, 0xd2, 0x0f, 0x84]
+                    && &bwi_body[i + 9..i + 17] == &[0x48, 0x89, 0x9c, 0x24, 0xb0, 0x02, 0x00, 0x00]
+                {
+                    bwi_matches.push(bwi_start + i);
+                }
+            }
+            if bwi_matches.len() != 1 {
+                return Err(format!(
+                    "BannerWithInfo 채널 검사 패턴 매칭 실패 (매칭 수: {})",
+                    bwi_matches.len()
+                ));
+            }
+            let chan_site = bwi_matches[0];
+            let chan_site_end = chan_site + 55;
+
+            let mut chan_patch = Vec::new();
+            let pc = chan_site + 7;
+            let disp_chan = (chan_va as i64) - (pc as i64);
+            chan_patch.extend_from_slice(&[0x48, 0x8d, 0x0d]);
+            chan_patch.extend_from_slice(&(disp_chan as i32).to_le_bytes());
+
+            chan_patch.push(0xba);
+            chan_patch.extend_from_slice(&(chan.len() as u32).to_le_bytes());
+
+            let pc = chan_site + chan_patch.len() + 5;
+            let rel_skip = (chan_site_end as i64) - (pc as i64);
+            chan_patch.push(0xe9);
+            chan_patch.extend_from_slice(&(rel_skip as i32).to_le_bytes());
+
+            while chan_patch.len() < 55 {
+                chan_patch.push(0x90);
+            }
+
+            edits.push(ByteEdit {
+                offset: chan_site,
+                payload: chan_patch,
+            });
+
+            Ok(edits)
+        }
+        Arch::Arm64 => Err("banner 패치는 현재 x86_64 환경에서 우선 지원됩니다.".into()),
+    }
+}
+
 const PATCH_REGISTRY: &[PatchSpec] = &[
     PatchSpec {
         id: "nodrip",
@@ -712,6 +865,14 @@ const PATCH_REGISTRY: &[PatchSpec] = &[
         symbol: "goldmark/extension.(*strikethroughParser).Parse",
         default_on: true,
         resolver: resolve_tilde_strike,
+    },
+    PatchSpec {
+        id: "banner",
+        title: "상단 배너 패치 릴리즈 노트 표시 (Release Notes Banner)",
+        description: "상단 로고 영역에 패치 버전(v0.2.0), 기능 요약 및 GitHub 계정/저장소 정보 표시",
+        symbol: "render.BuildHeader",
+        default_on: true,
+        resolver: resolve_banner,
     },
 ];
 
@@ -895,7 +1056,7 @@ fn interactive_wizard(src_bin: &Path, ctx: &BinaryContext) -> (Vec<&'static Patc
     loop {
         print!("\x1b[2J\x1b[H");
         println!("======================================================================");
-        println!("  agy-patch 대화형 설정 ({:?} / {:?})", ctx.format, ctx.arch);
+        println!("  agy-cli-patch 대화형 설정 ({:?} / {:?})", ctx.format, ctx.arch);
         println!("  원본 바이너리: {}", src_bin.display());
         println!("======================================================================");
         println!("  [↑/↓] 이동   [Space] 선택/해제   [a] 전체선택/해제   [Enter] 다음 단계   [q] 종료\n");
@@ -1053,15 +1214,15 @@ fn build_patched_binary(
 
 fn print_help() {
     println!(
-        "agy-patch: Antigravity CLI (agy) 멀티플랫폼 자동 바이너리 패처 (Linux/macOS, x86_64/ARM64)
+        "agy-cli-patch: Antigravity CLI (agy) 멀티플랫폼 자동 바이너리 패처 (Linux/macOS, x86_64/ARM64)
 
 사용법:
-  agy-patch                           대화형(Interactive) 패치 선택 및 출력 파일명 지정
-  agy-patch --list                    사용 가능한 패치 ID 및 상세 설명 출력
-  agy-patch -p <목록> -o <파일명>     원하는 패치만 골라 지정한 이름으로 바이너리 생성
-  agy-patch --preset                  기본 프리셋 2종(agy-batch, agy-nodrip) 일괄 생성
-  agy-patch -p all --in-place         원본 백업(antigravity.orig) 후 기본 agy에 직접 적용
-  agy-patch --restore                 antigravity.orig 백업에서 원본 복구
+  agy-cli-patch                           대화형(Interactive) 패치 선택 및 출력 파일명 지정
+  agy-cli-patch --list                    사용 가능한 패치 ID 및 상세 설명 출력
+  agy-cli-patch -p <목록> -o <파일명>     원하는 패치만 골라 지정한 이름으로 바이너리 생성
+  agy-cli-patch --preset                  기본 프리셋 2종(agy-batch, agy-nodrip) 일괄 생성
+  agy-cli-patch -p all --in-place         원본 백업(antigravity.orig) 후 기본 agy에 직접 적용
+  agy-cli-patch --restore                 antigravity.orig 백업에서 원본 복구
 
 옵션:
   --bin <경로>       원본 antigravity 바이너리 경로 직접 지정 (미지정 시 자동 탐색)
@@ -1144,7 +1305,7 @@ fn run() -> Result<(), String> {
     }
 
     // 새 릴리즈 업데이트 시 backup_bin 자동 갱신
-    if backup_bin.exists() {
+    if backup_bin.exists() && target_bin != backup_bin {
         let cur_mmap = MmapFile::open(&target_bin)?;
         let cur_ctx = BinaryContext::parse(cur_mmap.as_slice())?;
         if is_unpatched_cut(&cur_ctx)? {
@@ -1152,7 +1313,7 @@ fn run() -> Result<(), String> {
         }
     }
 
-    let src_bin = if backup_bin.exists() {
+    let src_bin = if target_bin != backup_bin && backup_bin.exists() {
         backup_bin.clone()
     } else {
         target_bin.clone()
