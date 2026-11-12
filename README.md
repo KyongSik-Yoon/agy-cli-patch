@@ -2,7 +2,7 @@
 
 `agy`(Antigravity CLI — **Linux & macOS**, **x86_64 & ARM64/Apple Silicon**) 바이너리의 스트리밍 출력 방식과 마크다운 렌더링 결함을 동적 심볼/시그니처 탐색으로 패치하는 초고속 모듈형 도구(Rust)입니다.
 
-릴리즈마다 바뀌는 고정 주소에 의존하지 않고, `mmap` 제로카피 매핑으로 **ELF64**(Linux) 및 **Mach-O 64**(macOS)의 텍스트 섹션과 Go `.gopclntab` 심볼 테이블을 파싱하여 대상 함수를 찾고, 아키텍처별(`x86_64` / `ARM64`) 기계어 시그니처를 검증한 뒤 패치합니다(외부 크레이트 의존성 0, Linux `FICLONE` reflink 및 macOS `codesign -f -s -` 자동 서명 지원).
+릴리즈마다 바뀌는 고정 주소에 의존하지 않고, `mmap` 제로카피 매핑으로 **ELF64**(Linux) 및 **Mach-O 64**(macOS)의 텍스트 섹션과 Go `.gopclntab` 심볼 테이블을 파싱하여 대상 함수를 찾고, 아키텍처별(`x86_64` / `ARM64`) 기계어 시그니처를 검증한 뒤 패치합니다(외부 크레이트 의존성 0, Linux `FICLONE` reflink 및 macOS `codesign -f -s -` 자동 서명 지원). 단, `banner`·`release-notes` 패치는 현재 `x86_64`에서만 지원합니다.
 
 ## 지원하는 패치 목록 (`--list`)
 
@@ -72,6 +72,36 @@ agy-cli-patch --bin /path/to/antigravity -p all -o agy-batch
 agy-cli-patch -p all --in-place
 agy-cli-patch --restore
 ```
+
+## 주의 사항
+
+### agy 자체 업데이트
+
+agy는 실행할 때마다 백그라운드로 새 버전을 확인하고, 있으면 **설치된 위치의 `antigravity` 바이너리를 직접 교체**합니다. 그 결과:
+
+- `--in-place`로 적용한 패치가 업데이트와 함께 사라집니다. 다시 `agy-cli-patch -p all --in-place`를 실행하면 됩니다(패치가 풀린 것을 감지하면 `antigravity.orig` 백업도 새 버전으로 갱신).
+- mise로 설치한 경우 디렉토리명과 실제 버전이 어긋납니다(예: `~/.local/share/mise/installs/agy/1.5.6/antigravity`가 실제로는 1.5.7). 패처는 경로와 함께 실제 버전을 출력하므로 `[*] 대상 바이너리: … (버전 1.5.7)` 줄로 확인할 수 있습니다.
+
+버전 관리를 mise 등 패키지 매니저에만 맡기려면 자체 업데이트를 끕니다. 값은 반드시 `true`여야 합니다(`1`은 적용되지 않음).
+
+```bash
+export AGY_CLI_DISABLE_AUTO_UPDATE=true
+```
+
+mise를 쓴다면 `~/.config/mise/config.toml`에 넣을 수 있습니다.
+
+```toml
+[env]
+AGY_CLI_DISABLE_AUTO_UPDATE = "true"
+```
+
+### `-o`와 심볼릭 링크
+
+`-o`에 경로(`/tmp/agy-test` 등)를 주더라도 `~/.local/bin/<파일 이름>` 심볼릭 링크가 함께 생성되며, 같은 이름의 기존 링크는 덮어씌워집니다. 테스트용 바이너리를 만들 때는 기존 명령과 겹치지 않는 이름을 쓰세요.
+
+### remote-control 데몬
+
+`agy-batch remote-control serve` 등으로 데몬을 띄워 두었다면, 해당 바이너리를 다시 생성하기 전에 데몬을 멈추고 생성 후 재시작하세요. agy를 재설치해 데몬이 `not signed in`으로 종료되면 `agy-batch remote-control start`로 다시 등록합니다.
 
 ## 새로운 패치 추가하기
 
