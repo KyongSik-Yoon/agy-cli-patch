@@ -675,39 +675,133 @@ fn resolve_tilde_strike(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
     }
 }
 
+// banner / release-notes 패치가 공유하는 0xcc 패딩 공간(cave) 배치.
+// 두 패치를 따로 적용해도 겹치지 않도록 고정 오프셋을 쓴다.
+const CAVE_MIN: usize = 1024;
+const CAVE_CHAN_OFF: usize = 0; // "patch v{ver}" (≤ 32바이트)
+const CAVE_NOTES_OFF: usize = 64; // 릴리즈 노트 문자열 + 트램펄린
+
+fn find_cave(ctx: &BinaryContext) -> Result<usize, String> {
+    let needle = [0xccu8; CAVE_MIN];
+    ctx.data
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .ok_or_else(|| format!("실행 파일 내 0xcc 여유 공간({CAVE_MIN}바이트)을 찾을 수 없습니다."))
+}
+
 fn resolve_banner(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
     match ctx.arch {
         Arch::X86_64 => {
-            let (bh_start, bh_end) = ctx.get_func("render.BuildHeader")?;
             let (bwi_start, bwi_end) = ctx.get_func("render.BannerWithInfo")?;
+            let cave_offset = find_cave(ctx)?;
+
+            // 제품명 옆 괄호 안에 표시: "Antigravity CLI 1.5.7 (patch v0.2.0)"
+            let chan = format!("patch v{}", env!("CARGO_PKG_VERSION")).into_bytes();
+            assert!(chan.len() <= CAVE_NOTES_OFF - CAVE_CHAN_OFF);
+            let chan_va = cave_offset + CAVE_CHAN_OFF;
+
+            let mut edits = vec![ByteEdit {
+                offset: chan_va,
+                payload: chan.clone(),
+            }];
+
+            // BannerWithInfo 패치: 빈 채널 대신 주입된 채널 문자열 포맷 루틴 활성화
+            let bwi_body = &ctx.data[bwi_start..bwi_end];
+            let mut bwi_matches = Vec::new();
+            for i in 0..bwi_body.len().saturating_sub(55) {
+                if &bwi_body[i..i + 5] == &[0x48, 0x85, 0xd2, 0x0f, 0x84]
+                    && &bwi_body[i + 9..i + 17] == &[0x48, 0x89, 0x9c, 0x24, 0xb0, 0x02, 0x00, 0x00]
+                    && &bwi_body[i + 17..i + 21] == &[0x48, 0x89, 0x84, 0x24]
+                {
+                    bwi_matches.push(bwi_start + i);
+                }
+            }
+            if bwi_matches.len() != 1 {
+                return Err(format!(
+                    "BannerWithInfo 채널 검사 패턴 매칭 실패 (매칭 수: {})",
+                    bwi_matches.len()
+                ));
+            }
+            let chan_site = bwi_matches[0];
+            let chan_site_end = chan_site + 55;
+
+            // 원본은 채널 분기 진입 시 제품명 문자열(rax=ptr, rbx=len)을 스택 슬롯에 저장하고,
+            // Sprintf 이후 그 슬롯을 다시 읽어 concatstring2 로 이어 붙인다.
+            // 이 두 저장(mov %rbx,0x2b0(%rsp) / mov %rax,0x320(%rsp))을 건너뛰면
+            // 초기화되지 않은 슬롯을 이어 붙이다 SIGSEGV 가 나므로 그대로 보존한다.
+            let mut chan_patch = ctx.data[chan_site + 9..chan_site + 25].to_vec();
+            let pc = chan_site + chan_patch.len() + 7;
+            let disp_chan = (chan_va as i64) - (pc as i64);
+            chan_patch.extend_from_slice(&[0x48, 0x8d, 0x0d]);
+            chan_patch.extend_from_slice(&(disp_chan as i32).to_le_bytes());
+
+            chan_patch.push(0xba);
+            chan_patch.extend_from_slice(&(chan.len() as u32).to_le_bytes());
+
+            let pc = chan_site + chan_patch.len() + 5;
+            let rel_skip = (chan_site_end as i64) - (pc as i64);
+            chan_patch.push(0xe9);
+            chan_patch.extend_from_slice(&(rel_skip as i32).to_le_bytes());
+
+            while chan_patch.len() < 55 {
+                chan_patch.push(0x90);
+            }
+
+            edits.push(ByteEdit {
+                offset: chan_site,
+                payload: chan_patch,
+            });
+            Ok(edits)
+        }
+        Arch::Arm64 => Err("banner 패치는 현재 x86_64 환경에서 우선 지원됩니다.".into()),
+    }
+}
+
+/// 릴리즈 노트 본문. `release-notes` 패치(배너 주입)와 `--notes` 출력이 같은 문구를 쓴다.
+fn release_notes_text() -> String {
+    const ITEMS: &[(&str, &str)] = &[
+        ("nodrip", "instant streaming (16ms typewriter drip removed)"),
+        ("batch", "full answer rendered at once on completion"),
+        ("heading", "'##' prefixes hidden on H2-H6"),
+        ("cjk-bold", "**bold** kept before Korean particles"),
+        ("tilde-strike", "only '~~' strikes through, single '~' stays"),
+        ("banner", "patch version shown next to the product name"),
+    ];
+    let mut out = format!(
+        " \x1b[1mWhat's new in agy-cli-patch v{}:\x1b[0m",
+        env!("CARGO_PKG_VERSION")
+    );
+    for (id, desc) in ITEMS {
+        out.push_str(&format!("\n \x1b[32m•\x1b[0m \x1b[1m{id}\x1b[0m: {desc}"));
+    }
+    out.push_str("\n \x1b[90mGitHub: https://github.com/KyongSik-Yoon/agy-cli-patch\x1b[0m");
+    out.push_str("\n \x1b[90mAccount: KyongSik-Yoon <sam1287@gmail.com>\x1b[0m");
+    out
+}
+
+fn resolve_release_notes(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
+    match ctx.arch {
+        Arch::X86_64 => {
+            let (bh_start, bh_end) = ctx.get_func("render.BuildHeader")?;
             let (concat3_start, _) = ctx.get_func("runtime.concatstring3")?;
+            let cave_offset = find_cave(ctx)?;
 
-            // 1. 실행 파일 내 미사용 0xcc 패딩 공간(512바이트 이상) 탐색
-            let needle = [0xccu8; 512];
-            let cave_offset = ctx
-                .data
-                .windows(needle.len())
-                .position(|w| w == needle)
-                .ok_or_else(|| "실행 파일 내 0xcc 여유 공간(512바이트)을 찾을 수 없습니다.".to_string())?;
+            let notes = format!("\n\n{}", release_notes_text()).into_bytes();
 
-            let version = env!("CARGO_PKG_VERSION");
-            let notes = format!(
-                "\n\n \x1b[1mWhat's new in agy-cli-patch v{}:\x1b[0m\n \x1b[32m•\x1b[0m \x1b[1mbatch\x1b[0m: instant full render on completion\n \x1b[32m•\x1b[0m \x1b[1mnodrip\x1b[0m: zero typing delay (16ms removed)\n \x1b[32m•\x1b[0m \x1b[1mmarkdown\x1b[0m: clean H2-H6 headings & CJK bold fix\n \x1b[90mGitHub: https://github.com/KyongSik-Yoon/agy-cli-patch\x1b[0m\n \x1b[90mAccount: KyongSik-Yoon <sam1287@gmail.com>\x1b[0m",
-                version
-            ).into_bytes();
-
-            let chan = format!("v{}", version).into_bytes();
-
-            let notes_va = cave_offset;
+            let notes_va = cave_offset + CAVE_NOTES_OFF;
             let notes_len = notes.len();
-            let tramp_va = notes_va + notes_len + 32;
-            let chan_va = tramp_va + 32;
+            let tramp_va = (notes_va + notes_len + 15) & !15;
 
             // 트램펄린 루틴 생성:
             // lea notes(%rip), %r8
             // mov $notes_len, %r9d
-            // call concatstring3
-            // ret
+            // jmp concatstring3   (tail call)
+            //
+            // call 이 아니라 jmp 여야 한다. call 로 들어가면 concatstring3 의 리턴 주소가
+            // pclntab 에 없는 동굴(cave)을 가리켜 GC/스택 확장 시 Go 언와인더가 실패하고,
+            // morestack 경로의 레지스터 인자 스필(SP+8~)이 트램펄린의 리턴 주소를 덮어쓴다.
+            // tail jmp 면 BuildHeader 가 concatstring3 를 직접 호출한 것과 동일한 프레임이 된다
+            // (BuildHeader 의 outgoing 인자 영역은 7워드 스필을 충분히 수용함).
             let mut tramp = Vec::new();
             let pc = tramp_va + 7;
             let disp = (notes_va as i64) - (pc as i64);
@@ -719,32 +813,25 @@ fn resolve_banner(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
 
             let pc = tramp_va + tramp.len() + 5;
             let rel_c3 = (concat3_start as i64) - (pc as i64);
-            tramp.push(0xe8);
+            tramp.push(0xe9);
             tramp.extend_from_slice(&(rel_c3 as i32).to_le_bytes());
 
-            tramp.push(0xc3);
+            if tramp_va + tramp.len() > cave_offset + CAVE_MIN {
+                return Err("릴리즈 노트가 0xcc 여유 공간을 초과합니다.".into());
+            }
 
-            let mut edits = Vec::new();
+            let mut edits = vec![
+                ByteEdit {
+                    offset: notes_va,
+                    payload: notes,
+                },
+                ByteEdit {
+                    offset: tramp_va,
+                    payload: tramp,
+                },
+            ];
 
-            // 릴리즈 노트 문자열 주입
-            edits.push(ByteEdit {
-                offset: notes_va,
-                payload: notes,
-            });
-
-            // 트램펄린 코드 주입
-            edits.push(ByteEdit {
-                offset: tramp_va,
-                payload: tramp,
-            });
-
-            // 채널 버전 문자열 주입
-            edits.push(ByteEdit {
-                offset: chan_va,
-                payload: chan.clone(),
-            });
-
-            // 2. BuildHeader 패치: concatstring2 호출을 트램펄린(concatstring3) 호출로 변경
+            // BuildHeader 패치: concatstring2 호출을 트램펄린(concatstring3) 호출로 변경
             let bh_body = &ctx.data[bh_start..bh_end];
             let bh_pat = [0x48, 0x89, 0xc7, 0x48, 0x89, 0xde, 0x31, 0xc0, 0x48, 0x8d, 0x1d];
             let bh_matches: Vec<_> = bh_body
@@ -777,51 +864,9 @@ fn resolve_banner(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
                 payload: call_bytes,
             });
 
-            // 3. BannerWithInfo 패치: 빈 채널 대신 주입된 v{version} 채널 포맷 루틴 활성화
-            let bwi_body = &ctx.data[bwi_start..bwi_end];
-            let mut bwi_matches = Vec::new();
-            for i in 0..bwi_body.len().saturating_sub(55) {
-                if &bwi_body[i..i + 5] == &[0x48, 0x85, 0xd2, 0x0f, 0x84]
-                    && &bwi_body[i + 9..i + 17] == &[0x48, 0x89, 0x9c, 0x24, 0xb0, 0x02, 0x00, 0x00]
-                {
-                    bwi_matches.push(bwi_start + i);
-                }
-            }
-            if bwi_matches.len() != 1 {
-                return Err(format!(
-                    "BannerWithInfo 채널 검사 패턴 매칭 실패 (매칭 수: {})",
-                    bwi_matches.len()
-                ));
-            }
-            let chan_site = bwi_matches[0];
-            let chan_site_end = chan_site + 55;
-
-            let mut chan_patch = Vec::new();
-            let pc = chan_site + 7;
-            let disp_chan = (chan_va as i64) - (pc as i64);
-            chan_patch.extend_from_slice(&[0x48, 0x8d, 0x0d]);
-            chan_patch.extend_from_slice(&(disp_chan as i32).to_le_bytes());
-
-            chan_patch.push(0xba);
-            chan_patch.extend_from_slice(&(chan.len() as u32).to_le_bytes());
-
-            let pc = chan_site + chan_patch.len() + 5;
-            let rel_skip = (chan_site_end as i64) - (pc as i64);
-            chan_patch.push(0xe9);
-            chan_patch.extend_from_slice(&(rel_skip as i32).to_le_bytes());
-
-            while chan_patch.len() < 55 {
-                chan_patch.push(0x90);
-            }
-
-            edits.push(ByteEdit {
-                offset: chan_site,
-                payload: chan_patch,
-            });
-
             Ok(edits)
         }
-        Arch::Arm64 => Err("banner 패치는 현재 x86_64 환경에서 우선 지원됩니다.".into()),
+        Arch::Arm64 => Err("release-notes 패치는 현재 x86_64 환경에서 우선 지원됩니다.".into()),
     }
 }
 
@@ -868,11 +913,19 @@ const PATCH_REGISTRY: &[PatchSpec] = &[
     },
     PatchSpec {
         id: "banner",
-        title: "상단 배너 패치 릴리즈 노트 표시 (Release Notes Banner)",
-        description: "상단 로고 영역에 패치 버전(v0.2.0), 기능 요약 및 GitHub 계정/저장소 정보 표시",
-        symbol: "render.BuildHeader",
+        title: "제품명 옆 패치 버전 표시 (Patch Version Tag)",
+        description: "상단 'Antigravity CLI 1.5.7' 옆에 '(patch v0.2.0)' 형태로 패치 버전 표시",
+        symbol: "render.BannerWithInfo",
         default_on: true,
         resolver: resolve_banner,
+    },
+    PatchSpec {
+        id: "release-notes",
+        title: "상단 배너 릴리즈 노트 표시 (Release Notes)",
+        description: "로고 아래에 패치 기능 요약 및 GitHub 정보 표시 (기본 꺼짐, -p 로 명시해야 적용)",
+        symbol: "render.BuildHeader",
+        default_on: false,
+        resolver: resolve_release_notes,
     },
 ];
 
@@ -944,6 +997,20 @@ fn which_in_path(cmd: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+fn binary_version(path: &Path) -> String {
+    Command::new(path)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.lines().next().map(|l| l.trim().to_string()))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "확인 불가".to_string())
 }
 
 fn detect_default_binary() -> PathBuf {
@@ -1139,7 +1206,14 @@ fn interactive_wizard(src_bin: &Path, ctx: &BinaryContext) -> (Vec<&'static Patc
 fn parse_patch_list(spec_str: &str) -> Result<Vec<&'static PatchSpec>, String> {
     let items: Vec<&str> = spec_str.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
     if items.is_empty() || items.contains(&"all") {
-        return Ok(PATCH_REGISTRY.iter().collect());
+        // 'all' 은 기본 활성(default_on) 패치 전체. 기본 꺼짐 패치는 'all,release-notes' 처럼 명시한다.
+        let mut v: Vec<&'static PatchSpec> = PATCH_REGISTRY.iter().filter(|p| p.default_on).collect();
+        for item in &items {
+            if let Some(spec) = PATCH_REGISTRY.iter().find(|p| p.id == *item && !p.default_on) {
+                v.push(spec);
+            }
+        }
+        return Ok(v);
     }
     let mut out = Vec::new();
     for item in items {
@@ -1223,6 +1297,7 @@ fn print_help() {
   agy-cli-patch --preset                  기본 프리셋 2종(agy-batch, agy-nodrip) 일괄 생성
   agy-cli-patch -p all --in-place         원본 백업(antigravity.orig) 후 기본 agy에 직접 적용
   agy-cli-patch --restore                 antigravity.orig 백업에서 원본 복구
+  agy-cli-patch --notes                   패치 릴리즈 노트 출력
 
 옵션:
   --bin <경로>       원본 antigravity 바이너리 경로 직접 지정 (미지정 시 자동 탐색)
@@ -1231,6 +1306,7 @@ fn print_help() {
   --preset           프롬프트 없이 agy-batch와 agy-nodrip 생성
   --in-place         원본 백업 후 기본 바이너리 덮어쓰기
   --restore          --in-place 백업 복구
+  --notes            패치 릴리즈 노트 출력 (agy 화면에 넣으려면 -p all,release-notes)
   -h, --help         도움말 출력"
     );
 }
@@ -1252,6 +1328,10 @@ fn run() -> Result<(), String> {
                 return Ok(());
             }
             "--list" | "-l" => list_mode = true,
+            "--notes" => {
+                println!("{}", release_notes_text());
+                return Ok(());
+            }
             "--preset" => preset_mode = true,
             "--in-place" => in_place = true,
             "--restore" => restore_mode = true,
@@ -1319,6 +1399,13 @@ fn run() -> Result<(), String> {
         target_bin.clone()
     };
 
+    // mise 설치 디렉토리명(예: 1.5.6)은 agy 자체 업데이트 후 실제 버전과 어긋날 수 있으므로
+    // 바이너리가 보고하는 버전을 함께 출력한다.
+    println!("[*] 대상 바이너리: {} (버전 {})", target_bin.display(), binary_version(&target_bin));
+    if src_bin != target_bin {
+        println!("[*] 패치 원본:     {} (버전 {})", src_bin.display(), binary_version(&src_bin));
+    }
+
     let mmap = MmapFile::open(&src_bin)?;
     let ctx = BinaryContext::parse(mmap.as_slice())?;
 
@@ -1327,8 +1414,9 @@ fn run() -> Result<(), String> {
         || (!is_tty && patches_arg.is_none() && output_arg.is_none() && !in_place)
     {
         let nodrip_patches: Vec<&'static PatchSpec> =
-            PATCH_REGISTRY.iter().filter(|p| p.id != "batch").collect();
-        let batch_patches: Vec<&'static PatchSpec> = PATCH_REGISTRY.iter().collect();
+            PATCH_REGISTRY.iter().filter(|p| p.default_on && p.id != "batch").collect();
+        let batch_patches: Vec<&'static PatchSpec> =
+            PATCH_REGISTRY.iter().filter(|p| p.default_on).collect();
         build_patched_binary(
             &src_bin,
             &ctx,
