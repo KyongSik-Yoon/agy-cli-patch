@@ -20,6 +20,10 @@ const ICANON: Tcflag = 0o0000002;
 #[cfg(target_os = "linux")]
 const ECHO: Tcflag = 0o0000010;
 #[cfg(target_os = "linux")]
+const ISIG: Tcflag = 0o0000001;
+#[cfg(target_os = "linux")]
+const TIOCGWINSZ: u64 = 0x5413;
+#[cfg(target_os = "linux")]
 const VMIN_IDX: usize = 6;
 #[cfg(target_os = "linux")]
 const VTIME_IDX: usize = 5;
@@ -32,6 +36,10 @@ type Tcflag = u64;
 const ICANON: Tcflag = 0x00000100;
 #[cfg(target_os = "macos")]
 const ECHO: Tcflag = 0x00000008;
+#[cfg(target_os = "macos")]
+const ISIG: Tcflag = 0x00000080;
+#[cfg(target_os = "macos")]
+const TIOCGWINSZ: u64 = 0x40087468;
 #[cfg(target_os = "macos")]
 const VMIN_IDX: usize = 16;
 #[cfg(target_os = "macos")]
@@ -64,11 +72,20 @@ struct Termios {
     c_ospeed: u64,
 }
 
+#[repr(C)]
+struct Winsize {
+    ws_row: u16,
+    ws_col: u16,
+    ws_xpixel: u16,
+    ws_ypixel: u16,
+}
+
 unsafe extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
     fn munmap(addr: *mut u8, len: usize) -> i32;
-    #[cfg(target_os = "linux")]
     fn ioctl(fd: i32, request: u64, ...) -> i32;
+    #[link_name = "read"]
+    fn sys_read(fd: i32, buf: *mut u8, count: usize) -> isize;
     fn tcgetattr(fd: i32, termios_p: *mut Termios) -> i32;
     fn tcsetattr(fd: i32, optional_actions: i32, termios_p: *const Termios) -> i32;
     fn isatty(fd: i32) -> i32;
@@ -1070,136 +1087,997 @@ fn detect_default_binary() -> PathBuf {
     home.join(".local/share/mise/installs/agy/latest/antigravity")
 }
 
-// --- 인터랙티브 터미널 UI ---
+// --- 인터랙티브 터미널 UI (외부 크레이트 없이 ANSI 이스케이프로 직접 그림) ---
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Key {
     Up,
     Down,
-    Char(char),
+    Left,
+    Right,
+    Home,
+    End,
     Enter,
     Esc,
+    Backspace,
+    Delete,
+    CtrlC,
+    Char(char),
 }
 
-fn read_key() -> Key {
-    let mut orig = unsafe { std::mem::zeroed::<Termios>() };
-    unsafe { tcgetattr(0, &mut orig) };
-    let mut raw = orig;
-    raw.c_lflag &= !(ICANON | ECHO);
-    raw.c_cc[VMIN_IDX] = 1;
-    raw.c_cc[VTIME_IDX] = 0;
-    unsafe { tcsetattr(0, TCSADRAIN, &raw) };
-
-    let mut buf = [0u8; 1];
-    let res = if io::stdin().read_exact(&mut buf).is_ok() {
-        match buf[0] {
+/// 한 번의 read 로 들어온 바이트를 키 목록으로 해석한다 (붙여넣기·빠른 입력 시 여러 키가 함께 온다).
+fn parse_keys(buf: &[u8]) -> Vec<Key> {
+    let mut keys = Vec::new();
+    let mut i = 0;
+    while i < buf.len() {
+        let b = buf[i];
+        match b {
             0x1b => {
-                let mut seq = [0u8; 2];
-                if io::stdin().read_exact(&mut seq).is_ok() && seq[0] == b'[' {
-                    match seq[1] {
-                        b'A' => Key::Up,
-                        b'B' => Key::Down,
-                        _ => Key::Esc,
+                let rest = &buf[i + 1..];
+                if rest.len() >= 2 && (rest[0] == b'[' || rest[0] == b'O') {
+                    // CSI/SS3: 파라미터 바이트(0x30–0x3f) 다음에 종결 바이트가 온다
+                    let mut j = 1;
+                    while j < rest.len() && (0x30..=0x3f).contains(&rest[j]) {
+                        j += 1;
+                    }
+                    if j < rest.len() {
+                        let params = &rest[1..j];
+                        let key = match (rest[j], params) {
+                            (b'A', _) => Some(Key::Up),
+                            (b'B', _) => Some(Key::Down),
+                            (b'C', _) => Some(Key::Right),
+                            (b'D', _) => Some(Key::Left),
+                            (b'H', _) => Some(Key::Home),
+                            (b'F', _) => Some(Key::End),
+                            (b'~', b"1") | (b'~', b"7") => Some(Key::Home),
+                            (b'~', b"4") | (b'~', b"8") => Some(Key::End),
+                            (b'~', b"3") => Some(Key::Delete),
+                            _ => None,
+                        };
+                        keys.extend(key);
+                        i += 1 + j + 1;
+                    } else {
+                        i = buf.len();
                     }
                 } else {
-                    Key::Esc
+                    keys.push(Key::Esc);
+                    i += 1;
                 }
             }
-            b'\r' | b'\n' => Key::Enter,
-            0x03 => Key::Esc,
-            c => Key::Char(c as char),
+            b'\r' | b'\n' => {
+                keys.push(Key::Enter);
+                i += 1;
+            }
+            0x7f | 0x08 => {
+                keys.push(Key::Backspace);
+                i += 1;
+            }
+            0x03 => {
+                keys.push(Key::CtrlC);
+                i += 1;
+            }
+            0x00..=0x1f => i += 1,
+            _ => {
+                let len = match b {
+                    0xc0..=0xdf => 2,
+                    0xe0..=0xef => 3,
+                    0xf0..=0xf7 => 4,
+                    _ => 1,
+                };
+                let end = (i + len).min(buf.len());
+                if let Some(c) = std::str::from_utf8(&buf[i..end]).ok().and_then(|s| s.chars().next()) {
+                    keys.push(Key::Char(c));
+                }
+                i = end;
+            }
         }
-    } else {
-        Key::Esc
-    };
-
-    unsafe { tcsetattr(0, TCSADRAIN, &orig) };
-    res
+    }
+    keys
 }
 
-fn interactive_wizard(src_bin: &Path, ctx: &BinaryContext) -> (Vec<&'static PatchSpec>, String, bool) {
-    let mut selected: Vec<bool> = PATCH_REGISTRY.iter().map(|p| p.default_on).collect();
-    let mut cursor = 0usize;
-
-    loop {
-        print!("\x1b[2J\x1b[H");
-        println!("======================================================================");
-        println!("  agy-cli-patch 대화형 설정 ({:?} / {:?})", ctx.format, ctx.arch);
-        println!("  원본 바이너리: {}", src_bin.display());
-        println!("======================================================================");
-        println!("  [↑/↓] 이동   [Space] 선택/해제   [a] 전체선택/해제   [Enter] 다음 단계   [q] 종료\n");
-
-        for (i, spec) in PATCH_REGISTRY.iter().enumerate() {
-            let mark = if selected[i] { "x" } else { " " };
-            let pointer = if i == cursor { "❯" } else { " " };
-            println!(" {pointer} [{mark}] {}. {:<13} - {}", i + 1, spec.id, spec.title);
-            println!("          └─ {}", spec.description);
-        }
-        let _ = io::stdout().flush();
-
-        match read_key() {
-            Key::Esc | Key::Char('q') | Key::Char('Q') => {
-                println!("\n취소되었습니다.");
-                process::exit(0);
-            }
-            Key::Up | Key::Char('k') => {
-                cursor = if cursor == 0 { PATCH_REGISTRY.len() - 1 } else { cursor - 1 };
-            }
-            Key::Down | Key::Char('j') => {
-                cursor = (cursor + 1) % PATCH_REGISTRY.len();
-            }
-            Key::Char(' ') => {
-                selected[cursor] = !selected[cursor];
-            }
-            Key::Char('a') | Key::Char('A') => {
-                let all_on = selected.iter().all(|&x| x);
-                selected.iter_mut().for_each(|x| *x = !all_on);
-            }
-            Key::Char(c) if c.is_ascii_digit() => {
-                let idx = (c as u8 - b'0') as usize;
-                if (1..=PATCH_REGISTRY.len()).contains(&idx) {
-                    selected[idx - 1] = !selected[idx - 1];
-                }
-            }
-            Key::Enter => {
-                if selected.iter().any(|&x| x) {
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    let mut chosen: Vec<&'static PatchSpec> = PATCH_REGISTRY
-        .iter()
-        .zip(selected.iter())
-        .filter_map(|(p, &on)| if on { Some(p) } else { None })
-        .collect();
-
-    let has_batch = chosen.iter().any(|p| p.id == "batch");
-    let has_nodrip = chosen.iter().any(|p| p.id == "nodrip");
-    if has_batch && !has_nodrip {
-        println!("\n[!] 참고: 'batch' 패치가 원활히 동작하도록 'nodrip' 패치를 함께 활성화합니다.");
-        chosen.insert(0, &PATCH_REGISTRY[0]);
-    }
-
-    let default_name = if has_batch { "agy-batch" } else { "agy-patched" };
-    println!("\n----------------------------------------------------------------------");
-    println!("출력 방식을 선택하세요:");
-    println!("  - 파일명 입력 (엔터 시 기본값: '{default_name}', ~/.local/bin 에 심볼릭 링크 생성)");
-    println!("  - 'in-place' 입력 시 원본을 백업(antigravity.orig)하고 기본 agy에 직접 덮어쓰기");
-    print!("\n출력 파일명 [{default_name}]: ");
-    let _ = io::stdout().flush();
-
-    let mut input = String::new();
-    let _ = io::stdin().read_line(&mut input);
-    let trimmed = input.trim();
-
-    if trimmed.eq_ignore_ascii_case("in-place") {
-        (chosen, String::new(), true)
-    } else if trimmed.is_empty() {
-        (chosen, default_name.to_string(), false)
+/// 터미널 표시 폭. 한글·CJK·전각 문자는 2칸으로 계산한다.
+fn char_width(c: char) -> usize {
+    let cp = c as u32;
+    if c.is_control() || matches!(cp, 0x0300..=0x036f | 0x200b..=0x200f | 0xfe00..=0xfe0f) {
+        0
+    } else if matches!(
+        cp,
+        0x1100..=0x115f
+            | 0x2e80..=0x303e
+            | 0x3041..=0x33ff
+            | 0x3400..=0x4dbf
+            | 0x4e00..=0x9fff
+            | 0xa000..=0xa4cf
+            | 0xac00..=0xd7a3
+            | 0xf900..=0xfaff
+            | 0xfe30..=0xfe4f
+            | 0xff00..=0xff60
+            | 0xffe0..=0xffe6
+            | 0x1f300..=0x1f64f
+            | 0x1f900..=0x1f9ff
+            | 0x20000..=0x3fffd
+    ) {
+        2
     } else {
-        (chosen, trimmed.to_string(), false)
+        1
+    }
+}
+
+fn str_width(s: &str) -> usize {
+    s.chars().map(char_width).sum()
+}
+
+/// 표시 폭이 max 를 넘으면 뒤를 잘라 '…'을 붙인다.
+fn truncate_end(s: &str, max: usize) -> String {
+    if str_width(s) <= max {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    let mut w = 0;
+    for c in s.chars() {
+        let cw = char_width(c);
+        if w + cw + 1 > max {
+            break;
+        }
+        out.push(c);
+        w += cw;
+    }
+    if max > 0 {
+        out.push('…');
+    }
+    out
+}
+
+/// 경로처럼 끝부분이 중요한 문자열은 앞을 잘라 '…'을 붙인다.
+fn truncate_start(s: &str, max: usize) -> String {
+    if str_width(s) <= max {
+        return s.to_string();
+    }
+    let mut tail: Vec<char> = Vec::new();
+    let mut w = 0;
+    for c in s.chars().rev() {
+        let cw = char_width(c);
+        if w + cw + 1 > max {
+            break;
+        }
+        tail.push(c);
+        w += cw;
+    }
+    let mut out = String::from("…");
+    out.extend(tail.iter().rev());
+    out
+}
+
+/// 공백 기준 줄바꿈. 한 단어가 폭보다 길면 글자 단위로 자른다.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0;
+    for word in text.split(' ') {
+        let ww = str_width(word);
+        let sep = usize::from(!cur.is_empty());
+        if cur_w + sep + ww <= width {
+            if sep == 1 {
+                cur.push(' ');
+            }
+            cur.push_str(word);
+            cur_w += sep + ww;
+            continue;
+        }
+        if !cur.is_empty() {
+            lines.push(std::mem::take(&mut cur));
+            cur_w = 0;
+        }
+        for c in word.chars() {
+            let cw = char_width(c);
+            if cur_w + cw > width {
+                lines.push(std::mem::take(&mut cur));
+                cur_w = 0;
+            }
+            cur.push(c);
+            cur_w += cw;
+        }
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    lines
+}
+
+/// HOME 아래 경로는 '~' 로 줄여 보여준다.
+fn tilde_path(p: &Path) -> String {
+    if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
+        if let Ok(rest) = p.strip_prefix(&home) {
+            return format!("~/{}", rest.display());
+        }
+    }
+    p.display().to_string()
+}
+
+const S_PLAIN: &str = "";
+const S_BOLD: &str = "1";
+const S_DIM: &str = "2";
+const S_ACCENT: &str = "36";
+const S_ACCENT_B: &str = "1;36";
+const S_OK: &str = "32";
+const S_WARN: &str = "33";
+const S_ERR: &str = "31";
+const S_CARET: &str = "7";
+
+/// 스타일이 붙은 조각(span)들로 이루어진 한 줄. 그릴 때 화면 폭에 맞춰 자른다.
+#[derive(Default)]
+struct Line {
+    spans: Vec<(&'static str, String)>,
+}
+
+impl Line {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn s(mut self, style: &'static str, text: impl Into<String>) -> Self {
+        self.spans.push((style, text.into()));
+        self
+    }
+
+    fn width(&self) -> usize {
+        self.spans.iter().map(|(_, t)| str_width(t)).sum()
+    }
+
+    /// 왼쪽 내용과 오른쪽 내용을 양 끝에 정렬한다. 폭이 모자라면 오른쪽을 생략한다.
+    fn with_right(mut self, right: Line, width: usize) -> Self {
+        let (lw, rw) = (self.width(), right.width());
+        if lw + rw + 2 <= width {
+            self.spans.push((S_PLAIN, " ".repeat(width - lw - rw)));
+            self.spans.extend(right.spans);
+        }
+        self
+    }
+
+    fn render(&self, width: usize, color: bool) -> String {
+        let mut out = String::new();
+        let mut used = 0;
+        for (style, text) in &self.spans {
+            let remain = width.saturating_sub(used);
+            if remain == 0 {
+                break;
+            }
+            let t = truncate_end(text, remain);
+            used += str_width(&t);
+            if color && !style.is_empty() {
+                out.push_str("\x1b[");
+                out.push_str(style);
+                out.push('m');
+                out.push_str(&t);
+                out.push_str("\x1b[0m");
+            } else {
+                out.push_str(&t);
+            }
+        }
+        out
+    }
+}
+
+fn rule(width: usize) -> Line {
+    Line::new().s(S_DIM, format!(" {}", "─".repeat(width.saturating_sub(2))))
+}
+
+fn key_hints(hints: &[(&str, &str)]) -> Line {
+    let mut line = Line::new().s(S_PLAIN, " ");
+    for (i, (k, label)) in hints.iter().enumerate() {
+        if i > 0 {
+            line = line.s(S_PLAIN, "   ");
+        }
+        line = line.s(S_BOLD, *k).s(S_DIM, format!(" {label}"));
+    }
+    line
+}
+
+/// raw 모드 + 대체 화면 버퍼. Drop 시(패닉 포함) 터미널을 원래대로 되돌린다.
+struct Tui {
+    orig: Termios,
+}
+
+impl Tui {
+    fn enter() -> Result<Self, String> {
+        let mut orig = unsafe { std::mem::zeroed::<Termios>() };
+        if unsafe { tcgetattr(0, &mut orig) } != 0 {
+            return Err("터미널 설정을 읽을 수 없습니다.".into());
+        }
+        let mut raw = orig;
+        // ISIG 도 끈다: Ctrl+C 를 키로 받아 화면을 복구한 뒤 종료하기 위함
+        raw.c_lflag &= !(ICANON | ECHO | ISIG);
+        // VMIN=0, VTIME=2: 입력이 없어도 0.2초마다 깨어나 터미널 크기 변경을 반영
+        raw.c_cc[VMIN_IDX] = 0;
+        raw.c_cc[VTIME_IDX] = 2;
+        if unsafe { tcsetattr(0, TCSADRAIN, &raw) } != 0 {
+            return Err("터미널을 raw 모드로 전환할 수 없습니다.".into());
+        }
+        let tui = Tui { orig };
+        tui.write("\x1b[?1049h\x1b[?25l\x1b[H\x1b[2J");
+        Ok(tui)
+    }
+
+    fn write(&self, s: &str) {
+        let mut out = io::stdout().lock();
+        let _ = out.write_all(s.as_bytes());
+        let _ = out.flush();
+    }
+
+    fn size() -> (usize, usize) {
+        let mut ws = Winsize {
+            ws_row: 0,
+            ws_col: 0,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        for fd in [1, 0] {
+            if unsafe { ioctl(fd, TIOCGWINSZ, &mut ws as *mut Winsize) } == 0 && ws.ws_col > 0 && ws.ws_row > 0 {
+                return (ws.ws_col as usize, ws.ws_row as usize);
+            }
+        }
+        (80, 24)
+    }
+
+    /// 화면 전체를 지우지 않고 줄마다 덮어쓴 뒤 남는 부분만 지워 깜빡임을 없앤다.
+    fn draw(&self, lines: &[String]) {
+        let mut buf = String::from("\x1b[H");
+        for (i, l) in lines.iter().enumerate() {
+            if i > 0 {
+                buf.push_str("\r\n");
+            }
+            buf.push_str(l);
+            buf.push_str("\x1b[0m\x1b[K");
+        }
+        buf.push_str("\x1b[J");
+        self.write(&buf);
+    }
+
+    fn read_keys(&self) -> Vec<Key> {
+        let mut buf = [0u8; 64];
+        let n = unsafe { sys_read(0, buf.as_mut_ptr(), buf.len()) };
+        if n <= 0 {
+            return Vec::new();
+        }
+        parse_keys(&buf[..n as usize])
+    }
+}
+
+impl Drop for Tui {
+    fn drop(&mut self) {
+        self.write("\x1b[0m\x1b[?25h\x1b[?1049l");
+        unsafe { tcsetattr(0, TCSADRAIN, &self.orig) };
+    }
+}
+
+/// 출력 이름(파일명 또는 경로)을 실제 생성 경로와 ~/.local/bin 링크 이름으로 바꾼다.
+fn output_paths(bin_dir: &Path, out_name: &str) -> (PathBuf, String) {
+    if out_name.contains('/') {
+        let p = PathBuf::from(out_name);
+        let name = p
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("agy-patched")
+            .to_string();
+        (p, name)
+    } else {
+        (bin_dir.join(out_name), out_name.to_string())
+    }
+}
+
+fn local_bin_link(name: &str) -> Option<PathBuf> {
+    env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/bin").join(name))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Step {
+    Patches,
+    Output,
+    Confirm,
+}
+
+enum Action {
+    Continue,
+    Cancel,
+    Done,
+}
+
+struct OutputPlan {
+    dst: PathBuf,
+    link: Option<PathBuf>,
+    error: Option<String>,
+    notes: Vec<(&'static str, String)>,
+}
+
+/// 대화형 설정의 결과: (적용할 패치, 출력 이름, in-place 여부)
+type WizardResult = (Vec<&'static PatchSpec>, String, bool);
+
+struct Wizard<'a> {
+    src_bin: &'a Path,
+    target_bin: &'a Path,
+    bin_dir: &'a Path,
+    version: &'a str,
+    platform: String,
+    color: bool,
+    /// 각 패치를 이 바이너리에 실제로 적용할 수 있는지 (resolver 사전 실행 결과)
+    avail: Vec<Result<(), String>>,
+    selected: Vec<bool>,
+    cursor: usize,
+    scroll: usize,
+    step: Step,
+    out_choice: usize,
+    name: Vec<char>,
+    name_pos: usize,
+    name_edited: bool,
+    flash: Option<(&'static str, String)>,
+    /// 터미널 높이가 낮을 때 빈 줄을 줄여 목록 공간을 확보
+    compact: bool,
+}
+
+fn patch_index(id: &str) -> Option<usize> {
+    PATCH_REGISTRY.iter().position(|p| p.id == id)
+}
+
+impl<'a> Wizard<'a> {
+    fn new(src_bin: &'a Path, target_bin: &'a Path, bin_dir: &'a Path, version: &'a str, ctx: &BinaryContext) -> Self {
+        let avail: Vec<Result<(), String>> = PATCH_REGISTRY.iter().map(|p| (p.resolver)(ctx).map(|_| ())).collect();
+        let selected = PATCH_REGISTRY
+            .iter()
+            .zip(&avail)
+            .map(|(p, a)| p.default_on && a.is_ok())
+            .collect();
+        let format = match ctx.format {
+            Format::Elf64 => "ELF",
+            Format::MachO64 => "Mach-O",
+        };
+        let arch = match ctx.arch {
+            Arch::X86_64 => "x86_64",
+            Arch::Arm64 => "arm64",
+        };
+        let color = env::var_os("NO_COLOR").is_none() && env::var("TERM").map_or(true, |t| t != "dumb");
+        Wizard {
+            src_bin,
+            target_bin,
+            bin_dir,
+            version,
+            platform: format!("{format} · {arch}"),
+            color,
+            avail,
+            selected,
+            cursor: 0,
+            scroll: 0,
+            step: Step::Patches,
+            out_choice: 0,
+            name: Vec::new(),
+            name_pos: 0,
+            name_edited: false,
+            flash: None,
+            compact: false,
+        }
+    }
+
+    fn chosen(&self) -> Vec<&'static PatchSpec> {
+        PATCH_REGISTRY
+            .iter()
+            .zip(&self.selected)
+            .filter_map(|(p, &on)| on.then_some(p))
+            .collect()
+    }
+
+    fn default_name(&self) -> &'static str {
+        if patch_index("batch").is_some_and(|i| self.selected[i]) {
+            "agy-batch"
+        } else {
+            "agy-patched"
+        }
+    }
+
+    fn name_str(&self) -> String {
+        let s: String = self.name.iter().collect();
+        let s = s.trim().to_string();
+        match (s.strip_prefix("~/"), env::var_os("HOME")) {
+            (Some(rest), Some(home)) => PathBuf::from(home).join(rest).display().to_string(),
+            _ => s,
+        }
+    }
+
+    fn toggle(&mut self, i: usize) {
+        if self.avail[i].is_err() {
+            // 사유는 하단 상세 영역에 이미 표시된다
+            self.flash = Some((S_WARN, format!("'{}' 패치는 이 바이너리에 적용할 수 없어 선택할 수 없습니다.", PATCH_REGISTRY[i].id)));
+            return;
+        }
+        self.selected[i] = !self.selected[i];
+
+        // batch 는 nodrip 과 함께 동작해야 하므로 두 패치를 연동한다.
+        let (Some(b), Some(nd)) = (patch_index("batch"), patch_index("nodrip")) else {
+            return;
+        };
+        if i == b && self.selected[b] && !self.selected[nd] && self.avail[nd].is_ok() {
+            self.selected[nd] = true;
+            self.flash = Some((S_ACCENT, "batch 는 nodrip 과 함께 동작하므로 nodrip 도 선택했습니다.".into()));
+        } else if i == nd && !self.selected[nd] && self.selected[b] {
+            self.selected[b] = false;
+            self.flash = Some((S_ACCENT, "nodrip 을 해제하면 batch 도 함께 해제됩니다.".into()));
+        }
+    }
+
+    fn toggle_all(&mut self) {
+        let avail_idx: Vec<usize> = (0..PATCH_REGISTRY.len()).filter(|&i| self.avail[i].is_ok()).collect();
+        let all_on = avail_idx.iter().all(|&i| self.selected[i]);
+        for i in avail_idx {
+            self.selected[i] = !all_on;
+        }
+    }
+
+    fn output_plan(&self) -> OutputPlan {
+        let name = self.name_str();
+        let (dst, link_name) = output_paths(self.bin_dir, &name);
+        let mut plan = OutputPlan {
+            dst: dst.clone(),
+            link: local_bin_link(&link_name),
+            error: None,
+            notes: Vec::new(),
+        };
+
+        if name.is_empty() {
+            plan.error = Some("실행 파일 이름을 입력하세요.".into());
+            return plan;
+        }
+        if name.ends_with('/') || dst.file_name().is_none() {
+            plan.error = Some("경로는 파일 이름으로 끝나야 합니다.".into());
+            return plan;
+        }
+        let parent = match dst.parent() {
+            Some(p) if p.as_os_str().is_empty() => PathBuf::from("."),
+            Some(p) => p.to_path_buf(),
+            None => PathBuf::from("."),
+        };
+        let Ok(parent) = fs::canonicalize(&parent) else {
+            plan.error = Some(format!("디렉토리가 없습니다: {}", parent.display()));
+            return plan;
+        };
+        let real_dst = parent.join(dst.file_name().unwrap_or_default());
+        let backup = self.bin_dir.join("antigravity.orig");
+        if real_dst == self.target_bin || real_dst == self.src_bin || real_dst == backup {
+            plan.error = Some("원본과 같은 경로입니다. 원본에 적용하려면 아래 in-place 를 고르세요.".into());
+            return plan;
+        }
+
+        if real_dst.exists() {
+            plan.notes.push((S_DIM, "같은 이름의 기존 파일을 새로 덮어씁니다.".into()));
+        }
+        if let Some(link) = &plan.link {
+            if link.exists() || link.is_symlink() {
+                match fs::read_link(link) {
+                    Ok(t) if t == real_dst || t == dst => {}
+                    Ok(t) => plan.notes.push((
+                        S_WARN,
+                        format!("{} 링크가 다른 파일({})을 가리키고 있어 교체됩니다.", tilde_path(link), tilde_path(&t)),
+                    )),
+                    Err(_) => plan
+                        .notes
+                        .push((S_WARN, format!("{} 에 있는 일반 파일을 링크로 교체합니다.", tilde_path(link)))),
+                }
+            }
+        }
+        plan
+    }
+
+    fn handle_key(&mut self, key: Key) -> Action {
+        if key == Key::CtrlC {
+            return Action::Cancel;
+        }
+        self.flash = None;
+        let n = PATCH_REGISTRY.len();
+        match self.step {
+            Step::Patches => match key {
+                Key::Esc | Key::Char('q') | Key::Char('Q') => return Action::Cancel,
+                Key::Up | Key::Char('k') => self.cursor = (self.cursor + n - 1) % n,
+                Key::Down | Key::Char('j') => self.cursor = (self.cursor + 1) % n,
+                Key::Home => self.cursor = 0,
+                Key::End => self.cursor = n - 1,
+                Key::Char(' ') => self.toggle(self.cursor),
+                Key::Char('a') | Key::Char('A') => self.toggle_all(),
+                Key::Char(c) if c.is_ascii_digit() => {
+                    let idx = (c as u8 - b'0') as usize;
+                    if (1..=n).contains(&idx) {
+                        self.cursor = idx - 1;
+                        self.toggle(idx - 1);
+                    }
+                }
+                Key::Enter | Key::Right => {
+                    if self.selected.iter().any(|&x| x) {
+                        if !self.name_edited {
+                            self.name = self.default_name().chars().collect();
+                            self.name_pos = self.name.len();
+                        }
+                        self.step = Step::Output;
+                    } else {
+                        self.flash = Some((S_WARN, "적용할 패치를 하나 이상 선택하세요.".into()));
+                    }
+                }
+                _ => {}
+            },
+            Step::Output => match key {
+                Key::Esc => self.step = Step::Patches,
+                Key::Up => self.out_choice = 0,
+                Key::Down => self.out_choice = 1,
+                Key::Enter => {
+                    if self.out_choice == 1 {
+                        self.step = Step::Confirm;
+                    } else if self.output_plan().error.is_some() {
+                        // 오류 내용은 이름 칸 아래에 이미 표시되어 있다
+                    } else {
+                        self.step = Step::Confirm;
+                    }
+                }
+                Key::Left if self.out_choice == 0 => self.name_pos = self.name_pos.saturating_sub(1),
+                Key::Right if self.out_choice == 0 => self.name_pos = (self.name_pos + 1).min(self.name.len()),
+                Key::Home if self.out_choice == 0 => self.name_pos = 0,
+                Key::End if self.out_choice == 0 => self.name_pos = self.name.len(),
+                Key::Backspace if self.out_choice == 0 && self.name_pos > 0 => {
+                    self.name_pos -= 1;
+                    self.name.remove(self.name_pos);
+                    self.name_edited = true;
+                }
+                Key::Delete if self.out_choice == 0 && self.name_pos < self.name.len() => {
+                    self.name.remove(self.name_pos);
+                    self.name_edited = true;
+                }
+                Key::Char(c) if self.out_choice == 0 && !c.is_control() => {
+                    self.name.insert(self.name_pos, c);
+                    self.name_pos += 1;
+                    self.name_edited = true;
+                }
+                _ => {}
+            },
+            Step::Confirm => match key {
+                Key::Esc | Key::Left => self.step = Step::Output,
+                Key::Char('q') | Key::Char('Q') => return Action::Cancel,
+                Key::Enter => return Action::Done,
+                _ => {}
+            },
+        }
+        Action::Continue
+    }
+
+    fn header(&self, w: usize) -> Vec<Line> {
+        let mut lines = Vec::new();
+        if !self.compact {
+            lines.push(Line::new());
+        }
+        lines.push(
+            Line::new()
+                .s(S_PLAIN, " ")
+                .s(S_ACCENT_B, "agy-cli-patch")
+                .s(S_DIM, format!(" v{}", env!("CARGO_PKG_VERSION")))
+                .with_right(Line::new().s(S_DIM, format!("{} ", self.platform)), w),
+        );
+        let ver = format!("  {}", self.version);
+        let budget = w.saturating_sub(8 + str_width(&ver)).max(10);
+        lines.push(
+            Line::new()
+                .s(S_DIM, " 대상  ")
+                .s(S_PLAIN, truncate_start(&tilde_path(self.target_bin), budget))
+                .s(S_DIM, ver),
+        );
+        if self.src_bin != self.target_bin {
+            lines.push(
+                Line::new()
+                    .s(S_DIM, " 원본  ")
+                    .s(S_PLAIN, truncate_start(&tilde_path(self.src_bin), w.saturating_sub(8)))
+                    .s(S_DIM, "  (백업본에서 패치)"),
+            );
+        }
+        if !self.compact {
+            lines.push(Line::new());
+        }
+
+        let steps = [(Step::Patches, "패치 선택"), (Step::Output, "출력 방식"), (Step::Confirm, "확인")];
+        let cur = steps.iter().position(|(s, _)| *s == self.step).unwrap_or(0);
+        let mut line = Line::new().s(S_PLAIN, " ");
+        for (i, (_, label)) in steps.iter().enumerate() {
+            if i > 0 {
+                line = line.s(S_DIM, "  ›  ");
+            }
+            let (num_style, label_style, mark) = if i < cur {
+                (S_OK, S_DIM, "✓".to_string())
+            } else if i == cur {
+                (S_ACCENT_B, S_BOLD, (i + 1).to_string())
+            } else {
+                (S_DIM, S_DIM, (i + 1).to_string())
+            };
+            line = line.s(num_style, mark).s(label_style, format!(" {label}"));
+        }
+        lines.push(line);
+        lines.push(rule(w));
+        lines
+    }
+
+    /// 알림 메시지(있으면)와 키 안내 앞의 빈 줄
+    fn flash_lines(&self) -> Vec<Line> {
+        let mut lines = vec![Line::new()];
+        if let Some((style, msg)) = &self.flash {
+            lines.push(Line::new().s(style, format!(" {msg}")));
+            lines.push(Line::new());
+        }
+        lines
+    }
+
+    fn id_width() -> usize {
+        PATCH_REGISTRY.iter().map(|p| str_width(p.id)).max().unwrap_or(8) + 2
+    }
+
+    fn body_patches(&mut self, w: usize, room: usize) -> (Vec<Line>, Vec<Line>) {
+        let idw = Self::id_width();
+        let count = self.selected.iter().filter(|&&x| x).count();
+        let mut top = vec![Line::new()
+            .s(S_BOLD, " 적용할 패치를 고르세요")
+            .with_right(Line::new().s(S_DIM, format!("{count}/{} 선택 ", PATCH_REGISTRY.len())), w)];
+        if !self.compact {
+            top.push(Line::new());
+        }
+
+        // 하단: 커서가 가리키는 패치의 상세 설명
+        let spec = &PATCH_REGISTRY[self.cursor];
+        let mut bottom = if self.compact { vec![rule(w)] } else { vec![Line::new(), rule(w)] };
+        let desc_max = if self.compact { 2 } else { 3 };
+        for l in wrap_text(spec.description, w.saturating_sub(3)).into_iter().take(desc_max) {
+            bottom.push(Line::new().s(S_PLAIN, format!(" {l}")));
+        }
+        bottom.push(Line::new().s(S_DIM, " 심볼  ").s(S_DIM, spec.symbol));
+        if let Err(e) = &self.avail[self.cursor] {
+            bottom.push(Line::new().s(S_ERR, " 사용 불가  ").s(S_ERR, e.clone()));
+        }
+        bottom.extend(self.flash_lines());
+
+        // 목록: 화면이 작으면 커서를 따라 스크롤
+        let list_h = room.saturating_sub(top.len() + bottom.len()).max(1);
+        if self.cursor < self.scroll {
+            self.scroll = self.cursor;
+        } else if self.cursor >= self.scroll + list_h {
+            self.scroll = self.cursor + 1 - list_h;
+        }
+        // 화면이 커지면 위로 당겨 빈 줄 없이 채운다
+        self.scroll = self.scroll.min(PATCH_REGISTRY.len().saturating_sub(list_h));
+        let mut lines = top;
+        let end = (self.scroll + list_h).min(PATCH_REGISTRY.len());
+        for (i, p) in PATCH_REGISTRY.iter().enumerate().take(end).skip(self.scroll) {
+            let is_cur = i == self.cursor;
+            let ok = self.avail[i].is_ok();
+            let pointer = if is_cur { (S_ACCENT_B, " ❯ ") } else { (S_PLAIN, "   ") };
+            let check = match (ok, self.selected[i]) {
+                (false, _) => (S_DIM, "✕ "),
+                (true, true) => (S_OK, "◉ "),
+                (true, false) => (S_DIM, "○ "),
+            };
+            let (id_style, title_style) = match (ok, is_cur) {
+                (false, _) => (S_DIM, S_DIM),
+                (true, true) => (S_ACCENT_B, S_BOLD),
+                (true, false) => (S_ACCENT, S_PLAIN),
+            };
+            let pad = " ".repeat(idw.saturating_sub(str_width(p.id)));
+            let mut line = Line::new()
+                .s(pointer.0, pointer.1)
+                .s(check.0, check.1)
+                .s(id_style, format!("{}{pad}", p.id))
+                .s(title_style, p.title);
+            if !ok {
+                line = line.s(S_DIM, "  (사용 불가)");
+            }
+            lines.push(line);
+        }
+        if self.scroll + list_h < PATCH_REGISTRY.len() {
+            if let Some(last) = lines.last_mut() {
+                *last = Line::new().s(S_DIM, format!("   … {}개 더", PATCH_REGISTRY.len() - self.scroll - list_h + 1));
+            }
+        }
+        lines.extend(bottom);
+        let footer = vec![key_hints(&[
+            ("↑↓", "이동"),
+            ("space", "선택"),
+            ("a", "전체"),
+            ("enter", "다음"),
+            ("q", "종료"),
+        ])];
+        (lines, footer)
+    }
+
+    fn body_output(&self, w: usize) -> (Vec<Line>, Vec<Line>) {
+        let mut lines = vec![Line::new().s(S_BOLD, " 결과물을 어떻게 만들까요?"), Line::new()];
+
+        // 1) 새 실행 파일
+        let sel0 = self.out_choice == 0;
+        lines.push(
+            Line::new()
+                .s(if sel0 { S_ACCENT_B } else { S_PLAIN }, if sel0 { " ❯ " } else { "   " })
+                .s(if sel0 { S_BOLD } else { S_PLAIN }, "새 실행 파일 만들기")
+                .s(S_DIM, "   원본은 그대로 둡니다"),
+        );
+        let mut field = Line::new().s(S_DIM, "     이름  ");
+        if sel0 {
+            let before: String = self.name[..self.name_pos].iter().collect();
+            let at = self.name.get(self.name_pos).map_or(" ".to_string(), |c| c.to_string());
+            let after: String = self.name.get(self.name_pos + 1..).map_or(String::new(), |s| s.iter().collect());
+            field = field.s(S_ACCENT_B, before).s(S_CARET, at).s(S_ACCENT_B, after);
+        } else {
+            field = field.s(S_PLAIN, self.name.iter().collect::<String>());
+        }
+        lines.push(field);
+        let plan = self.output_plan();
+        let pw = w.saturating_sub(13);
+        if let Some(err) = &plan.error {
+            lines.push(Line::new().s(S_ERR, format!("     {err}")));
+        } else {
+            lines.push(
+                Line::new()
+                    .s(S_DIM, "     생성  ")
+                    .s(S_PLAIN, truncate_start(&tilde_path(&plan.dst), pw)),
+            );
+            if let Some(link) = &plan.link {
+                lines.push(
+                    Line::new()
+                        .s(S_DIM, "     링크  ")
+                        .s(S_PLAIN, truncate_start(&tilde_path(link), pw)),
+                );
+            }
+            for (style, note) in &plan.notes {
+                for l in wrap_text(note, w.saturating_sub(6)) {
+                    lines.push(Line::new().s(style, format!("     {l}")));
+                }
+            }
+        }
+        lines.push(Line::new());
+
+        // 2) in-place
+        let sel1 = self.out_choice == 1;
+        let backup = self.bin_dir.join("antigravity.orig");
+        lines.push(
+            Line::new()
+                .s(if sel1 { S_ACCENT_B } else { S_PLAIN }, if sel1 { " ❯ " } else { "   " })
+                .s(if sel1 { S_BOLD } else { S_PLAIN }, "기본 agy에 직접 덮어쓰기")
+                .s(S_DIM, "   in-place"),
+        );
+        let backup_note = if backup.exists() { "  (이미 있음)" } else { "  (새로 만듦)" };
+        lines.push(
+            Line::new()
+                .s(S_DIM, "     백업  ")
+                .s(S_PLAIN, truncate_start(&tilde_path(&backup), pw.saturating_sub(14)))
+                .s(S_DIM, backup_note),
+        );
+        for l in wrap_text("agy 자체 업데이트 시 패치가 사라지므로 다시 실행해야 합니다.", w.saturating_sub(6)) {
+            lines.push(Line::new().s(S_DIM, format!("     {l}")));
+        }
+        lines.extend(self.flash_lines());
+
+        let hints: &[(&str, &str)] = if sel0 {
+            &[("↑↓", "방식"), ("←→", "커서"), ("enter", "다음"), ("esc", "뒤로"), ("ctrl+c", "종료")]
+        } else {
+            &[("↑↓", "방식"), ("enter", "다음"), ("esc", "뒤로"), ("ctrl+c", "종료")]
+        };
+        (lines, vec![key_hints(hints)])
+    }
+
+    fn body_confirm(&self, w: usize) -> (Vec<Line>, Vec<Line>) {
+        let chosen = self.chosen();
+        let idw = Self::id_width();
+        let mut lines = vec![
+            Line::new().s(S_BOLD, " 아래 내용으로 패치합니다"),
+            Line::new(),
+            Line::new().s(S_DIM, format!(" 적용할 패치 {}개", chosen.len())),
+        ];
+        for p in &chosen {
+            let pad = " ".repeat(idw.saturating_sub(str_width(p.id)));
+            lines.push(
+                Line::new()
+                    .s(S_OK, "   ✓ ")
+                    .s(S_ACCENT, format!("{}{pad}", p.id))
+                    .s(S_PLAIN, p.title),
+            );
+        }
+        lines.push(Line::new());
+        lines.push(Line::new().s(S_DIM, " 출력"));
+        let pw = w.saturating_sub(10);
+        if self.out_choice == 1 {
+            let backup = self.bin_dir.join("antigravity.orig");
+            lines.push(
+                Line::new()
+                    .s(S_DIM, "   덮어쓰기  ")
+                    .s(S_PLAIN, truncate_start(&tilde_path(self.target_bin), pw)),
+            );
+            lines.push(
+                Line::new()
+                    .s(S_DIM, "   원본 백업  ")
+                    .s(S_PLAIN, truncate_start(&tilde_path(&backup), pw)),
+            );
+        } else {
+            let plan = self.output_plan();
+            lines.push(
+                Line::new()
+                    .s(S_DIM, "   생성  ")
+                    .s(S_PLAIN, truncate_start(&tilde_path(&plan.dst), pw)),
+            );
+            if let Some(link) = &plan.link {
+                lines.push(
+                    Line::new()
+                        .s(S_DIM, "   링크  ")
+                        .s(S_PLAIN, truncate_start(&tilde_path(link), pw)),
+                );
+            }
+            for (style, note) in &plan.notes {
+                for l in wrap_text(note, w.saturating_sub(4)) {
+                    lines.push(Line::new().s(style, format!("   {l}")));
+                }
+            }
+        }
+        lines.extend(self.flash_lines());
+        (lines, vec![key_hints(&[("enter", "패치 실행"), ("esc", "뒤로"), ("q", "종료")])])
+    }
+
+    fn render(&mut self, w: usize, h: usize) -> Vec<String> {
+        // 마지막 열에 쓰면 일부 터미널에서 줄이 넘어가므로 한 칸 여유를 둔다
+        let w = w.saturating_sub(1).max(20);
+        self.compact = h < 26;
+        let header = self.header(w);
+        let room = h.saturating_sub(header.len() + 1);
+        let (body, footer) = match self.step {
+            Step::Patches => self.body_patches(w, room),
+            Step::Output => self.body_output(w),
+            Step::Confirm => self.body_confirm(w),
+        };
+
+        let mut all = header;
+        all.extend(body);
+        all.extend(footer);
+        if all.len() > h {
+            all.drain(h.saturating_sub(1)..all.len() - 1);
+        }
+        all.iter().map(|l| l.render(w, self.color)).collect()
+    }
+}
+
+/// 대화형 설정 화면. 취소하면 None 을 돌려준다.
+fn interactive_wizard(
+    src_bin: &Path,
+    target_bin: &Path,
+    version: &str,
+    ctx: &BinaryContext,
+) -> Result<Option<WizardResult>, String> {
+    let bin_dir = target_bin.parent().ok_or("상위 디렉토리를 확인할 수 없습니다.")?;
+    let mut wiz = Wizard::new(src_bin, target_bin, bin_dir, version, ctx);
+    let tui = Tui::enter()?;
+
+    let mut last_size = (0, 0);
+    let mut dirty = true;
+    loop {
+        let size = Tui::size();
+        if dirty || size != last_size {
+            tui.draw(&wiz.render(size.0, size.1));
+            last_size = size;
+            dirty = false;
+        }
+        for key in tui.read_keys() {
+            dirty = true;
+            match wiz.handle_key(key) {
+                Action::Continue => {}
+                Action::Cancel => return Ok(None),
+                Action::Done => {
+                    drop(tui);
+                    let mut chosen = wiz.chosen();
+                    // 안전장치: batch 는 nodrip 없이 적용하지 않는다
+                    if chosen.iter().any(|p| p.id == "batch") && !chosen.iter().any(|p| p.id == "nodrip") {
+                        chosen.insert(0, &PATCH_REGISTRY[0]);
+                    }
+                    return Ok(Some(if wiz.out_choice == 1 {
+                        (chosen, String::new(), true)
+                    } else {
+                        (chosen, wiz.name_str(), false)
+                    }));
+                }
+            }
+        }
     }
 }
 
@@ -1401,7 +2279,8 @@ fn run() -> Result<(), String> {
 
     // mise 설치 디렉토리명(예: 1.5.6)은 agy 자체 업데이트 후 실제 버전과 어긋날 수 있으므로
     // 바이너리가 보고하는 버전을 함께 출력한다.
-    println!("[*] 대상 바이너리: {} (버전 {})", target_bin.display(), binary_version(&target_bin));
+    let target_version = binary_version(&target_bin);
+    println!("[*] 대상 바이너리: {} (버전 {})", target_bin.display(), target_version);
     if src_bin != target_bin {
         println!("[*] 패치 원본:     {} (버전 {})", src_bin.display(), binary_version(&src_bin));
     }
@@ -1436,7 +2315,13 @@ fn run() -> Result<(), String> {
 
     let (chosen_patches, out_name, do_in_place) =
         if patches_arg.is_none() && output_arg.is_none() && !in_place {
-            interactive_wizard(&src_bin, &ctx)
+            match interactive_wizard(&src_bin, &target_bin, &target_version, &ctx)? {
+                Some(result) => result,
+                None => {
+                    println!("취소되었습니다.");
+                    return Ok(());
+                }
+            }
         } else {
             let patches = parse_patch_list(patches_arg.as_deref().unwrap_or("all"))?;
             let default_out = if patches.iter().any(|p| p.id == "batch") {
@@ -1460,17 +2345,7 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
 
-    let (dst_path, symlink_name) = if out_name.contains('/') {
-        let p = PathBuf::from(&out_name);
-        let name = p
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("agy-patched")
-            .to_string();
-        (p, name)
-    } else {
-        (bin_dir.join(&out_name), out_name)
-    };
+    let (dst_path, symlink_name) = output_paths(bin_dir, &out_name);
 
     build_patched_binary(&src_bin, &ctx, &chosen_patches, &dst_path, Some(&symlink_name))
 }
