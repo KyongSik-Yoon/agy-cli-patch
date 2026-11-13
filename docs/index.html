@@ -24,110 +24,217 @@
 }
 *{box-sizing:border-box}
 html{scroll-behavior:smooth}
-body{margin:0;background:var(--bg);color:var(--fg);font-family:var(--sans);font-size:16px;line-height:1.7;word-break:keep-all;overflow-wrap:anywhere;-webkit-font-smoothing:antialiased}
+body{margin:0;background:var(--bg);color:var(--fg);font-family:var(--sans);font-size:16px;line-height:1.7;word-break:keep-all;overflow-wrap:anywhere;-webkit-font-smoothing:antialiased;overflow-x:hidden}
 a{color:var(--accent);text-decoration:none}
 a:hover{text-decoration:underline}
 code,.mono{font-family:var(--mono)}
 .wrap{max-width:1080px;margin:0 auto;padding:0 20px}
 button{font:inherit;color:inherit;cursor:pointer}
 :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+[hidden]{display:none!important}
 
-header.top{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:18px 0}
+/* 머리말 */
+.topbar{position:sticky;top:0;z-index:20;background:rgba(12,16,19,.78);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);border-bottom:1px solid transparent;transition:border-color .3s}
+.topbar.stuck{border-bottom-color:var(--line)}
+.topbar .in{display:flex;align-items:center;justify-content:space-between;gap:12px;padding-top:14px;padding-bottom:14px}
+.topbar .prog{position:absolute;left:0;bottom:-1px;height:2px;width:100%;background:linear-gradient(90deg,var(--accent),var(--ok));transform-origin:0 50%;transform:scaleX(0)}
 .brand{font-family:var(--mono);font-weight:700;color:var(--accent);font-size:15px}
 .brand span{color:var(--dim);font-weight:400}
-header.top nav{display:flex;gap:18px;font-size:14px}
-header.top nav a{color:var(--dim)}
-header.top nav a:hover{color:var(--fg);text-decoration:none}
+.topbar nav{display:flex;gap:18px;font-size:14px}
+.topbar nav a{color:var(--dim)}
+.topbar nav a:hover{color:var(--fg);text-decoration:none}
 
-.hero{padding:36px 0 72px}
-.hero h1{font-size:clamp(30px,5.4vw,54px);line-height:1.22;margin:0 0 16px;font-weight:700;letter-spacing:-.02em}
-.hero h1 em{font-style:normal;color:var(--accent)}
+/* 첫 화면 */
+.heroZone{position:relative}
+#field{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;-webkit-mask-image:radial-gradient(85% 75% at 92% 0%,#000 0,rgba(0,0,0,.45) 40%,transparent 68%);mask-image:radial-gradient(85% 75% at 92% 0%,#000 0,rgba(0,0,0,.45) 40%,transparent 68%)}
+.hero{position:relative;padding:44px 0 72px}
+.hero h1{font-size:clamp(30px,5.4vw,56px);line-height:1.2;margin:0 0 16px;font-weight:700;letter-spacing:-.02em}
+.hero h1 em{font-style:normal;color:var(--accent);position:relative;white-space:nowrap}
+.hero h1 em::after{content:"";position:absolute;left:0;right:0;bottom:.02em;height:.09em;background:var(--accent);transform-origin:0 50%;animation:under 1s .5s cubic-bezier(.2,.8,.2,1) both}
+@keyframes under{from{transform:scaleX(0)}to{transform:scaleX(1)}}
 .hero p.lead{max-width:640px;color:var(--dim);margin:0 0 30px;font-size:17px}
 .hero p.lead b{color:var(--fg);font-weight:500}
+.js .hero .up{animation:up .7s cubic-bezier(.2,.8,.2,1) both}
+.js .hero .up.d1{animation-delay:.08s}.js .hero .up.d2{animation-delay:.18s}
+@keyframes up{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:none}}
 
 .demo{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(0,1fr);gap:16px;align-items:stretch}
-.win{background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden;display:flex;flex-direction:column;min-width:0}
+.win{background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden;display:flex;flex-direction:column;min-width:0;box-shadow:0 18px 50px -24px rgba(0,0,0,.8)}
 .win .bar{display:flex;align-items:center;gap:8px;padding:9px 12px;border-bottom:1px solid var(--line);font-family:var(--mono);font-size:12.5px;color:var(--dim)}
 .win .bar i{width:10px;height:10px;border-radius:50%;background:var(--line2);display:block}
 .win .bar b{font-weight:500;margin-left:6px}
-.term{font-family:var(--mono);font-size:14px;line-height:1.75;padding:16px 18px;min-height:330px;flex:1}
+.win .bar .r{margin-left:auto;color:var(--faint)}
+.term{font-family:var(--mono);font-size:14px;line-height:1.75;padding:16px 18px;min-height:300px;flex:1}
 .term .h{color:var(--accent);font-weight:700}
 .term .h .px{color:var(--faint)}
 .term b{color:#fff;font-weight:700}
 .term code{background:#22303a;color:var(--warn);padding:1px 5px;border-radius:3px}
 .term s{color:var(--faint)}
 .term .sp{height:.9em}
-.term .caret{display:inline-block;width:.55em;height:1.05em;background:var(--fg);vertical-align:-.18em;margin-left:1px}
-.stat{display:flex;flex-wrap:wrap;gap:4px 16px;padding:8px 14px;border-top:1px solid var(--line);font-family:var(--mono);font-size:12px;color:var(--dim)}
-.stat em{font-style:normal;color:var(--fg)}
+.term .caret{display:inline-block;width:.55em;height:1.05em;background:var(--fg);vertical-align:-.18em;margin-left:1px;animation:blink 1s steps(2) infinite}
+@keyframes blink{50%{opacity:.25}}
+.term .fx{animation:fx 1.1s ease-out;border-radius:4px}
+@keyframes fx{0%{background:rgba(95,215,215,.38);box-shadow:0 0 0 4px rgba(95,215,215,.38)}100%{background:transparent;box-shadow:0 0 0 4px transparent}}
+.term.pop>div{animation:pop .45s cubic-bezier(.2,.8,.2,1) both}
+@keyframes pop{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+.meter{padding:10px 14px 4px;border-top:1px solid var(--line);font-family:var(--mono);font-size:12px;color:var(--dim);display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:5px 10px;align-items:center}
+.meter .tr{height:6px;background:#1d272e;border-radius:3px;overflow:hidden}
+.meter .tr i{display:block;height:100%;width:0;border-radius:3px;background:var(--dim)}
+.meter .tr i.sh{background:var(--accent)}
+.meter em{font-style:normal;color:var(--fg);min-width:4.2em;text-align:right}
+.stat{display:flex;gap:16px;padding:4px 14px 10px;font-family:var(--mono);font-size:12px;color:var(--dim)}
 .stat .state{margin-left:auto}
 .stat .state.done{color:var(--ok)}
+.stat .lag.hot{color:var(--warn)}
 
 .sw{font-family:var(--mono);font-size:13.5px;padding:14px 8px 10px;flex:1;display:flex;flex-direction:column}
 .sw .hd{display:flex;justify-content:space-between;padding:0 8px 8px;color:var(--fg);font-weight:700;font-family:var(--sans);font-size:14px}
 .sw .hd span{font-family:var(--mono);font-weight:400;color:var(--dim);font-size:12.5px}
-.sw button.row{display:grid;grid-template-columns:20px 1fr;gap:2px 6px;width:100%;text-align:left;background:none;border:0;border-radius:6px;padding:7px 8px}
-.sw button.row:hover{background:#1b252c}
-.sw .ck{color:var(--faint)}
+.sw button.row{display:grid;grid-template-columns:14px 18px 1fr;gap:2px 4px;width:100%;text-align:left;background:none;border:0;border-radius:6px;padding:7px 8px 7px 4px;transition:background .2s}
+.sw button.row:hover,.sw button.row.cur{background:#1b252c}
+.sw .pt{color:var(--accent);font-weight:700;opacity:0}
+.sw button.row.cur .pt{opacity:1}
+.sw .ck{color:var(--faint);transition:color .2s,transform .25s}
 .sw .id{color:var(--accent)}
-.sw .ds{grid-column:2;color:var(--dim);font-family:var(--sans);font-size:12.5px;line-height:1.45}
-.sw button.row[aria-checked="true"] .ck{color:var(--ok)}
+.sw .ds{grid-column:3;color:var(--dim);font-family:var(--sans);font-size:12.5px;line-height:1.45}
+.sw button.row[aria-checked="true"] .ck{color:var(--ok);transform:scale(1.15)}
 .sw button.row[aria-checked="true"] .id{font-weight:700}
 .sw .flash{min-height:2.9em;padding:6px 8px 0;color:var(--accent);font-family:var(--sans);font-size:12.5px;line-height:1.45}
-.sw .acts{display:flex;gap:8px;padding:6px 8px 4px;margin-top:auto}
-.btn{background:#1b252c;border:1px solid var(--line2);border-radius:6px;padding:6px 12px;font-size:13px;font-family:var(--sans)}
+.sw .acts{display:flex;flex-wrap:wrap;gap:8px;padding:6px 8px 4px;margin-top:auto}
+.btn{background:#1b252c;border:1px solid var(--line2);border-radius:6px;padding:6px 12px;font-size:13px;font-family:var(--sans);transition:border-color .2s,background .2s}
 .btn:hover{border-color:var(--accent)}
+.btn[aria-pressed="true"]{border-color:var(--accent);color:var(--accent)}
 .note{color:var(--faint);font-size:12.5px;margin:10px 2px 0}
 
-section{padding:72px 0;border-top:1px solid var(--line)}
+section{padding:76px 0;border-top:1px solid var(--line)}
 section h2{font-size:clamp(23px,3.4vw,32px);line-height:1.3;margin:0 0 10px;letter-spacing:-.01em}
 section p.sub{color:var(--dim);max-width:660px;margin:0 0 30px}
 .kicker{font-family:var(--mono);font-size:12.5px;color:var(--accent);margin-bottom:10px}
+.js .rv{opacity:0;transform:translateY(22px);transition:opacity .7s cubic-bezier(.2,.8,.2,1),transform .7s cubic-bezier(.2,.8,.2,1);transition-delay:var(--d,0s)}
+.js .rv.in{opacity:1;transform:none}
 
+/* 빛 따라오는 카드 */
+.glow{position:relative}
+.glow::after{content:"";position:absolute;inset:0;border-radius:inherit;pointer-events:none;opacity:0;transition:opacity .3s;background:radial-gradient(260px circle at var(--mx,50%) var(--my,50%),rgba(95,215,215,.10),transparent 70%)}
+.glow:hover::after{opacity:1}
+
+/* 패치 목록 */
 .plist{border:1px solid var(--line);border-radius:10px;overflow:hidden}
-.plist .p{display:grid;grid-template-columns:150px minmax(0,1fr);gap:4px 20px;padding:15px 18px;border-top:1px solid var(--line);background:var(--bg2)}
+.plist .p{display:grid;grid-template-columns:140px minmax(0,1fr) 310px;gap:4px 20px;padding:16px 18px;border-top:1px solid var(--line);background:var(--bg2);align-items:center}
 .plist .p:first-child{border-top:0}
-.plist .id{font-family:var(--mono);color:var(--accent);font-weight:700;font-size:14.5px}
+.plist .id{font-family:var(--mono);color:var(--accent);font-weight:700;font-size:14.5px;align-self:start}
 .plist .d{font-size:15px}
-.plist .sym{grid-column:2;font-family:var(--mono);font-size:12.5px;color:var(--faint)}
+.plist .sym{font-family:var(--mono);font-size:12.5px;color:var(--faint);margin-top:4px}
 .tag{display:inline-block;font-family:var(--mono);font-size:11px;border:1px solid var(--line2);border-radius:4px;padding:0 6px;color:var(--warn);margin-left:6px;vertical-align:1px;white-space:nowrap}
+.mini{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:8px 12px 10px;font-family:var(--mono);font-size:13px;line-height:1.6;min-height:74px;position:relative;z-index:1;transition:border-color .3s}
+.mini:hover{border-color:var(--line2)}
+.mini[data-on="1"]{border-color:rgba(127,216,143,.45)}
+.mini .lab{display:flex;justify-content:space-between;font-family:var(--sans);font-size:11px;color:var(--faint);margin-bottom:3px}
+.mini .lab i{font-style:normal}
+.mini .lab i::before{content:"패치 전"}
+.mini[data-on="1"] .lab i{color:var(--ok)}
+.mini[data-on="1"] .lab i::before{content:"패치 후"}
+.mini .c{display:block;white-space:nowrap;overflow:hidden}
+.mini .px{display:inline-block;max-width:4ch;overflow:hidden;vertical-align:bottom;color:var(--faint);transition:max-width .5s cubic-bezier(.2,.8,.2,1),opacity .4s;white-space:pre}
+.mini[data-on="1"] .px{max-width:0;opacity:0}
+.mini .hx{color:var(--accent);font-weight:700}
+.mini .bd{transition:color .4s,font-weight .4s}
+.mini[data-on="1"] .bd{color:#fff;font-weight:700}
+.mini .tl{display:inline-block;max-width:0;overflow:hidden;vertical-align:bottom;transition:max-width .5s}
+.mini[data-on="1"] .tl{max-width:1ch}
+.mini .sk{text-decoration:line-through;color:var(--faint);transition:color .4s,text-decoration-color .4s}
+.mini[data-on="1"] .sk{text-decoration-color:transparent;color:var(--fg)}
+.mini .add{color:var(--ok);display:inline-block;max-width:0;overflow:hidden;vertical-align:bottom;white-space:pre;transition:max-width .7s cubic-bezier(.2,.8,.2,1)}
+.mini[data-on="1"] .add{max-width:17ch}
+.mini .rn{display:block;font-size:11.5px;line-height:1.55;color:var(--dim);max-height:0;opacity:0;overflow:hidden;transition:max-height .6s,opacity .5s}
+.mini .rn b{color:var(--fg)}.mini .rn u{text-decoration:none;color:var(--ok)}
+.mini[data-on="1"] .rn{max-height:5em;opacity:1}
+.mini .dr{display:inline-block}
+.mini[data-on="0"] .dr{animation:drip0 2.2s steps(7,end) both}
+.mini[data-on="1"] .dr{animation:inst .25s ease-out both}
+@keyframes drip0{from{clip-path:inset(0 100% 0 0)}to{clip-path:inset(0 0 0 0)}}
+@keyframes inst{from{opacity:0}to{opacity:1}}
+.mini[data-on="1"] .ba{animation:hold 2.2s linear both}
+@keyframes hold{0%,62%{opacity:0;transform:translateY(4px)}70%,100%{opacity:1;transform:none}}
+.mini .stt{font-family:var(--sans);font-size:11px;color:var(--faint)}
 
+/* 원리 */
 .flow{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;counter-reset:st}
-.flow .st{background:var(--bg2);border:1px solid var(--line);border-radius:10px;padding:16px;counter-increment:st}
+.flow .st{background:var(--bg2);border:1px solid var(--line);border-radius:10px;padding:16px;counter-increment:st;transition:border-color .35s,background .35s,opacity .35s}
 .flow .st::before{content:counter(st);font-family:var(--mono);color:var(--accent);font-weight:700;font-size:13px}
 .flow .st h3{margin:4px 0 6px;font-size:15.5px}
 .flow .st p{margin:0;font-size:13.5px;color:var(--dim);line-height:1.6}
-.bytes{margin-top:16px;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px 18px;font-family:var(--mono);font-size:13.5px;overflow-x:auto}
-.bytes .cap{color:var(--dim);font-family:var(--sans);font-size:13px;margin-bottom:8px}
-.bytes table{border-collapse:collapse;white-space:nowrap}
-.bytes td{padding:3px 18px 3px 0}
-.bytes td:first-child{color:var(--dim)}
-.bytes .o{color:var(--err)}
-.bytes .n{color:var(--ok)}
-.bytes .c{color:var(--faint)}
+.flow.live .st{opacity:.55}
+.flow.live .st.done{opacity:1}
+.flow.live .st.act{opacity:1;border-color:var(--accent);background:#132026}
+.flow.live .st.skip{opacity:.3}
+.stage{margin-top:14px;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:18px;font-family:var(--mono);font-size:13px}
+.stage .ctl{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:16px;font-family:var(--sans)}
+.stage .ctl .sp{flex:1}
+.filebar{position:relative;display:flex;height:34px;border-radius:6px;overflow:hidden;border:1px solid var(--line2);clip-path:inset(0 100% 0 0);transition:clip-path .9s cubic-bezier(.2,.8,.2,1)}
+.stage.mapped .filebar{clip-path:inset(0 0 0 0)}
+.filebar .seg{display:flex;align-items:center;justify-content:center;font-size:11.5px;color:var(--dim);border-right:1px solid var(--line2);background:#182127;transition:background .4s,color .4s;white-space:nowrap;overflow:hidden}
+.filebar .seg:last-child{border-right:0}
+.filebar .hd{flex:0 0 13%}.filebar .tx{flex:1 1 52%}.filebar .pc{flex:0 0 26%}.filebar .et{flex:0 0 9%}
+.stage.s1 .filebar .pc{background:rgba(95,215,215,.18);color:var(--accent)}
+.stage.s2 .filebar .tx,.stage.s3 .filebar .tx{background:rgba(127,216,143,.13);color:var(--ok)}
+.stage.fail .filebar .tx{background:rgba(239,123,123,.13);color:var(--err)}
+.filebar .pin{position:absolute;top:0;bottom:0;left:44%;width:2px;background:var(--ok);opacity:0;transition:opacity .3s;box-shadow:0 0 12px var(--ok)}
+.stage.s2 .pin,.stage.s3 .pin{opacity:1}
+.stage.fail .pin{background:var(--err);box-shadow:0 0 12px var(--err)}
+.fcap{color:var(--faint);font-family:var(--sans);font-size:12px;margin:6px 0 16px}
+.cols{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.15fr);gap:18px}
+.cols h4{margin:0 0 8px;font-family:var(--sans);font-size:12.5px;font-weight:500;color:var(--dim)}
+.syms div{padding:3px 8px;border-radius:4px;color:var(--faint);transition:background .15s,color .15s;overflow-wrap:anywhere}
+.syms div.scan{background:#1d2a31;color:var(--fg)}
+.syms div.hit{background:rgba(95,215,215,.16);color:var(--accent);font-weight:700}
+.addr{min-height:1.7em;color:var(--dim);margin-bottom:8px}
+.addr b{color:var(--accent)}
+.brow{display:flex;flex-wrap:wrap;gap:5px;min-height:34px;margin-bottom:6px;align-items:center}
+.brow .lb{flex:0 0 100%;font-family:var(--sans);font-size:11.5px;color:var(--faint)}
+.cell{display:inline-flex;align-items:center;justify-content:center;width:30px;height:28px;border:1px solid var(--line2);border-radius:5px;color:var(--fg);background:var(--bg);animation:cellin .25s ease-out both;transition:border-color .2s,color .2s}
+@keyframes cellin{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:none}}
+.cell.sig{color:var(--dim);border-style:dashed}
+.cell.ok{border-color:var(--ok)}
+.cell.bad{border-color:var(--err);color:var(--err)}
+.cell.old{color:var(--err)}
+.cell.flip{animation:flip .34s ease-in-out both}
+@keyframes flip{0%{transform:rotateX(0)}50%{transform:rotateX(90deg)}100%{transform:rotateX(0)}}
+.cell.new{color:var(--ok);border-color:var(--ok);background:rgba(127,216,143,.08)}
+.verdict{min-height:1.7em;font-family:var(--sans);font-size:13px}
+.verdict.ok{color:var(--ok)}.verdict.bad{color:var(--err)}
+.asm{min-height:1.7em;color:var(--dim);margin-top:4px}
+.asm b{color:var(--fg);font-weight:500}
+.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
+.chips span{border:1px solid var(--line2);border-radius:20px;padding:2px 12px;font-size:12px;color:var(--faint);transition:color .4s,border-color .4s}
+.chips span.on{color:var(--ok);border-color:var(--ok)}
 
-.tabs{display:flex;flex-wrap:wrap;gap:4px 0;font-family:var(--mono);font-size:13.5px;padding:12px 16px 0}
-.tabs button{background:none;border:0;padding:2px 0;color:var(--dim)}
-.tabs button .n{color:var(--dim)}
-.tabs button[aria-selected="true"]{color:#fff;font-weight:700}
-.tabs button[aria-selected="true"] .n{color:var(--accent)}
-.tabs .sep{color:var(--faint);padding:2px 10px}
-.tui{font-family:var(--mono);font-size:13.5px;line-height:1.7;padding:0 16px 14px;min-height:400px}
-.tui .hdr{display:flex;justify-content:space-between;gap:10px;padding-top:12px}
+/* 대화형 */
+.wz{outline:0}
+.wz:focus-visible{box-shadow:0 0 0 2px var(--accent)}
+.wz.foc{border-color:var(--accent)}
+.tui{font-family:var(--mono);font-size:13.5px;line-height:1.7;padding:12px 16px 14px;min-height:455px}
+.tui .hdr{display:flex;justify-content:space-between;gap:10px}
 .tui .rule{border-top:1px solid var(--line2);margin:8px 0}
-.tui .dim{color:var(--dim)} .tui .acc{color:var(--accent)} .tui .ok{color:var(--ok)} .tui .b{color:#fff;font-weight:700}
+.tui .dim{color:var(--dim)} .tui .acc{color:var(--accent)} .tui .ab{color:var(--accent);font-weight:700} .tui .ok{color:var(--ok)} .tui .b{color:#fff;font-weight:700} .tui .wr{color:var(--warn)} .tui .er{color:var(--err)}
 .tui .ln{display:flex;gap:0 8px;min-height:1.7em}
 .tui .ln>span{flex:none}
 .tui .ln>span:last-child,.tui .ln>span.gr{flex:0 1 auto;min-width:0}
-.tui.head{min-height:0;padding-bottom:10px}
+.tui .ln.row{cursor:pointer;border-radius:4px}
+.tui .ln.row:hover{background:#1a242a}
 .tui .idc{display:inline-block;min-width:118px}
+.tui .ptr{display:inline-block;width:10px}
 .tui .ind{padding-left:38px}
 .tui .car{background:var(--fg);color:var(--bg)}
-.tui .keys{margin-top:12px;display:flex;flex-wrap:wrap;gap:2px 18px}
-.tui [hidden]{display:none}
+.tui .keys{margin-top:12px;display:flex;flex-wrap:wrap;gap:6px 14px;align-items:center}
+.tui .keys button{background:#1b252c;border:1px solid var(--line2);border-radius:5px;padding:0 8px;font-family:var(--mono);font-size:12.5px;color:#fff;font-weight:700;line-height:1.8}
+.tui .keys button:hover{border-color:var(--accent)}
+.tui .keys button:active{background:var(--accent);color:var(--bg)}
+.tui .log div{white-space:pre-wrap;overflow-wrap:anywhere;min-height:1.7em;animation:pop .3s ease-out both}
+.tui .log .g{color:var(--ok)} .tui .log .p{color:var(--dim)}
 
 .care{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
-.care div{background:var(--bg2);border:1px solid var(--line);border-radius:10px;padding:18px}
+.care>div{background:var(--bg2);border:1px solid var(--line);border-radius:10px;padding:18px}
 .care h3{margin:0 0 6px;font-size:16px}
 .care p{margin:0;color:var(--dim);font-size:14.5px}
 
@@ -135,207 +242,203 @@ section p.sub{color:var(--dim);max-width:660px;margin:0 0 30px}
 .cmd .lbl{padding:10px 16px 0;color:var(--dim);font-size:13px}
 .cmd pre{margin:0;padding:10px 16px 16px;font-family:var(--mono);font-size:13.5px;line-height:1.7;overflow-x:auto;color:var(--fg)}
 .cmd pre .c{color:var(--faint)}
+.cmd pre .o{color:var(--dim)}
+.cmd pre .g{color:var(--ok)}
 .cmd .copy{position:absolute;top:8px;right:8px}
+.cmd .again{position:absolute;top:8px;right:70px}
+.cmd .tcar{display:inline-block;width:.55em;height:1.05em;background:var(--fg);vertical-align:-.18em;animation:blink 1s steps(2) infinite}
 .plat{color:var(--dim);font-size:14px;margin:0 0 22px}
 
 footer{border-top:1px solid var(--line);padding:32px 0 56px;color:var(--dim);font-size:13.5px}
 footer p{margin:0 0 8px;max-width:760px}
 footer .links{display:flex;flex-wrap:wrap;gap:6px 18px;margin-top:12px}
 
+@media (max-width:900px){
+  .plist .p{grid-template-columns:120px minmax(0,1fr)}
+  .plist .p .mini{grid-column:1/-1;margin-top:8px}
+}
 @media (max-width:820px){
   .demo{grid-template-columns:minmax(0,1fr)}
   .flow{grid-template-columns:repeat(2,minmax(0,1fr))}
   .care{grid-template-columns:minmax(0,1fr)}
+  .cols{grid-template-columns:minmax(0,1fr)}
   .term{min-height:290px}
 }
 @media (max-width:520px){
   .wrap{padding:0 16px}
-  header.top nav a.opt{display:none}
-  .hero{padding:20px 0 56px}
+  .topbar nav a.opt{display:none}
+  .hero{padding:24px 0 56px}
   .term{font-size:13px;padding:14px;min-height:300px}
   .plist .p{grid-template-columns:minmax(0,1fr)}
-  .plist .sym{grid-column:1}
   .flow{grid-template-columns:minmax(0,1fr)}
   section{padding:56px 0}
-  .tui{font-size:12.5px}
+  .tui{font-size:12.5px;min-height:520px}
   .tui .idc{min-width:104px}
   .tui .ind{padding-left:20px}
+  .filebar .seg{font-size:10px}
+  .cmd .again{right:66px}
 }
-@media (prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
+@media (prefers-reduced-motion:reduce){
+  html{scroll-behavior:auto}
+  *,*::before,*::after{animation-duration:.001s!important;animation-delay:0s!important;transition-duration:.001s!important}
+  .js .rv{opacity:1;transform:none}
+}
 </style>
 </head>
 <body>
-<div class="wrap">
+<script>document.documentElement.classList.add('js')</script>
 
-<header class="top">
-  <div class="brand">agy-cli-patch <span>v0.2.1</span></div>
-  <nav>
-    <a class="opt" href="#patches">패치</a>
-    <a class="opt" href="#how">원리</a>
-    <a href="#install">설치</a>
-    <a href="https://github.com/KyongSik-Yoon/agy-cli-patch">GitHub</a>
-  </nav>
-</header>
+<div class="topbar" id="topbar">
+  <div class="wrap in">
+    <div class="brand">agy-cli-patch <span>v0.2.1</span></div>
+    <nav>
+      <a class="opt" href="#patches">패치</a>
+      <a class="opt" href="#how">원리</a>
+      <a class="opt" href="#wizard">직접 조작</a>
+      <a href="#install">설치</a>
+      <a href="https://github.com/KyongSik-Yoon/agy-cli-patch">GitHub</a>
+    </nav>
+  </div>
+  <div class="prog" id="prog"></div>
+</div>
 
 <main>
+<div class="heroZone">
+<canvas id="field" aria-hidden="true"></canvas>
+<div class="wrap">
 <div class="hero">
-  <h1>agy 출력의 거슬리는 곳을<br><em>스위치 하나씩</em> 끕니다.</h1>
-  <p class="lead">Antigravity CLI(<code>agy</code>) 바이너리의 <b>타자기 딜레이</b>와 <b>한글 마크다운 결함</b>을 고치는 Rust 패처입니다. 아래 스위치를 켜면 같은 응답이 어떻게 달라지는지 보입니다.</p>
+  <h1 class="up">agy 출력의 거슬리는 곳을<br><em>스위치 하나씩</em> 끕니다.</h1>
+  <p class="lead up d1">Antigravity CLI(<code>agy</code>) 바이너리의 <b>타자기 딜레이</b>와 <b>한글 마크다운 결함</b>을 고치는 Rust 패처입니다. 스위치가 하나씩 켜지며 같은 응답이 달라지는 걸 보세요. 직접 눌러도 됩니다.</p>
 
-  <div class="demo">
+  <div class="demo up d2">
     <div class="win">
       <div class="bar"><i></i><i></i><i></i><b>agy</b></div>
       <div class="term" id="term" aria-live="off"></div>
+      <div class="meter">
+        <span>수신</span><span class="tr"><i id="rxbar"></i></span><em><span id="rx">0</span> B</em>
+        <span>표시</span><span class="tr"><i class="sh" id="shbar"></i></span><em><span id="shown">0</span> B</em>
+      </div>
       <div class="stat">
-        <span>수신 <em id="rx">0</em> / <span id="tot">0</span> B</span>
-        <span>표시 <em id="shown">0</em> B</span>
+        <span class="lag" id="lag">밀린 양 0 B</span>
         <span class="state" id="state">생성 중</span>
       </div>
     </div>
 
     <div class="win">
       <div class="bar"><i></i><i></i><i></i><b>agy-cli-patch</b></div>
-      <div class="sw">
+      <div class="sw" id="sw">
         <div class="hd">적용할 패치를 고르세요 <span id="cnt">0/5 선택</span></div>
-        <button class="row" role="switch" aria-checked="false" data-k="nodrip"><span class="ck">○</span><span class="id">nodrip</span><span class="ds">16ms마다 12바이트씩 끊어 찍는 타자기 효과를 끄고 수신 즉시 반영</span></button>
-        <button class="row" role="switch" aria-checked="false" data-k="batch"><span class="ck">○</span><span class="id">batch</span><span class="ds">생성 중에는 본문을 숨겼다가 완료(DONE)되면 한 번에 출력</span></button>
-        <button class="row" role="switch" aria-checked="false" data-k="heading"><span class="ck">○</span><span class="id">heading</span><span class="ds">제목 앞의 '## ' 기호를 숨기고 색·볼드만 유지</span></button>
-        <button class="row" role="switch" aria-checked="false" data-k="cjk"><span class="ck">○</span><span class="id">cjk-bold</span><span class="ds">구두점 뒤에 한글 조사가 붙어도 볼드 유지</span></button>
-        <button class="row" role="switch" aria-checked="false" data-k="tilde"><span class="ck">○</span><span class="id">tilde-strike</span><span class="ds">'~' 하나는 그대로 두고 '~~'만 취소선</span></button>
+        <button class="row" role="switch" aria-checked="false" data-k="nodrip"><span class="pt">❯</span><span class="ck">○</span><span class="id">nodrip</span><span class="ds">16ms마다 12바이트씩 끊어 찍는 타자기 효과를 끄고 수신 즉시 반영</span></button>
+        <button class="row" role="switch" aria-checked="false" data-k="batch"><span class="pt">❯</span><span class="ck">○</span><span class="id">batch</span><span class="ds">생성 중에는 본문을 숨겼다가 완료(DONE)되면 한 번에 출력</span></button>
+        <button class="row" role="switch" aria-checked="false" data-k="heading"><span class="pt">❯</span><span class="ck">○</span><span class="id">heading</span><span class="ds">제목 앞의 '## ' 기호를 숨기고 색·볼드만 유지</span></button>
+        <button class="row" role="switch" aria-checked="false" data-k="cjk"><span class="pt">❯</span><span class="ck">○</span><span class="id">cjk-bold</span><span class="ds">구두점 뒤에 한글 조사가 붙어도 볼드 유지</span></button>
+        <button class="row" role="switch" aria-checked="false" data-k="tilde"><span class="pt">❯</span><span class="ck">○</span><span class="id">tilde-strike</span><span class="ds">'~' 하나는 그대로 두고 '~~'만 취소선</span></button>
         <div class="flash" id="flash" role="status"></div>
         <div class="acts">
+          <button class="btn" id="auto">자동 시연</button>
           <button class="btn" id="replay">다시 재생</button>
           <button class="btn" id="all">모두 켜기</button>
         </div>
       </div>
     </div>
   </div>
-  <p class="note">그림으로 흉내 낸 시연입니다. 타자기 효과는 실제 속도(16ms마다 12바이트)의 ¼배속으로 재생하고, 수신 속도는 임의로 정한 값입니다.</p>
+  <p class="note">그림으로 흉내 낸 시연입니다. 타자기 효과는 실제 속도(16ms마다 12바이트)의 ¼배속으로 재생하고, 수신 속도는 임의로 정한 값입니다. 배경의 바이트는 <code>nodrip</code> 패치가 실제로 바꾸는 x86_64 바이트입니다.</p>
+</div>
+</div>
 </div>
 
+<div class="wrap">
 <section id="patches">
-  <div class="kicker">--list</div>
-  <h2>패치 일곱 가지, 골라서 적용</h2>
-  <p class="sub">필요한 것만 조합해 새 실행 파일로 만들거나, 기본 agy에 바로 덮어씁니다.</p>
-  <div class="plist">
-    <div class="p"><div class="id">nodrip</div><div class="d">16ms마다 12바이트씩 끊어 찍는 타자기 딜레이를 없애고 수신 즉시 반영합니다.</div><div class="sym">store.cutAtRuneBoundary</div></div>
-    <div class="p"><div class="id">batch</div><div class="d">응답 생성 중에는 본문 출력을 보류하고, 완료되면 완성된 마크다운 전체를 한 번에 출력합니다.</div><div class="sym">render.renderPlannerBody</div></div>
-    <div class="p"><div class="id">heading</div><div class="d">H2~H6 제목 앞에 붙는 <code>## </code>~<code>###### </code> 프리픽스를 숨기고 색상·볼드만 남깁니다.</div><div class="sym">render.glamourStyleForScheme</div></div>
-    <div class="p"><div class="id">cjk-bold</div><div class="d"><code>**"문구"**라는</code>, <code>**용어(`code`)**는</code>처럼 닫는 <code>**</code> 앞 구두점과 뒤 한글 조사가 만날 때 볼드가 풀리는 현상을 고칩니다.</div><div class="sym">goldmark/parser.ScanDelimiter</div></div>
-    <div class="p"><div class="id">tilde-strike</div><div class="d"><code>1.5.0~1.5.6</code>, <code>H2~H6</code> 같은 범위 표기의 물결표 하나에 취소선이 그어지지 않게 합니다. <code>~~</code> 두 개만 취소선입니다.</div><div class="sym">goldmark/extension.(*strikethroughParser).Parse</div></div>
-    <div class="p"><div class="id">banner</div><div class="d">상단 <code>Antigravity CLI 1.5.7</code> 옆에 <code>(patch v0.2.1)</code> 형태로 패치 버전을 표시합니다.<span class="tag">x86_64 전용</span></div><div class="sym">render.BannerWithInfo</div></div>
-    <div class="p"><div class="id">release-notes</div><div class="d">로고 아래에 패치 기능 요약과 저장소 정보를 표시합니다. <code>-p all,release-notes</code>처럼 명시해야 적용됩니다.<span class="tag">x86_64 전용</span><span class="tag">기본 꺼짐</span></div><div class="sym">render.BuildHeader</div></div>
+  <div class="kicker rv">--list</div>
+  <h2 class="rv">패치 일곱 가지, 골라서 적용</h2>
+  <p class="sub rv">필요한 것만 조합해 새 실행 파일로 만들거나, 기본 agy에 바로 덮어씁니다. 오른쪽 칸은 패치 전후를 번갈아 보여 주고, 누르면 그 상태로 멈춥니다.</p>
+  <div class="plist rv">
+    <div class="p glow"><div class="id">nodrip</div><div><div class="d">16ms마다 12바이트씩 끊어 찍는 타자기 딜레이를 없애고 수신 즉시 반영합니다.</div><div class="sym">store.cutAtRuneBoundary</div></div>
+      <button class="mini" data-on="0" aria-label="nodrip 패치 전후 보기"><span class="lab"><i></i></span><span class="c"><span class="dr">받은 글을 그대로 화면에 올립니다</span></span></button></div>
+    <div class="p glow"><div class="id">batch</div><div><div class="d">응답 생성 중에는 본문 출력을 보류하고, 완료되면 완성된 마크다운 전체를 한 번에 출력합니다.</div><div class="sym">render.renderPlannerBody</div></div>
+      <button class="mini" data-on="0" aria-label="batch 패치 전후 보기"><span class="lab"><i></i></span><span class="c"><span class="dr ba">완성된 답변을 한 번에 보여 줍니다</span></span></button></div>
+    <div class="p glow"><div class="id">heading</div><div><div class="d">H2~H6 제목 앞에 붙는 <code>## </code>~<code>###### </code> 프리픽스를 숨기고 색상·볼드만 남깁니다.</div><div class="sym">render.glamourStyleForScheme</div></div>
+      <button class="mini" data-on="0" aria-label="heading 패치 전후 보기"><span class="lab"><i></i></span><span class="c hx"><span class="px">## </span>설치 방법</span></button></div>
+    <div class="p glow"><div class="id">cjk-bold</div><div><div class="d"><code>**"문구"**라는</code>, <code>**용어(`code`)**는</code>처럼 닫는 <code>**</code> 앞 구두점과 뒤 한글 조사가 만날 때 볼드가 풀리는 현상을 고칩니다.</div><div class="sym">goldmark/parser.ScanDelimiter</div></div>
+      <button class="mini" data-on="0" aria-label="cjk-bold 패치 전후 보기"><span class="lab"><i></i></span><span class="c"><span class="px">**</span><span class="bd">"문구"</span><span class="px">**</span>라는 표현</span></button></div>
+    <div class="p glow"><div class="id">tilde-strike</div><div><div class="d"><code>1.5.0~1.5.6</code>, <code>H2~H6</code> 같은 범위 표기의 물결표 하나에 취소선이 그어지지 않게 합니다. <code>~~</code> 두 개만 취소선입니다.</div><div class="sym">goldmark/extension.(*strikethroughParser).Parse</div></div>
+      <button class="mini" data-on="0" aria-label="tilde-strike 패치 전후 보기"><span class="lab"><i></i></span><span class="c">1.5.0<span class="tl">~</span><span class="sk">1.5.6, H2</span><span class="tl">~</span>H6</span></button></div>
+    <div class="p glow"><div class="id">banner</div><div><div class="d">상단 <code>Antigravity CLI 1.5.7</code> 옆에 <code>(patch v0.2.1)</code> 형태로 패치 버전을 표시합니다.<span class="tag">x86_64 전용</span></div><div class="sym">render.BannerWithInfo</div></div>
+      <button class="mini" data-on="0" aria-label="banner 패치 전후 보기"><span class="lab"><i></i></span><span class="c">Antigravity CLI 1.5.7<span class="add"> (patch v0.2.1)</span></span></button></div>
+    <div class="p glow"><div class="id">release-notes</div><div><div class="d">로고 아래에 패치 기능 요약과 저장소 정보를 표시합니다. <code>-p all,release-notes</code>처럼 명시해야 적용됩니다.<span class="tag">x86_64 전용</span><span class="tag">기본 꺼짐</span></div><div class="sym">render.BuildHeader</div></div>
+      <button class="mini" data-on="0" aria-label="release-notes 패치 전후 보기"><span class="lab"><i></i></span><span class="c stt">로고 아래</span><span class="rn"><b>What's new in agy-cli-patch v0.2.1:</b><br><u>•</u> <b>nodrip</b>: instant streaming …<br><u>•</u> <b>batch</b>: full answer rendered at once …</span></button></div>
   </div>
 </section>
 
 <section id="how">
-  <div class="kicker">주소가 아니라 이름으로</div>
-  <h2>릴리즈마다 바뀌는 주소에 기대지 않습니다</h2>
-  <p class="sub">agy는 Go 바이너리라 함수 이름표(<code>.gopclntab</code>)를 품고 있습니다. 패처는 그 표에서 대상 함수를 찾고, 그 자리의 기계어가 아는 모양일 때만 손댑니다.</p>
-  <div class="flow">
-    <div class="st"><h3>매핑</h3><p><code>mmap</code> 제로카피로 바이너리를 엽니다. ELF64(Linux)와 Mach-O 64(macOS)를 읽습니다.</p></div>
-    <div class="st"><h3>심볼 찾기</h3><p>텍스트 섹션과 Go <code>.gopclntab</code> 심볼 테이블을 파싱해 대상 함수의 위치를 얻습니다.</p></div>
-    <div class="st"><h3>시그니처 검증</h3><p>x86_64·ARM64 각각의 기계어 시그니처와 대조합니다. 맞지 않으면 패치하지 않고 사유를 알립니다.</p></div>
-    <div class="st"><h3>쓰기</h3><p>Linux는 <code>FICLONE</code> reflink로 복사하고, macOS는 <code>codesign -f -s -</code>로 다시 서명합니다.</p></div>
+  <div class="kicker rv">주소가 아니라 이름으로</div>
+  <h2 class="rv">릴리즈마다 바뀌는 주소에 기대지 않습니다</h2>
+  <p class="sub rv">agy는 Go 바이너리라 함수 이름표(<code>.gopclntab</code>)를 품고 있습니다. 패처는 그 표에서 대상 함수를 찾고, 그 자리의 기계어가 아는 모양일 때만 손댑니다. 아래는 <code>nodrip</code> 한 건이 지나가는 길입니다.</p>
+  <div class="flow rv" id="flow">
+    <div class="st glow"><h3>매핑</h3><p><code>mmap</code> 제로카피로 바이너리를 엽니다. ELF64(Linux)와 Mach-O 64(macOS)를 읽습니다.</p></div>
+    <div class="st glow"><h3>심볼 찾기</h3><p>텍스트 섹션과 Go <code>.gopclntab</code> 심볼 테이블을 파싱해 대상 함수의 위치를 얻습니다.</p></div>
+    <div class="st glow"><h3>시그니처 검증</h3><p>x86_64·ARM64 각각의 기계어 시그니처와 대조합니다. 맞지 않으면 패치하지 않고 사유를 알립니다.</p></div>
+    <div class="st glow"><h3>쓰기</h3><p>Linux는 <code>FICLONE</code> reflink로 복사하고, macOS는 <code>codesign -f -s -</code>로 다시 서명합니다.</p></div>
   </div>
-  <div class="bytes">
-    <div class="cap"><code>nodrip</code>이 실제로 바꾸는 바이트 — <code>store.cutAtRuneBoundary</code>의 첫머리 (<code>src/main.rs</code>)</div>
-    <table>
-      <tr><td>x86_64</td><td class="o">55 48 89 e5</td><td>→</td><td class="n">48 89 d8 c3</td></tr>
-      <tr><td>ARM64</td><td class="o">90 0b 40 f9 ff 63 30 eb</td><td>→</td><td class="n">e0 03 01 aa c0 03 5f d6</td><td class="c">mov x0, x1; ret</td></tr>
-    </table>
+  <div class="stage rv" id="stage">
+    <div class="ctl">
+      <button class="btn" data-arch="x86" aria-pressed="true">x86_64</button>
+      <button class="btn" data-arch="arm" aria-pressed="false">ARM64</button>
+      <span class="sp"></span>
+      <button class="btn" id="mis" aria-pressed="false">시그니처가 다르면?</button>
+      <button class="btn" id="scanAgain">다시 보기</button>
+    </div>
+    <div class="filebar"><span class="seg hd">헤더</span><span class="seg tx">텍스트 섹션</span><span class="seg pc">.gopclntab</span><span class="seg et">…</span><i class="pin"></i></div>
+    <div class="fcap">antigravity 바이너리 (구획 크기와 위치는 실제 비율이 아닌 그림)</div>
+    <div class="cols">
+      <div><h4>.gopclntab 에서 이름으로 찾기</h4><div class="syms" id="syms"></div></div>
+      <div>
+        <h4>찾은 자리의 첫 바이트</h4>
+        <div class="addr" id="addr"></div>
+        <div class="brow" id="brow"></div>
+        <div class="brow" id="srow"></div>
+        <div class="verdict" id="verdict"></div>
+        <div class="asm" id="asm"></div>
+        <div class="chips"><span id="chipL">Linux · FICLONE reflink</span><span id="chipM">macOS · codesign -f -s -</span></div>
+      </div>
+    </div>
   </div>
-  <p class="note">외부 크레이트 의존성 0. Rust 툴체인만 있으면 인터넷 없이 빌드됩니다.</p>
+  <p class="note">바이트 값은 <code>src/main.rs</code>의 시그니처 그대로이고, <code>0xa4720c0</code>은 agy 1.5.7(Linux x86_64)에서 패처가 실제로 찾은 위치입니다. 버전이 바뀌면 이 숫자도 바뀝니다. 외부 크레이트 의존성 0 — Rust 툴체인만 있으면 인터넷 없이 빌드됩니다.</p>
 </section>
 
 <section id="wizard">
-  <div class="kicker">인자 없이 실행</div>
-  <h2>세 단계로 고르고, 확인하고, 패치</h2>
-  <p class="sub">각 패치를 대상 바이너리에 미리 대조해, 적용할 수 없는 패치는 <code>✕</code>와 사유를 보여 주고 선택되지 않게 합니다. 원본을 망가뜨리는 출력 경로는 거부합니다.</p>
-  <div class="win">
-    <div class="bar"><i></i><i></i><i></i><b>agy-cli-patch</b></div>
-    <div class="tui head">
-      <div class="hdr"><span><span class="acc b" style="color:var(--accent)">agy-cli-patch</span> <span class="dim">v0.2.1</span></span><span class="dim">ELF · x86_64</span></div>
-      <div class="ln"><span class="dim">대상</span><span class="gr">~/.local/share/mise/installs/agy/1.5.6/antigravity</span><span class="dim" style="flex:none">1.5.7</span></div>
-    </div>
-    <div class="tabs" role="tablist" style="padding-top:0">
-      <button role="tab" aria-selected="true" data-t="0"><span class="n">1</span> 패치 선택</button><span class="sep">›</span>
-      <button role="tab" aria-selected="false" data-t="1"><span class="n">2</span> 출력 방식</button><span class="sep">›</span>
-      <button role="tab" aria-selected="false" data-t="2"><span class="n">3</span> 확인</button>
-    </div>
-    <div class="tui" style="padding-top:0">
-      <div class="rule"></div>
-      <div data-p="0">
-        <div class="hdr" style="padding-top:0"><span class="b">적용할 패치를 고르세요</span><span class="dim">6/7 선택</span></div>
-        <div class="ln"></div>
-        <div class="ln"><span class="acc b" style="color:var(--accent)">❯</span><span class="ok">◉</span><span class="acc b idc" style="color:var(--accent)">nodrip</span><span class="b">타자기 딜레이 제거 (No Drip)</span></div>
-        <div class="ln"><span>&nbsp;</span><span class="ok">◉</span><span class="acc idc">batch</span><span>응답 완료 시 한 번에 일괄 출력 (Batch Render)</span></div>
-        <div class="ln"><span>&nbsp;</span><span class="ok">◉</span><span class="acc idc">heading</span><span>마크다운 헤딩 '##' 기호 숨김 (Clean Headings)</span></div>
-        <div class="ln"><span>&nbsp;</span><span class="ok">◉</span><span class="acc idc">cjk-bold</span><span>구두점 뒤 한글 조사 볼드(**) 깨짐 수정 (CJK Bold Fix)</span></div>
-        <div class="ln"><span>&nbsp;</span><span class="ok">◉</span><span class="acc idc">tilde-strike</span><span>단일 물결표(~) 취소선 오작동 방지 (Double-Tilde Strikethrough)</span></div>
-        <div class="ln"><span>&nbsp;</span><span class="ok">◉</span><span class="acc idc">banner</span><span>제품명 옆 패치 버전 표시 (Patch Version Tag)</span></div>
-        <div class="ln"><span>&nbsp;</span><span class="dim">○</span><span class="acc idc">release-notes</span><span>상단 배너 릴리즈 노트 표시 (Release Notes)</span></div>
-        <div class="rule"></div>
-        <div class="ln"><span>16ms마다 12바이트씩 끊어 찍는 타자기 효과를 끄고 수신 즉시 반영</span></div>
-        <div class="ln"><span class="dim">심볼</span><span class="dim">store.cutAtRuneBoundary</span></div>
-        <div class="keys"><span><span class="b">↑↓</span> <span class="dim">이동</span></span><span><span class="b">space</span> <span class="dim">선택</span></span><span><span class="b">a</span> <span class="dim">전체</span></span><span><span class="b">enter</span> <span class="dim">다음</span></span><span><span class="b">q</span> <span class="dim">종료</span></span></div>
-      </div>
-      <div data-p="1" hidden>
-        <div class="ln"><span class="b">결과물을 어떻게 만들까요?</span></div>
-        <div class="ln"></div>
-        <div class="ln"><span class="acc b" style="color:var(--accent)">❯</span><span class="b">새 실행 파일 만들기</span><span class="dim">원본은 그대로 둡니다</span></div>
-        <div class="ln ind"><span class="dim">이름</span><span class="acc b" style="color:var(--accent)">agy-batch<span class="car">&nbsp;</span></span></div>
-        <div class="ln ind"><span class="dim">생성</span><span>~/.local/share/mise/installs/agy/1.5.6/agy-batch</span></div>
-        <div class="ln ind"><span class="dim">링크</span><span>~/.local/bin/agy-batch</span></div>
-        <div class="ln"></div>
-        <div class="ln"><span>&nbsp;</span><span>기본 agy에 직접 덮어쓰기</span><span class="dim">in-place</span></div>
-        <div class="ln ind"><span class="dim">백업</span><span class="gr">~/.local/share/mise/installs/agy/1.5.6/antigravity.orig</span><span class="dim">(새로 만듦)</span></div>
-        <div class="ln ind"><span class="dim">agy 자체 업데이트 시 패치가 사라지므로 다시 실행해야 합니다.</span></div>
-        <div class="keys"><span><span class="b">↑↓</span> <span class="dim">방식</span></span><span><span class="b">←→</span> <span class="dim">커서</span></span><span><span class="b">enter</span> <span class="dim">다음</span></span><span><span class="b">esc</span> <span class="dim">뒤로</span></span><span><span class="b">ctrl+c</span> <span class="dim">종료</span></span></div>
-      </div>
-      <div data-p="2" hidden>
-        <div class="ln"><span class="b">아래 내용으로 패치합니다</span></div>
-        <div class="ln"></div>
-        <div class="ln"><span class="dim">적용할 패치 6개</span></div>
-        <div class="ln"><span>&nbsp;</span><span class="ok">✓</span><span class="acc idc">nodrip</span><span>타자기 딜레이 제거 (No Drip)</span></div>
-        <div class="ln"><span>&nbsp;</span><span class="ok">✓</span><span class="acc idc">batch</span><span>응답 완료 시 한 번에 일괄 출력 (Batch Render)</span></div>
-        <div class="ln"><span>&nbsp;</span><span class="ok">✓</span><span class="acc idc">heading</span><span>마크다운 헤딩 '##' 기호 숨김 (Clean Headings)</span></div>
-        <div class="ln"><span>&nbsp;</span><span class="ok">✓</span><span class="acc idc">cjk-bold</span><span>구두점 뒤 한글 조사 볼드(**) 깨짐 수정 (CJK Bold Fix)</span></div>
-        <div class="ln"><span>&nbsp;</span><span class="ok">✓</span><span class="acc idc">tilde-strike</span><span>단일 물결표(~) 취소선 오작동 방지 (Double-Tilde Strikethrough)</span></div>
-        <div class="ln"><span>&nbsp;</span><span class="ok">✓</span><span class="acc idc">banner</span><span>제품명 옆 패치 버전 표시 (Patch Version Tag)</span></div>
-        <div class="ln"></div>
-        <div class="ln"><span class="dim">출력</span></div>
-        <div class="ln"><span>&nbsp;</span><span class="dim">생성</span><span>~/.local/share/mise/installs/agy/1.5.6/agy-batch</span></div>
-        <div class="ln"><span>&nbsp;</span><span class="dim">링크</span><span>~/.local/bin/agy-batch</span></div>
-        <div class="keys"><span><span class="b">enter</span> <span class="dim">패치 실행</span></span><span><span class="b">esc</span> <span class="dim">뒤로</span></span><span><span class="b">q</span> <span class="dim">종료</span></span></div>
-      </div>
-    </div>
+  <div class="kicker rv">인자 없이 실행</div>
+  <h2 class="rv">세 단계로 고르고, 확인하고, 패치</h2>
+  <p class="sub rv">아래 화면은 실제로 조작됩니다. 화면을 누른 뒤 <code>↑↓</code> <code>space</code> <code>a</code> <code>enter</code> <code>esc</code>를 쓰거나, 줄과 아래 키를 직접 누르세요. <code>batch</code>를 켜면 <code>nodrip</code>도 함께 켜집니다.</p>
+  <div class="win wz rv" id="wz" tabindex="0" role="application" aria-label="agy-cli-patch 대화형 화면 따라 하기">
+    <div class="bar"><i></i><i></i><i></i><b>agy-cli-patch</b><span class="r" id="wzhint">눌러서 키보드로 조작</span></div>
+    <div class="tui" id="tui"></div>
   </div>
-  <p class="note">실제 화면의 문구와 배치를 옮겨 그린 그림입니다. 단계 이름을 누르면 해당 화면으로 바뀝니다. 경로는 mise로 설치한 경우의 예시입니다.</p>
+  <p class="note">실제 화면의 문구·키·연동 규칙을 옮긴 따라 하기 화면이며, 아무것도 패치하지 않습니다. 마지막 출력의 오프셋은 agy 1.5.7(Linux x86_64)에 실제로 실행해 얻은 값이고, 경로는 mise 설치 기준의 예시입니다. 이름 칸은 영문·숫자·<code>. _ -</code>만 받도록 줄였고, 파일 시스템을 보는 검사(기존 파일·링크 충돌)는 뺐습니다.</p>
 </section>
 
 <section id="care">
-  <div class="kicker">알아 둘 것</div>
-  <h2>agy가 스스로 업데이트하면 패치가 풀립니다</h2>
-  <p class="sub">agy는 실행할 때마다 새 버전을 확인하고, 있으면 설치된 <code>antigravity</code> 바이너리를 직접 교체합니다.</p>
+  <div class="kicker rv">알아 둘 것</div>
+  <h2 class="rv">agy가 스스로 업데이트하면 패치가 풀립니다</h2>
+  <p class="sub rv">agy는 실행할 때마다 새 버전을 확인하고, 있으면 설치된 <code>antigravity</code> 바이너리를 직접 교체합니다.</p>
   <div class="care">
-    <div><h3>in-place 패치는 다시 적용</h3><p><code>agy-cli-patch -p all --in-place</code>를 다시 실행하면 됩니다. 원본은 <code>antigravity.orig</code>로 백업되고 <code>--restore</code>로 되돌립니다.</p></div>
-    <div><h3>자체 업데이트 끄기</h3><p><code>export AGY_CLI_DISABLE_AUTO_UPDATE=true</code> — 값은 반드시 <code>true</code>여야 합니다(<code>1</code>은 적용되지 않음).</p></div>
+    <div class="glow rv"><h3>in-place 패치는 다시 적용</h3><p><code>agy-cli-patch -p all --in-place</code>를 다시 실행하면 됩니다. 원본은 <code>antigravity.orig</code>로 백업되고 <code>--restore</code>로 되돌립니다.</p></div>
+    <div class="glow rv" style="--d:.08s"><h3>자체 업데이트 끄기</h3><p><code>export AGY_CLI_DISABLE_AUTO_UPDATE=true</code> — 값은 반드시 <code>true</code>여야 합니다(<code>1</code>은 적용되지 않음).</p></div>
   </div>
   <p class="note">링크 덮어쓰기 규칙, remote-control 데몬 등 나머지 주의 사항은 <a href="https://github.com/KyongSik-Yoon/agy-cli-patch#주의-사항">README</a>에 있습니다.</p>
 </section>
 
 <section id="install">
-  <div class="kicker">설치</div>
-  <h2>한 줄로 받고, 인자 없이 실행</h2>
-  <p class="plat">Linux(x86_64, aarch64)와 macOS(x86_64, Apple Silicon)용 프리빌트 바이너리를 <code>~/.local/bin/agy-cli-patch</code>에 설치합니다.</p>
-  <div class="cmd"><div class="lbl">원라이너 설치</div><button class="btn copy" data-copy="c1">복사</button>
-<pre id="c1">curl -fsSL https://raw.githubusercontent.com/KyongSik-Yoon/agy-cli-patch/main/install.sh | sh</pre></div>
-  <div class="cmd"><div class="lbl">소스에서 빌드</div><button class="btn copy" data-copy="c2">복사</button>
+  <div class="kicker rv">설치</div>
+  <h2 class="rv">한 줄로 받고, 인자 없이 실행</h2>
+  <p class="plat rv">Linux(x86_64, aarch64)와 macOS(x86_64, Apple Silicon)용 프리빌트 바이너리를 <code>~/.local/bin/agy-cli-patch</code>에 설치합니다.</p>
+  <div class="cmd rv"><div class="lbl">원라이너 설치</div><button class="btn again" id="typeAgain">다시</button><button class="btn copy" data-copy="c1">복사</button>
+<pre><span class="c">$ </span><span id="c1">curl -fsSL https://raw.githubusercontent.com/KyongSik-Yoon/agy-cli-patch/main/install.sh | sh</span><span id="c1out"></span></pre></div>
+  <div class="cmd rv"><div class="lbl">소스에서 빌드</div><button class="btn copy" data-copy="c2">복사</button>
 <pre id="c2">git clone https://github.com/KyongSik-Yoon/agy-cli-patch.git
 cd agy-cli-patch
 ./install.sh --build</pre></div>
-  <div class="cmd"><div class="lbl">쓰기</div>
+  <div class="cmd rv"><div class="lbl">쓰기</div>
 <pre><span class="c"># 대화형: 패치 선택 → 출력 방식 → 확인</span>
 agy-cli-patch
 
@@ -344,11 +447,13 @@ agy-cli-patch -p all -o agy-batch
 
 <span class="c"># 마크다운 패치 3종만 적용해 agy-md 생성</span>
 agy-cli-patch -p heading,cjk-bold,tilde-strike -o agy-md</pre></div>
-  <p class="note">전체 옵션은 <a href="https://github.com/KyongSik-Yoon/agy-cli-patch#사용법">README의 사용법</a>을 보세요.</p>
+  <p class="note">설치 출력은 Linux x86_64에서 실제로 찍힌 줄이며 홈 경로만 예시로 바꿨습니다. 전체 옵션은 <a href="https://github.com/KyongSik-Yoon/agy-cli-patch#사용법">README의 사용법</a>을 보세요.</p>
 </section>
+</div>
 </main>
 
 <footer>
+<div class="wrap">
   <p>본 저장소는 어떠한 독점 바이너리나 소스 코드도 포함·재배포하지 않는 비공식 로컬 패치 도구입니다. 로컬 바이너리 수정에 따른 모든 책임은 사용자 본인에게 있으며, 공식 고객 지원 대상에서 제외될 수 있습니다.</p>
   <p>MIT License · © 2026 KyongSik-Yoon</p>
   <div class="links">
@@ -356,12 +461,84 @@ agy-cli-patch -p heading,cjk-bold,tilde-strike -o agy-md</pre></div>
     <a href="https://github.com/KyongSik-Yoon/agy-cli-patch/issues">이슈</a>
     <a href="https://github.com/KyongSik-Yoon/agy-cli-patch/releases">릴리즈</a>
     <a href="https://github.com/KyongSik-Yoon/agy-cli-patch/blob/main/LICENSE">라이선스</a>
+    <a href="classic.html">이전 판</a>
   </div>
-</footer>
 </div>
+</footer>
 
 <script>
 (function(){
+'use strict';
+var $ = function(id){ return document.getElementById(id); };
+var reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+var sleep = function(ms){ return new Promise(function(r){ setTimeout(r, ms); }); };
+function part(name, fn){ try { fn(); } catch (e) { console.error('[' + name + ']', e); } }
+function onView(el, cb, opt){
+  if (!('IntersectionObserver' in window)) { cb(true); return; }
+  new IntersectionObserver(function(es){ es.forEach(function(e){ cb(e.isIntersecting); }); }, opt || {threshold: .25}).observe(el);
+}
+function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+/* ── 스크롤: 등장, 진행 막대, 카드 빛 ───────────────────────── */
+part('scroll', function(){
+  var rv = document.querySelectorAll('.rv');
+  if (reduce || !('IntersectionObserver' in window)) rv.forEach(function(e){ e.classList.add('in'); });
+  else {
+    var io = new IntersectionObserver(function(es){ es.forEach(function(e){ if (e.isIntersecting) { e.target.classList.add('in'); io.unobserve(e.target); } }); }, {threshold: .12, rootMargin: '0px 0px -6% 0px'});
+    rv.forEach(function(e){ io.observe(e); });
+  }
+  var bar = $('prog'), top = $('topbar'), tick = false;
+  function upd(){
+    tick = false;
+    var h = document.documentElement.scrollHeight - innerHeight;
+    bar.style.transform = 'scaleX(' + (h > 0 ? Math.min(1, scrollY / h) : 0) + ')';
+    top.classList.toggle('stuck', scrollY > 8);
+  }
+  addEventListener('scroll', function(){ if (!tick) { tick = true; requestAnimationFrame(upd); } }, {passive: true});
+  upd();
+  document.addEventListener('pointermove', function(e){
+    var g = e.target.closest && e.target.closest('.glow'); if (!g) return;
+    var r = g.getBoundingClientRect();
+    g.style.setProperty('--mx', (e.clientX - r.left) + 'px'); g.style.setProperty('--my', (e.clientY - r.top) + 'px');
+  }, {passive: true});
+});
+
+/* ── 배경: nodrip 이 바꾸는 실제 바이트 ───────────────────── */
+part('field', function(){
+  var cv = $('field'), cx = cv.getContext('2d'), zone = cv.parentNode;
+  var OLD = '55 48 89 e5', NEW = '48 89 d8 c3', SW = 118, RH = 22, FADE = 1500;
+  var sites = [], cols = 0, rows = 0, W = 0, H = 0, vis = true, timer = null;
+  function size(){
+    var r = zone.getBoundingClientRect(), d = Math.min(2, devicePixelRatio || 1);
+    W = r.width; H = r.height; cv.width = W * d; cv.height = H * d; cx.setTransform(d, 0, 0, d, 0, 0);
+    cols = Math.ceil(W / SW) + 1; rows = Math.ceil(H / RH);
+    sites = []; for (var i = 0; i < cols * rows; i++) sites.push({on: Math.random() < .3, t: -1e9});
+    draw();
+  }
+  function draw(){
+    var now = performance.now();
+    cx.clearRect(0, 0, W, H); cx.font = '12px "JetBrains Mono", monospace'; cx.textBaseline = 'top';
+    for (var r = 0; r < rows; r++) for (var c = 0; c < cols; c++) {
+      var s = sites[r * cols + c], k = Math.max(0, 1 - (now - s.t) / FADE);
+      cx.fillStyle = s.on ? 'rgba(127,216,143,' + (.13 + .6 * k) + ')' : 'rgba(125,140,150,' + (.11 + .25 * k) + ')';
+      cx.fillText(s.on ? NEW : OLD, c * SW - (r % 2 ? SW / 2 : 0) + 6, r * RH + 4);
+    }
+  }
+  function step(){
+    if (!vis || document.hidden) return;
+    var n = 1 + (Math.random() * 2 | 0);
+    while (n--) { var s = sites[Math.random() * sites.length | 0]; s.on = !s.on; s.t = performance.now(); }
+    draw();
+  }
+  size(); addEventListener('resize', size);
+  if (document.fonts && document.fonts.ready) document.fonts.ready.then(draw);
+  if (reduce) return;
+  onView(zone, function(v){ vis = v; }, {threshold: 0});
+  timer = setInterval(step, 110);
+});
+
+/* ── 첫 화면: 패치 스위치 시연 ────────────────────────────── */
+part('hero', function(){
   var SRC = [
     '## 스트리밍 출력',
     'agy는 응답을 16ms마다 12바이트씩 끊어 찍습니다. 여기서 **"문구"**라는 표현과 **용어(`code`)**는 굵게 보여야 합니다.',
@@ -369,108 +546,106 @@ agy-cli-patch -p heading,cjk-bold,tilde-strike -o agy-md</pre></div>
     '### 지원 범위',
     '버전은 1.5.0~1.5.6, 헤딩은 H2~H6까지입니다. ~~지워진 글~~만 취소선이어야 합니다.'
   ].join('\n');
+  var FXLINE = {heading: [0, 3], cjk: [1], tilde: [4]};
   var enc = new TextEncoder();
   // 글자 경계별 누적 바이트 수 (cutAtRuneBoundary 처럼 글자 중간에서 자르지 않는다)
   var chars = Array.from(SRC), cum = [0];
-  chars.forEach(function(c){ cum.push(cum[cum.length-1] + enc.encode(c).length); });
-  var TOTAL = cum[cum.length-1];
-  function cut(bytes){ var i = 0; while (i < chars.length && cum[i+1] <= bytes) i++; return {text: chars.slice(0,i).join(''), bytes: cum[i]}; }
+  chars.forEach(function(c){ cum.push(cum[cum.length - 1] + enc.encode(c).length); });
+  var TOTAL = cum[cum.length - 1];
+  function cut(bytes){ var i = 0; while (i < chars.length && cum[i + 1] <= bytes) i++; return {text: chars.slice(0, i).join(''), bytes: cum[i]}; }
 
-  var on = {nodrip:false, batch:false, heading:false, cjk:false, tilde:false};
-  var $ = function(id){ return document.getElementById(id); };
-  var term = $('term'), reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var KEYS = ['nodrip', 'batch', 'heading', 'cjk', 'tilde'];
+  var on = {nodrip: false, batch: false, heading: false, cjk: false, tilde: false};
+  var term = $('term'), rows = Array.prototype.slice.call(document.querySelectorAll('#sw button.row'));
+  function rowOf(k){ return rows.filter(function(b){ return b.dataset.k === k; })[0]; }
 
-  function esc(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
   var PUNCT = /[!-\/:-@\[-`{-~]/;
   function inline(s){
     var out = '', i = 0;
     while (i < s.length) {
       var ch = s[i];
       if (ch === '`') {
-        var e = s.indexOf('`', i+1);
-        if (e > i) { out += '<code>' + esc(s.slice(i+1, e)) + '</code>'; i = e+1; continue; }
+        var e = s.indexOf('`', i + 1);
+        if (e > i) { out += '<code>' + esc(s.slice(i + 1, e)) + '</code>'; i = e + 1; continue; }
       }
-      if (ch === '*' && s[i+1] === '*') {
-        var j = i+2, close = -1;
-        while (j < s.length-1) {
-          if (s[j] === '`') { var e2 = s.indexOf('`', j+1); if (e2 > j) { j = e2+1; continue; } }
-          if (s[j] === '*' && s[j+1] === '*') {
-            var prev = s[j-1], next = s[j+2];
+      if (ch === '*' && s[i + 1] === '*') {
+        var j = i + 2, close = -1;
+        while (j < s.length - 1) {
+          if (s[j] === '`') { var e2 = s.indexOf('`', j + 1); if (e2 > j) { j = e2 + 1; continue; } }
+          if (s[j] === '*' && s[j + 1] === '*') {
+            var prev = s[j - 1], next = s[j + 2];
             var nextOk = next === undefined || /\s/.test(next) || PUNCT.test(next);
             // 닫는 ** 앞이 구두점이고 뒤에 글자가 바로 붙으면 닫는 표시로 인정되지 않는다 (cjk-bold 가 고치는 곳)
             if (!/\s/.test(prev) && (!PUNCT.test(prev) || nextOk || on.cjk)) { close = j; break; }
           }
           j++;
         }
-        if (close > 0) { out += '<b>' + inline(s.slice(i+2, close)) + '</b>'; i = close+2; continue; }
+        if (close > 0) { out += '<b>' + inline(s.slice(i + 2, close)) + '</b>'; i = close + 2; continue; }
       }
       if (ch === '~') {
-        var n = s[i+1] === '~' ? 2 : 1;
+        var n = s[i + 1] === '~' ? 2 : 1;
         if (n === 2 || !on.tilde) {
-          var mark = n === 2 ? '~~' : '~', k = i+n, c2 = -1;
+          var k = i + n, c2 = -1;
           while (k < s.length) {
-            if (s[k] === '~') {
-              var run = s[k+1] === '~' ? 2 : 1;
-              if (run === n) { c2 = k; break; }
-              k += run; continue;
-            }
+            if (s[k] === '~') { var run = s[k + 1] === '~' ? 2 : 1; if (run === n) { c2 = k; break; } k += run; continue; }
             k++;
           }
-          if (c2 > 0) { out += '<s>' + inline(s.slice(i+n, c2)) + '</s>'; i = c2+n; continue; }
-          out += mark; i += n; continue;
+          if (c2 > 0) { out += '<s>' + inline(s.slice(i + n, c2)) + '</s>'; i = c2 + n; continue; }
+          out += n === 2 ? '~~' : '~'; i += n; continue;
         }
       }
       out += esc(ch); i++;
     }
     return out;
   }
-  function render(text, caret){
-    var lines = text.split('\n'), html = '';
+  function render(text, caret, fx){
+    var lines = text.split('\n'), html = '', hl = FXLINE[fx] || [];
     lines.forEach(function(l, idx){
-      var last = idx === lines.length-1, c = (last && caret) ? '<span class="caret"></span>' : '';
+      var last = idx === lines.length - 1, c = (last && caret) ? '<span class="caret"></span>' : '';
+      var f = hl.indexOf(idx) >= 0 ? ' fx' : '';
       var m = /^(#{2,6}) (.*)$/.exec(l);
-      if (m) html += '<div class="h">' + (on.heading ? '' : '<span class="px">' + m[1] + ' </span>') + inline(m[2]) + c + '</div>';
+      if (m) html += '<div class="h"><span class="' + f.trim() + '">' + (on.heading ? '' : '<span class="px">' + m[1] + ' </span>') + inline(m[2]) + '</span>' + c + '</div>';
       else if (l === '') html += '<div class="sp">' + c + '</div>';
-      else html += '<div>' + inline(l) + c + '</div>';
+      else html += '<div><span class="' + f.trim() + '">' + inline(l) + '</span>' + c + '</div>';
     });
     return html;
   }
 
-  var timer = null, rx = 0, drip = 0, t0 = 0;
-  var RX_RATE = 420;        // 수신 속도(B/s) — 시연용으로 정한 값
+  var timer = null, rx = 0, drip = 0, t0 = 0, finished = false, wasEmpty = false;
+  var RX_RATE = 420;          // 수신 속도(B/s) — 시연용으로 정한 값
   var DRIP_RATE = 12 / 0.064; // 12바이트 / 16ms 를 ¼배속으로
-  function paint(){
-    var done = rx >= TOTAL;
-    var shownBytes;
+  function paint(fx){
+    var done = rx >= TOTAL, shownBytes;
     if (on.batch) shownBytes = done ? TOTAL : 0;
     else if (on.nodrip) shownBytes = rx;
     else shownBytes = Math.min(rx, drip);
-    var c = cut(shownBytes);
-    var finished = done && c.bytes >= TOTAL;
-    term.innerHTML = render(c.text, !finished && !on.batch);
-    $('rx').textContent = cut(rx).bytes;
-    $('shown').textContent = c.bytes;
-    var st = $('state');
-    st.textContent = done ? 'DONE' : '생성 중';
-    st.className = 'state' + (done ? ' done' : '');
+    var c = cut(shownBytes), r = cut(rx).bytes;
+    finished = done && c.bytes >= TOTAL;
+    term.classList.toggle('pop', on.batch && finished && wasEmpty);
+    wasEmpty = c.bytes === 0;
+    term.innerHTML = render(c.text, !finished && !on.batch, fx);
+    $('rx').textContent = r; $('shown').textContent = c.bytes;
+    $('rxbar').style.width = (r / TOTAL * 100) + '%'; $('shbar').style.width = (c.bytes / TOTAL * 100) + '%';
+    var lag = $('lag'); lag.textContent = '밀린 양 ' + (r - c.bytes) + ' B'; lag.classList.toggle('hot', r - c.bytes > 0);
+    var st = $('state'); st.textContent = done ? 'DONE' : '생성 중'; st.className = 'state' + (done ? ' done' : '');
     return finished;
   }
   function stop(){ if (timer) { clearInterval(timer); timer = null; } }
   function play(){
-    stop();
+    stop(); wasEmpty = false;
     if (reduce) { rx = drip = TOTAL; paint(); return; }
     rx = 0; drip = 0; t0 = performance.now();
     timer = setInterval(function(){
       var t = (performance.now() - t0) / 1000;
-      rx = Math.min(TOTAL, Math.floor(t * RX_RATE / 40) * 40);          // 40바이트 덩어리로 도착
-      drip = Math.min(TOTAL, Math.floor(t * DRIP_RATE / 12) * 12);      // 12바이트씩 표시
+      rx = Math.min(TOTAL, Math.floor(t * RX_RATE / 40) * 40);     // 40바이트 덩어리로 도착
+      drip = Math.min(TOTAL, Math.floor(t * DRIP_RATE / 12) * 12); // 12바이트씩 표시
       if (paint()) stop();
     }, 32);
     paint();
   }
   function sync(){
     var n = 0;
-    document.querySelectorAll('.sw button.row').forEach(function(b){
+    rows.forEach(function(b){
       var v = on[b.dataset.k]; if (v) n++;
       b.setAttribute('aria-checked', v ? 'true' : 'false');
       b.querySelector('.ck').textContent = v ? '◉' : '○';
@@ -478,52 +653,362 @@ agy-cli-patch -p heading,cjk-bold,tilde-strike -o agy-md</pre></div>
     $('cnt').textContent = n + '/5 선택';
     $('all').textContent = n === 5 ? '모두 끄기' : '모두 켜기';
   }
-  document.querySelectorAll('.sw button.row').forEach(function(b){
-    b.addEventListener('click', function(){
-      var k = b.dataset.k; on[k] = !on[k]; $('flash').textContent = '';
-      if (k === 'batch' && on.batch && !on.nodrip) { on.nodrip = true; $('flash').textContent = 'batch 는 nodrip 과 함께 동작하므로 nodrip 도 선택했습니다.'; }
-      if (k === 'nodrip' && !on.nodrip && on.batch) { on.batch = false; $('flash').textContent = 'nodrip 을 해제하면 batch 도 함께 해제됩니다.'; }
-      sync();
-      if (k === 'nodrip' || k === 'batch') play(); else paint();
+  function toggle(k){
+    on[k] = !on[k]; $('flash').textContent = '';
+    if (k === 'batch' && on.batch && !on.nodrip) { on.nodrip = true; $('flash').textContent = 'batch 는 nodrip 과 함께 동작하므로 nodrip 도 선택했습니다.'; }
+    if (k === 'nodrip' && !on.nodrip && on.batch) { on.batch = false; $('flash').textContent = 'nodrip 을 해제하면 batch 도 함께 해제됩니다.'; }
+    sync();
+    if (k === 'nodrip' || k === 'batch') play(); else paint(k);
+  }
+
+  // 자동 시연: 커서가 내려가며 하나씩 켠다. 사용자가 손대면 바로 멈춘다.
+  var autoTok = 0;
+  function stopAuto(){
+    autoTok++; rows.forEach(function(r){ r.classList.remove('cur'); });
+    $('auto').textContent = '자동 시연'; $('auto').setAttribute('aria-pressed', 'false');
+  }
+  function until(f){ return new Promise(function(res){ (function chk(){ f() ? res() : setTimeout(chk, 80); })(); }); }
+  function autopilot(){
+    stopAuto(); var tok = autoTok, live = function(){ return tok === autoTok; };
+    $('auto').textContent = '자동 시연 중'; $('auto').setAttribute('aria-pressed', 'true');
+    KEYS.forEach(function(k){ on[k] = false; }); $('flash').textContent = ''; sync(); play();
+    var seq = ['heading', 'cjk', 'tilde', 'nodrip', 'batch'], p = until(function(){ return finished || !live(); });
+    seq.forEach(function(k){
+      p = p.then(function(){ return live() && sleep(1000); })
+        .then(function(){ if (live()) rowOf(k).classList.add('cur'); return live() && sleep(700); })
+        .then(function(){ if (!live()) return; toggle(k); return (k === 'nodrip' || k === 'batch') ? until(function(){ return finished || !live(); }) : sleep(600); })
+        .then(function(){ if (live()) rowOf(k).classList.remove('cur'); });
     });
-  });
-  $('replay').addEventListener('click', play);
+    p.then(function(){ if (live()) stopAuto(); });
+  }
+  rows.forEach(function(b){ b.addEventListener('click', function(){ stopAuto(); toggle(b.dataset.k); }); });
+  $('replay').addEventListener('click', function(){ stopAuto(); play(); });
   $('all').addEventListener('click', function(){
-    var allOn = Object.keys(on).every(function(k){ return on[k]; });
-    Object.keys(on).forEach(function(k){ on[k] = !allOn; });
+    stopAuto();
+    var allOn = KEYS.every(function(k){ return on[k]; });
+    KEYS.forEach(function(k){ on[k] = !allOn; });
     $('flash').textContent = ''; sync(); play();
   });
-  $('tot').textContent = TOTAL;
-  sync(); play();
+  $('auto').addEventListener('click', function(){ if ($('auto').getAttribute('aria-pressed') === 'true') stopAuto(); else autopilot(); });
+  sync();
+  if (reduce) play(); else autopilot();
+});
 
-  // 대화형 화면 단계 전환
-  var tabs = document.querySelectorAll('.tabs button');
-  tabs.forEach(function(t){
-    t.addEventListener('click', function(){
-      var cur = +t.dataset.t;
-      tabs.forEach(function(x){
-        var i = +x.dataset.t;
-        x.setAttribute('aria-selected', i === cur ? 'true' : 'false');
-        var n = x.querySelector('.n');
-        n.textContent = i < cur ? '✓' : (i+1);
-        n.style.color = i < cur ? 'var(--ok)' : '';
+/* ── 패치 목록: 전후 미리보기 ─────────────────────────────── */
+part('minis', function(){
+  var minis = Array.prototype.slice.call(document.querySelectorAll('.mini')), tick = 0;
+  minis.forEach(function(m, i){
+    m._vis = false; m._pin = false;
+    onView(m, function(v){ m._vis = v; }, {threshold: .6});
+    m.addEventListener('click', function(){ m._pin = true; m.dataset.on = m.dataset.on === '1' ? '0' : '1'; });
+  });
+  if (reduce) { minis.forEach(function(m){ m.dataset.on = '1'; }); return; }
+  setInterval(function(){
+    if (document.hidden) return;
+    tick++;
+    minis.forEach(function(m, i){ if (m._vis && !m._pin && (tick + i) % 2 === 0) m.dataset.on = m.dataset.on === '1' ? '0' : '1'; });
+  }, 1700);
+});
+
+/* ── 원리: 이름으로 찾고, 대조하고, 쓴다 ──────────────────── */
+part('scan', function(){
+  var SYMS = ['render.BuildHeader', 'render.BannerWithInfo', 'render.glamourStyleForScheme', 'goldmark/parser.ScanDelimiter', 'store.cutAtRuneBoundary', 'render.renderPlannerBody', 'goldmark/extension.(*strikethroughParser).Parse'];
+  var TARGET = 4;
+  var A = {
+    x86: {old: ['55', '48', '89', 'e5'], neu: ['48', '89', 'd8', 'c3'], at: '0xa4720c0', atNote: ' <span>(agy 1.5.7 · Linux x86_64)</span>',
+          asmOld: '<b>push rbp</b> · <b>mov rbp, rsp</b>', asmNew: '<b>mov rax, rbx</b> · <b>ret</b> — 받은 값을 자르지 않고 바로 돌려줍니다',
+          err: 'cutAtRuneBoundary x86_64 프롤로그 불일치 (@0xa4720c0)'},
+    arm: {old: ['90', '0b', '40', 'f9', 'ff', '63', '30', 'eb'], neu: ['e0', '03', '01', 'aa', 'c0', '03', '5f', 'd6'], at: '', atNote: '',
+          asmOld: '', asmNew: '<b>mov x0, x1</b> · <b>ret</b> — 받은 값을 자르지 않고 바로 돌려줍니다',
+          err: 'cutAtRuneBoundary ARM64 프롤로그 불일치 (@0x…)'}
+  };
+  var stage = $('stage'), flow = $('flow'), cards = flow.querySelectorAll('.st'), syms = $('syms');
+  var arch = 'x86', mis = false, gen = 0, started = false;
+  SYMS.forEach(function(s){ var d = document.createElement('div'); d.textContent = s; syms.appendChild(d); });
+  var symEls = syms.children;
+  function setStep(n, fail){
+    stage.className = 'stage rv in' + (n >= 0 ? ' mapped' : '') + (n >= 1 ? ' s' + Math.min(n, 3) : '') + (fail ? ' fail' : '');
+    for (var i = 0; i < 4; i++) { cards[i].className = 'st glow' + (i < n ? ' done' : i === n ? (fail ? ' done' : ' act') : (fail ? ' skip' : '')); }
+  }
+  function cell(txt, cls){ var c = document.createElement('span'); c.className = 'cell ' + (cls || ''); c.textContent = txt; return c; }
+  function label(txt){ var l = document.createElement('span'); l.className = 'lb'; l.textContent = txt; return l; }
+  function run(){
+    var tok = ++gen, a = A[arch], ok = function(){ return tok === gen; };
+    var w = function(ms){ return sleep(reduce ? 0 : ms); };
+    flow.classList.add('live');
+    for (var i = 0; i < symEls.length; i++) symEls[i].className = '';
+    $('addr').innerHTML = ''; $('brow').innerHTML = ''; $('srow').innerHTML = ''; $('asm').innerHTML = '';
+    $('verdict').textContent = ''; $('verdict').className = 'verdict';
+    $('chipL').className = ''; $('chipM').className = '';
+    stage.className = 'stage rv in';
+    var p = w(60).then(function(){ if (ok()) setStep(0); return w(1100); })
+      .then(function(){ if (ok()) setStep(1); return w(350); });
+    for (var s = 0; s <= TARGET; s++) (function(s){
+      p = p.then(function(){
+        if (!ok()) return;
+        if (s > 0) symEls[s - 1].className = '';
+        symEls[s].className = s === TARGET ? 'hit' : 'scan';
+        return w(s === TARGET ? 500 : 190);
       });
-      document.querySelectorAll('[data-p]').forEach(function(p){ p.hidden = +p.dataset.p !== cur; });
+    })(s);
+    p = p.then(function(){
+      if (!ok()) return;
+      $('addr').innerHTML = a.at ? '→ 함수 시작 <b>' + a.at + '</b>' + a.atNote : '→ 함수 시작 위치';
+      return w(700);
+    }).then(function(){
+      if (!ok()) return;
+      setStep(2);
+      $('brow').appendChild(label('바이너리에서 읽은 바이트'));
+      $('srow').appendChild(label('패처가 아는 시그니처'));
+      return w(250);
+    });
+    a.old.forEach(function(b, i){
+      p = p.then(function(){
+        if (!ok()) return;
+        $('brow').appendChild(cell(mis ? '??' : b, mis ? 'bad' : 'old ok'));
+        $('srow').appendChild(cell(b, 'sig'));
+        return w(150);
+      });
+    });
+    p = p.then(function(){
+      if (!ok()) return;
+      if (mis) {
+        setStep(2, true);
+        $('verdict').className = 'verdict bad'; $('verdict').textContent = '✕ ' + a.err + ' — 아무것도 쓰지 않습니다.';
+        return Promise.reject('stop');
+      }
+      $('verdict').className = 'verdict ok'; $('verdict').textContent = '✓ 시그니처 일치';
+      $('asm').innerHTML = a.asmOld;
+      return w(900);
+    }).then(function(){ if (ok()) setStep(3); return w(300); });
+    a.neu.forEach(function(b, i){
+      p = p.then(function(){
+        if (!ok()) return;
+        var c = $('brow').querySelectorAll('.cell')[i];
+        c.className = 'cell flip';
+        setTimeout(function(){ if (ok()) { c.textContent = b; c.className = 'cell flip new'; } }, reduce ? 0 : 170);
+        return w(190);
+      });
+    });
+    p.then(function(){
+      if (!ok()) return;
+      $('asm').innerHTML = a.asmNew;
+      $('verdict').textContent = '✓ ' + a.neu.length + '바이트를 바꿔 썼습니다';
+      $('chipL').className = 'on'; $('chipM').className = 'on';
+      for (var i = 0; i < 4; i++) cards[i].className = 'st glow done';
+    }).catch(function(e){ if (e !== 'stop') console.error(e); });
+  }
+  stage.querySelectorAll('[data-arch]').forEach(function(b){
+    b.addEventListener('click', function(){
+      arch = b.dataset.arch;
+      stage.querySelectorAll('[data-arch]').forEach(function(x){ x.setAttribute('aria-pressed', x === b ? 'true' : 'false'); });
+      run();
     });
   });
+  $('mis').addEventListener('click', function(){ mis = !mis; $('mis').setAttribute('aria-pressed', mis ? 'true' : 'false'); run(); });
+  $('scanAgain').addEventListener('click', run);
+  onView(stage, function(v){ if (v && !started) { started = true; run(); } }, {threshold: .35});
+});
 
-  // 복사
+/* ── 대화형 화면 따라 하기 (Wizard::handle_key 를 옮김) ───── */
+part('wizard', function(){
+  var P = [
+    {id: 'nodrip', t: '타자기 딜레이 제거 (No Drip)', d: '16ms마다 12바이트씩 끊어 찍는 타자기 효과를 끄고 수신 즉시 반영', s: 'store.cutAtRuneBoundary', def: true, off: '0xa4720c0'},
+    {id: 'batch', t: '응답 완료 시 한 번에 일괄 출력 (Batch Render)', d: '생성 중에는 본문을 숨겼다가 답변이 완료(DONE)되면 전체를 한 번에 출력', s: 'render.renderPlannerBody', def: true, off: '0xa3268f3'},
+    {id: 'heading', t: "마크다운 헤딩 '##' 기호 숨김 (Clean Headings)", d: "H2~H6 제목 앞에 붙는 '## '~'###### ' 프리픽스를 제거하고 스타일만 유지", s: 'render.glamourStyleForScheme', def: true, off: '0xa31fbf6, 0xa31fc11, 0xa31fc2c, 0xa31fc47, 0xa31fc62'},
+    {id: 'cjk-bold', t: '구두점 뒤 한글 조사 볼드(**) 깨짐 수정 (CJK Bold Fix)', d: '**"문구"**라는, **용어(`code`)**는 처럼 뒤에 한글 조사가 붙어도 볼드 유지', s: 'goldmark/parser.ScanDelimiter', def: true, off: '0xa1b9c91, 0xa1b9cc3'},
+    {id: 'tilde-strike', t: '단일 물결표(~) 취소선 오작동 방지 (Double-Tilde Strikethrough)', d: "1.5.0~1.5.6 같은 범위 표기용 단일 '~'에 취소선이 그어지지 않도록 '~~'만 허용", s: 'goldmark/extension.(*strikethroughParser).Parse', def: true, off: '0xa1d5015'},
+    {id: 'banner', t: '제품명 옆 패치 버전 표시 (Patch Version Tag)', d: "상단 'Antigravity CLI 1.5.7' 옆에 '(patch v0.2.1)' 형태로 패치 버전 표시", s: 'render.BannerWithInfo', def: true, off: '0xa8a4287, 0xa326f90'},
+    {id: 'release-notes', t: '상단 배너 릴리즈 노트 표시 (Release Notes)', d: '로고 아래에 패치 기능 요약 및 GitHub 정보 표시 (기본 꺼짐, -p 로 명시해야 적용)', s: 'render.BuildHeader', def: false, off: '0xa8a42c7, 0xa8a4520, 0xa318180'}
+  ];
+  var N = P.length, B = 1, ND = 0;
+  var DIR = '~/.local/share/mise/installs/agy/1.5.7', ADIR = '/home/user/.local/share/mise/installs/agy/1.5.7', ABIN = '/home/user/.local/bin';
+  var wz = $('wz'), tui = $('tui'), W, logTok = 0;
+  function reset(){ W = {mode: 'tui', step: 0, cursor: 0, sel: P.map(function(p){ return p.def; }), choice: 0, name: [], pos: 0, edited: false, flash: null}; }
+  function chosen(){ return P.filter(function(p, i){ return W.sel[i]; }); }
+  function nameStr(){ return W.name.join('').trim(); }
+  function plan(){
+    var n = nameStr();
+    if (!n) return {err: '실행 파일 이름을 입력하세요.'};
+    if (n === 'antigravity' || n === 'antigravity.orig') return {err: '원본과 같은 경로입니다. 원본에 적용하려면 아래 in-place 를 고르세요.'};
+    return {dst: DIR + '/' + n, link: '~/.local/bin/' + n, adst: ADIR + '/' + n, alink: ABIN + '/' + n};
+  }
+  function toggle(i){
+    W.sel[i] = !W.sel[i];
+    if (i === B && W.sel[B] && !W.sel[ND]) { W.sel[ND] = true; W.flash = ['acc', 'batch 는 nodrip 과 함께 동작하므로 nodrip 도 선택했습니다.']; }
+    else if (i === ND && !W.sel[ND] && W.sel[B]) { W.sel[B] = false; W.flash = ['acc', 'nodrip 을 해제하면 batch 도 함께 해제됩니다.']; }
+  }
+  function key(k){
+    if (W.mode !== 'tui') return false;
+    if (k === 'CtrlC') { cancel(); return true; }
+    W.flash = null;
+    if (W.step === 0) {
+      if (k === 'Esc' || k === 'q' || k === 'Q') { cancel(); return true; }
+      else if (k === 'Up' || k === 'k') W.cursor = (W.cursor + N - 1) % N;
+      else if (k === 'Down' || k === 'j') W.cursor = (W.cursor + 1) % N;
+      else if (k === 'Home') W.cursor = 0;
+      else if (k === 'End') W.cursor = N - 1;
+      else if (k === ' ') toggle(W.cursor);
+      else if (k === 'a' || k === 'A') { var all = W.sel.every(Boolean); W.sel = W.sel.map(function(){ return !all; }); }
+      else if (/^[0-9]$/.test(k)) { var idx = +k; if (idx >= 1 && idx <= N) { W.cursor = idx - 1; toggle(idx - 1); } }
+      else if (k === 'Enter' || k === 'Right') {
+        if (W.sel.some(Boolean)) {
+          if (!W.edited) { W.name = Array.from(W.sel[B] ? 'agy-batch' : 'agy-patched'); W.pos = W.name.length; }
+          W.step = 1;
+        } else W.flash = ['wr', '적용할 패치를 하나 이상 선택하세요.'];
+      } else return false;
+    } else if (W.step === 1) {
+      var ed = W.choice === 0;
+      if (k === 'Esc') W.step = 0;
+      else if (k === 'Up') W.choice = 0;
+      else if (k === 'Down') W.choice = 1;
+      else if (k === 'Enter') { if (W.choice === 1 || !plan().err) W.step = 2; }
+      else if (k === 'Left' && ed) W.pos = Math.max(0, W.pos - 1);
+      else if (k === 'Right' && ed) W.pos = Math.min(W.name.length, W.pos + 1);
+      else if (k === 'Home' && ed) W.pos = 0;
+      else if (k === 'End' && ed) W.pos = W.name.length;
+      else if (k === 'Backspace' && ed && W.pos > 0) { W.pos--; W.name.splice(W.pos, 1); W.edited = true; }
+      else if (k === 'Delete' && ed && W.pos < W.name.length) { W.name.splice(W.pos, 1); W.edited = true; }
+      else if (k.length === 1 && ed && /[A-Za-z0-9._-]/.test(k) && W.name.length < 24) { W.name.splice(W.pos, 0, k); W.pos++; W.edited = true; }
+      else return false;
+    } else {
+      if (k === 'Esc' || k === 'Left') W.step = 1;
+      else if (k === 'q' || k === 'Q') { cancel(); return true; }
+      else if (k === 'Enter') { done(); return true; }
+      else return false;
+    }
+    draw(); return true;
+  }
+  function ln(html, cls, attr){ return '<div class="ln ' + (cls || '') + '"' + (attr || '') + '>' + html + '</div>'; }
+  function sp(cls, txt){ return '<span class="' + cls + '">' + esc(txt) + '</span>'; }
+  function keys(list){
+    return '<div class="keys">' + list.map(function(h){
+      return '<span>' + h[0].map(function(b){ return '<button type="button" data-key="' + b[1] + '">' + b[0] + '</button>'; }).join(' ') + ' <span class="dim">' + h[1] + '</span></span>';
+    }).join('') + '</div>';
+  }
+  function flashLines(){ return ln('') + (W.flash ? ln(sp(W.flash[0], W.flash[1])) + ln('') : ''); }
+  function draw(){
+    var h = '<div class="hdr"><span><span class="ab">agy-cli-patch</span> <span class="dim">v0.2.1</span></span><span class="dim">ELF · x86_64</span></div>';
+    h += ln(sp('dim', '대상') + sp('gr', DIR + '/antigravity') + '<span class="dim" style="flex:none">1.5.7</span>');
+    h += ln('');
+    var names = ['패치 선택', '출력 방식', '확인'];
+    h += '<div class="ln" style="flex-wrap:wrap">' + names.map(function(n, i){
+      var mark = i < W.step ? sp('ok', '✓') : sp(i === W.step ? 'ab' : 'dim', String(i + 1));
+      return (i ? sp('dim', '›') : '') + '<span>' + mark + ' ' + sp(i === W.step ? 'b' : 'dim', n) + '</span>';
+    }).join('') + '</div><div class="rule"></div>';
+    if (W.step === 0) {
+      var cnt = W.sel.filter(Boolean).length, cur = P[W.cursor];
+      h += '<div class="hdr">' + sp('b', '적용할 패치를 고르세요') + sp('dim', cnt + '/' + N + ' 선택') + '</div>' + ln('');
+      P.forEach(function(p, i){
+        var c = i === W.cursor;
+        h += ln('<span class="ptr ab">' + (c ? '❯' : '') + '</span>' + sp(W.sel[i] ? 'ok' : 'dim', W.sel[i] ? '◉' : '○') + sp((c ? 'ab' : 'acc') + ' idc', p.id) + sp(c ? 'b' : '', p.t), 'row', ' data-i="' + i + '"');
+      });
+      h += '<div class="rule"></div>' + ln(sp('', cur.d)) + ln(sp('dim', '심볼') + sp('dim', cur.s)) + flashLines();
+      h += keys([[[['↑', 'Up'], ['↓', 'Down']], '이동'], [[['space', ' ']], '선택'], [[['a', 'a']], '전체'], [[['enter', 'Enter']], '다음'], [[['q', 'q']], '종료']]);
+    } else if (W.step === 1) {
+      var s0 = W.choice === 0, pl = plan();
+      h += ln(sp('b', '결과물을 어떻게 만들까요?')) + ln('');
+      h += ln('<span class="ptr ab">' + (s0 ? '❯' : '') + '</span>' + sp(s0 ? 'b' : '', '새 실행 파일 만들기') + sp('dim', '원본은 그대로 둡니다'), 'row', ' data-c="0"');
+      var nm;
+      if (s0) { nm = '<span class="ab">' + esc(W.name.slice(0, W.pos).join('')) + '<span class="car">' + esc(W.name[W.pos] || ' ').replace(' ', '&nbsp;') + '</span>' + esc(W.name.slice(W.pos + 1).join('')) + '</span>'; }
+      else nm = sp('', W.name.join(''));
+      h += ln(sp('dim', '이름') + nm, 'ind');
+      if (pl.err) h += ln(sp('er', pl.err), 'ind');
+      else h += ln(sp('dim', '생성') + sp('', pl.dst), 'ind') + ln(sp('dim', '링크') + sp('', pl.link), 'ind');
+      h += ln('');
+      h += ln('<span class="ptr ab">' + (s0 ? '' : '❯') + '</span>' + sp(s0 ? '' : 'b', '기본 agy에 직접 덮어쓰기') + sp('dim', 'in-place'), 'row', ' data-c="1"');
+      h += ln(sp('dim', '백업') + sp('gr', DIR + '/antigravity.orig') + sp('dim', '(새로 만듦)'), 'ind');
+      h += ln(sp('dim', 'agy 자체 업데이트 시 패치가 사라지므로 다시 실행해야 합니다.'), 'ind') + flashLines();
+      h += keys(s0
+        ? [[[['↑', 'Up'], ['↓', 'Down']], '방식'], [[['←', 'Left'], ['→', 'Right']], '커서'], [[['enter', 'Enter']], '다음'], [[['esc', 'Esc']], '뒤로'], [[['ctrl+c', 'CtrlC']], '종료']]
+        : [[[['↑', 'Up'], ['↓', 'Down']], '방식'], [[['enter', 'Enter']], '다음'], [[['esc', 'Esc']], '뒤로'], [[['ctrl+c', 'CtrlC']], '종료']]);
+    } else {
+      var ch = chosen(), p2 = plan();
+      h += ln(sp('b', '아래 내용으로 패치합니다')) + ln('') + ln(sp('dim', '적용할 패치 ' + ch.length + '개'));
+      ch.forEach(function(p){ h += ln('<span class="ptr"></span>' + sp('ok', '✓') + sp('acc idc', p.id) + sp('', p.t)); });
+      h += ln('') + ln(sp('dim', '출력'));
+      if (W.choice === 1) h += ln('<span class="ptr"></span>' + sp('dim', '덮어쓰기') + sp('', DIR + '/antigravity')) + ln('<span class="ptr"></span>' + sp('dim', '원본 백업') + sp('', DIR + '/antigravity.orig'));
+      else h += ln('<span class="ptr"></span>' + sp('dim', '생성') + sp('', p2.dst)) + ln('<span class="ptr"></span>' + sp('dim', '링크') + sp('', p2.link));
+      h += flashLines() + keys([[[['enter', 'Enter']], '패치 실행'], [[['esc', 'Esc']], '뒤로'], [[['q', 'q']], '종료']]);
+    }
+    tui.innerHTML = h;
+  }
+  function showLog(lines){
+    W.mode = 'log'; var tok = ++logTok;
+    tui.innerHTML = '<div class="log" id="wzlog"></div><div class="keys"><button type="button" data-key="Restart">다시 실행</button></div>';
+    var box = $('wzlog'), p = Promise.resolve();
+    lines.forEach(function(l, i){
+      p = p.then(function(){
+        if (tok !== logTok) return;
+        var d = document.createElement('div'); d.className = l[0]; d.textContent = l[1]; box.appendChild(d);
+        return sleep(reduce ? 0 : (i === 0 ? 450 : 140));
+      });
+    });
+  }
+  var HEAD = [['p', '$ agy-cli-patch'], ['', '[*] 대상 바이너리: ' + ADIR + '/antigravity (버전 1.5.7)']];
+  function cancel(){ showLog(HEAD.concat([['', '취소되었습니다.']])); }
+  function done(){
+    var ch = chosen(), L = HEAD.slice(), inpl = W.choice === 1, pl = plan(), dst = inpl ? ADIR + '/antigravity' : pl.adst;
+    if (inpl) L.push(['g', '[+] 원본 백업 저장: ' + ADIR + '/antigravity.orig']);
+    L.push(['', '']); L.push(['g', '[+] 패치 적용 내역 (Elf64 / X86_64) -> ' + dst]);
+    ch.forEach(function(p){ L.push(['', '    - [' + p.id + '] ' + p.t + ' (' + p.off + ')']); });
+    if (inpl) L.push(['g', '[+] 기본 agy 바이너리에 패치 적용 완료: ' + dst]);
+    else L.push(['g', '[+] 심볼릭 링크 연결 완료: ' + pl.alink + ' -> ' + dst]);
+    showLog(L);
+  }
+  var MAP = {ArrowUp: 'Up', ArrowDown: 'Down', ArrowLeft: 'Left', ArrowRight: 'Right', Escape: 'Esc', Enter: 'Enter', Backspace: 'Backspace', Delete: 'Delete', Home: 'Home', End: 'End'};
+  wz.addEventListener('keydown', function(e){
+    if (e.target !== wz && e.target.tagName === 'BUTTON' && (e.key === 'Enter' || e.key === ' ')) return; // 화면 속 버튼은 그대로 눌린다
+    if (e.altKey || e.metaKey) return;
+    var k = e.ctrlKey ? (e.key === 'c' ? 'CtrlC' : null) : (MAP[e.key] || (e.key.length === 1 ? e.key : null));
+    if (!k) return;
+    if (W.mode === 'log') { if (k === 'Enter') { e.preventDefault(); reset(); draw(); } return; }
+    if (key(k)) e.preventDefault();
+  });
+  wz.addEventListener('focus', function(){ wz.classList.add('foc'); $('wzhint').textContent = '키보드 조작 중'; });
+  wz.addEventListener('blur', function(){ wz.classList.remove('foc'); $('wzhint').textContent = '눌러서 키보드로 조작'; });
+  tui.addEventListener('click', function(e){
+    var b = e.target.closest('[data-key]'), r = e.target.closest('[data-i]'), c = e.target.closest('[data-c]');
+    if (b) { if (b.dataset.key === 'Restart') { reset(); draw(); } else key(b.dataset.key); }
+    else if (r && W.mode === 'tui') { W.flash = null; W.cursor = +r.dataset.i; toggle(W.cursor); draw(); }
+    else if (c && W.mode === 'tui') { W.choice = +c.dataset.c; draw(); }
+    wz.focus({preventScroll: true});
+  });
+  reset(); draw();
+});
+
+/* ── 설치: 명령이 쳐지고 실제 출력이 따라온다 ─────────────── */
+part('install', function(){
+  var cmd = $('c1'), out = $('c1out'), full = cmd.textContent, tok = 0, started = false;
+  var OUT = [['o', '다운로드 중: https://github.com/KyongSik-Yoon/agy-cli-patch/releases/latest/download/agy-cli-patch-linux-x86_64.tar.gz'], ['g', '설치 완료: /home/user/.local/bin/agy-cli-patch']];
+  function finish(){ cmd.textContent = full; out.innerHTML = OUT.map(function(o){ return '\n<span class="' + o[0] + '">' + esc(o[1]) + '</span>'; }).join(''); }
+  function run(){
+    var t = ++tok, i = 0;
+    if (reduce) { finish(); return; }
+    cmd.textContent = ''; out.innerHTML = '<span class="tcar"></span>';
+    (function type(){
+      if (t !== tok) return;
+      i = Math.min(full.length, i + 2); cmd.textContent = full.slice(0, i);
+      if (i < full.length) { setTimeout(type, 22); return; }
+      sleep(500).then(function(){ if (t !== tok) return; out.innerHTML = '\n<span class="o">' + esc(OUT[0][1]) + '</span>'; return sleep(900); })
+        .then(function(){ if (t === tok) finish(); });
+    })();
+  }
+  $('typeAgain').addEventListener('click', run);
+  onView(cmd.parentNode, function(v){ if (v && !started) { started = true; run(); } }, {threshold: .6});
+
   document.querySelectorAll('.copy').forEach(function(b){
     b.addEventListener('click', function(){
-      var txt = $(b.dataset.copy).textContent;
+      var txt = b.dataset.copy === 'c1' ? full : $(b.dataset.copy).textContent;
       var ok = function(){ b.textContent = '복사됨'; setTimeout(function(){ b.textContent = '복사'; }, 1400); };
-      if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(txt).then(ok, fallback); else fallback();
       function fallback(){
         var ta = document.createElement('textarea'); ta.value = txt; document.body.appendChild(ta); ta.select();
         try { document.execCommand('copy'); ok(); } catch (e) {} document.body.removeChild(ta);
       }
+      if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(txt).then(ok, fallback); else fallback();
     });
   });
+});
 })();
 </script>
 </body>

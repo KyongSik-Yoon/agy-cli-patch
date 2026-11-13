@@ -1,0 +1,530 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>agy-cli-patch — agy 출력을 고치는 패처</title>
+<meta name="description" content="Antigravity CLI(agy)의 타자기 딜레이와 마크다운 렌더링 결함을, 주소가 아니라 심볼과 시그니처로 찾아 고치는 Rust 패처. Linux·macOS, x86_64·ARM64.">
+<meta property="og:title" content="agy-cli-patch">
+<meta property="og:description" content="agy의 타자기 딜레이와 한글 마크다운 결함을 스위치 하나씩 끄는 바이너리 패처.">
+<meta property="og:url" content="https://kyongsik-yoon.github.io/agy-cli-patch/">
+<meta property="og:type" content="website">
+<meta name="theme-color" content="#0c1013">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230c1013'/%3E%3Ccircle cx='11' cy='16' r='5.5' fill='none' stroke='%235fd7d7' stroke-width='2.5'/%3E%3Ccircle cx='11' cy='16' r='2' fill='%237fd88f'/%3E%3Crect x='20' y='9' width='4' height='14' rx='1' fill='%235fd7d7'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+KR:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&family=Nanum+Gothic+Coding:wght@400;700&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#0c1013; --bg2:#11171b; --panel:#151c21; --line:#243038; --line2:#31414b;
+  --fg:#d6dee3; --dim:#7d8c96; --faint:#55636c;
+  --accent:#5fd7d7; --ok:#7fd88f; --warn:#e5c07b; --err:#ef7b7b;
+  --sans:"IBM Plex Sans KR",system-ui,sans-serif;
+  --mono:"JetBrains Mono","Nanum Gothic Coding",ui-monospace,monospace;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--fg);font-family:var(--sans);font-size:16px;line-height:1.7;word-break:keep-all;overflow-wrap:anywhere;-webkit-font-smoothing:antialiased}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+code,.mono{font-family:var(--mono)}
+.wrap{max-width:1080px;margin:0 auto;padding:0 20px}
+button{font:inherit;color:inherit;cursor:pointer}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+
+header.top{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:18px 0}
+.brand{font-family:var(--mono);font-weight:700;color:var(--accent);font-size:15px}
+.brand span{color:var(--dim);font-weight:400}
+header.top nav{display:flex;gap:18px;font-size:14px}
+header.top nav a{color:var(--dim)}
+header.top nav a:hover{color:var(--fg);text-decoration:none}
+
+.hero{padding:36px 0 72px}
+.hero h1{font-size:clamp(30px,5.4vw,54px);line-height:1.22;margin:0 0 16px;font-weight:700;letter-spacing:-.02em}
+.hero h1 em{font-style:normal;color:var(--accent)}
+.hero p.lead{max-width:640px;color:var(--dim);margin:0 0 30px;font-size:17px}
+.hero p.lead b{color:var(--fg);font-weight:500}
+
+.demo{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(0,1fr);gap:16px;align-items:stretch}
+.win{background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden;display:flex;flex-direction:column;min-width:0}
+.win .bar{display:flex;align-items:center;gap:8px;padding:9px 12px;border-bottom:1px solid var(--line);font-family:var(--mono);font-size:12.5px;color:var(--dim)}
+.win .bar i{width:10px;height:10px;border-radius:50%;background:var(--line2);display:block}
+.win .bar b{font-weight:500;margin-left:6px}
+.term{font-family:var(--mono);font-size:14px;line-height:1.75;padding:16px 18px;min-height:330px;flex:1}
+.term .h{color:var(--accent);font-weight:700}
+.term .h .px{color:var(--faint)}
+.term b{color:#fff;font-weight:700}
+.term code{background:#22303a;color:var(--warn);padding:1px 5px;border-radius:3px}
+.term s{color:var(--faint)}
+.term .sp{height:.9em}
+.term .caret{display:inline-block;width:.55em;height:1.05em;background:var(--fg);vertical-align:-.18em;margin-left:1px}
+.stat{display:flex;flex-wrap:wrap;gap:4px 16px;padding:8px 14px;border-top:1px solid var(--line);font-family:var(--mono);font-size:12px;color:var(--dim)}
+.stat em{font-style:normal;color:var(--fg)}
+.stat .state{margin-left:auto}
+.stat .state.done{color:var(--ok)}
+
+.sw{font-family:var(--mono);font-size:13.5px;padding:14px 8px 10px;flex:1;display:flex;flex-direction:column}
+.sw .hd{display:flex;justify-content:space-between;padding:0 8px 8px;color:var(--fg);font-weight:700;font-family:var(--sans);font-size:14px}
+.sw .hd span{font-family:var(--mono);font-weight:400;color:var(--dim);font-size:12.5px}
+.sw button.row{display:grid;grid-template-columns:20px 1fr;gap:2px 6px;width:100%;text-align:left;background:none;border:0;border-radius:6px;padding:7px 8px}
+.sw button.row:hover{background:#1b252c}
+.sw .ck{color:var(--faint)}
+.sw .id{color:var(--accent)}
+.sw .ds{grid-column:2;color:var(--dim);font-family:var(--sans);font-size:12.5px;line-height:1.45}
+.sw button.row[aria-checked="true"] .ck{color:var(--ok)}
+.sw button.row[aria-checked="true"] .id{font-weight:700}
+.sw .flash{min-height:2.9em;padding:6px 8px 0;color:var(--accent);font-family:var(--sans);font-size:12.5px;line-height:1.45}
+.sw .acts{display:flex;gap:8px;padding:6px 8px 4px;margin-top:auto}
+.btn{background:#1b252c;border:1px solid var(--line2);border-radius:6px;padding:6px 12px;font-size:13px;font-family:var(--sans)}
+.btn:hover{border-color:var(--accent)}
+.note{color:var(--faint);font-size:12.5px;margin:10px 2px 0}
+
+section{padding:72px 0;border-top:1px solid var(--line)}
+section h2{font-size:clamp(23px,3.4vw,32px);line-height:1.3;margin:0 0 10px;letter-spacing:-.01em}
+section p.sub{color:var(--dim);max-width:660px;margin:0 0 30px}
+.kicker{font-family:var(--mono);font-size:12.5px;color:var(--accent);margin-bottom:10px}
+
+.plist{border:1px solid var(--line);border-radius:10px;overflow:hidden}
+.plist .p{display:grid;grid-template-columns:150px minmax(0,1fr);gap:4px 20px;padding:15px 18px;border-top:1px solid var(--line);background:var(--bg2)}
+.plist .p:first-child{border-top:0}
+.plist .id{font-family:var(--mono);color:var(--accent);font-weight:700;font-size:14.5px}
+.plist .d{font-size:15px}
+.plist .sym{grid-column:2;font-family:var(--mono);font-size:12.5px;color:var(--faint)}
+.tag{display:inline-block;font-family:var(--mono);font-size:11px;border:1px solid var(--line2);border-radius:4px;padding:0 6px;color:var(--warn);margin-left:6px;vertical-align:1px;white-space:nowrap}
+
+.flow{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;counter-reset:st}
+.flow .st{background:var(--bg2);border:1px solid var(--line);border-radius:10px;padding:16px;counter-increment:st}
+.flow .st::before{content:counter(st);font-family:var(--mono);color:var(--accent);font-weight:700;font-size:13px}
+.flow .st h3{margin:4px 0 6px;font-size:15.5px}
+.flow .st p{margin:0;font-size:13.5px;color:var(--dim);line-height:1.6}
+.bytes{margin-top:16px;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px 18px;font-family:var(--mono);font-size:13.5px;overflow-x:auto}
+.bytes .cap{color:var(--dim);font-family:var(--sans);font-size:13px;margin-bottom:8px}
+.bytes table{border-collapse:collapse;white-space:nowrap}
+.bytes td{padding:3px 18px 3px 0}
+.bytes td:first-child{color:var(--dim)}
+.bytes .o{color:var(--err)}
+.bytes .n{color:var(--ok)}
+.bytes .c{color:var(--faint)}
+
+.tabs{display:flex;flex-wrap:wrap;gap:4px 0;font-family:var(--mono);font-size:13.5px;padding:12px 16px 0}
+.tabs button{background:none;border:0;padding:2px 0;color:var(--dim)}
+.tabs button .n{color:var(--dim)}
+.tabs button[aria-selected="true"]{color:#fff;font-weight:700}
+.tabs button[aria-selected="true"] .n{color:var(--accent)}
+.tabs .sep{color:var(--faint);padding:2px 10px}
+.tui{font-family:var(--mono);font-size:13.5px;line-height:1.7;padding:0 16px 14px;min-height:400px}
+.tui .hdr{display:flex;justify-content:space-between;gap:10px;padding-top:12px}
+.tui .rule{border-top:1px solid var(--line2);margin:8px 0}
+.tui .dim{color:var(--dim)} .tui .acc{color:var(--accent)} .tui .ok{color:var(--ok)} .tui .b{color:#fff;font-weight:700}
+.tui .ln{display:flex;gap:0 8px;min-height:1.7em}
+.tui .ln>span{flex:none}
+.tui .ln>span:last-child,.tui .ln>span.gr{flex:0 1 auto;min-width:0}
+.tui.head{min-height:0;padding-bottom:10px}
+.tui .idc{display:inline-block;min-width:118px}
+.tui .ind{padding-left:38px}
+.tui .car{background:var(--fg);color:var(--bg)}
+.tui .keys{margin-top:12px;display:flex;flex-wrap:wrap;gap:2px 18px}
+.tui [hidden]{display:none}
+
+.care{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.care div{background:var(--bg2);border:1px solid var(--line);border-radius:10px;padding:18px}
+.care h3{margin:0 0 6px;font-size:16px}
+.care p{margin:0;color:var(--dim);font-size:14.5px}
+
+.cmd{position:relative;background:var(--panel);border:1px solid var(--line);border-radius:10px;margin:0 0 14px}
+.cmd .lbl{padding:10px 16px 0;color:var(--dim);font-size:13px}
+.cmd pre{margin:0;padding:10px 16px 16px;font-family:var(--mono);font-size:13.5px;line-height:1.7;overflow-x:auto;color:var(--fg)}
+.cmd pre .c{color:var(--faint)}
+.cmd .copy{position:absolute;top:8px;right:8px}
+.plat{color:var(--dim);font-size:14px;margin:0 0 22px}
+
+footer{border-top:1px solid var(--line);padding:32px 0 56px;color:var(--dim);font-size:13.5px}
+footer p{margin:0 0 8px;max-width:760px}
+footer .links{display:flex;flex-wrap:wrap;gap:6px 18px;margin-top:12px}
+
+@media (max-width:820px){
+  .demo{grid-template-columns:minmax(0,1fr)}
+  .flow{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .care{grid-template-columns:minmax(0,1fr)}
+  .term{min-height:290px}
+}
+@media (max-width:520px){
+  .wrap{padding:0 16px}
+  header.top nav a.opt{display:none}
+  .hero{padding:20px 0 56px}
+  .term{font-size:13px;padding:14px;min-height:300px}
+  .plist .p{grid-template-columns:minmax(0,1fr)}
+  .plist .sym{grid-column:1}
+  .flow{grid-template-columns:minmax(0,1fr)}
+  section{padding:56px 0}
+  .tui{font-size:12.5px}
+  .tui .idc{min-width:104px}
+  .tui .ind{padding-left:20px}
+}
+@media (prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="top">
+  <div class="brand">agy-cli-patch <span>v0.2.1</span></div>
+  <nav>
+    <a class="opt" href="#patches">패치</a>
+    <a class="opt" href="#how">원리</a>
+    <a href="#install">설치</a>
+    <a href="https://github.com/KyongSik-Yoon/agy-cli-patch">GitHub</a>
+  </nav>
+</header>
+
+<main>
+<div class="hero">
+  <h1>agy 출력의 거슬리는 곳을<br><em>스위치 하나씩</em> 끕니다.</h1>
+  <p class="lead">Antigravity CLI(<code>agy</code>) 바이너리의 <b>타자기 딜레이</b>와 <b>한글 마크다운 결함</b>을 고치는 Rust 패처입니다. 아래 스위치를 켜면 같은 응답이 어떻게 달라지는지 보입니다.</p>
+
+  <div class="demo">
+    <div class="win">
+      <div class="bar"><i></i><i></i><i></i><b>agy</b></div>
+      <div class="term" id="term" aria-live="off"></div>
+      <div class="stat">
+        <span>수신 <em id="rx">0</em> / <span id="tot">0</span> B</span>
+        <span>표시 <em id="shown">0</em> B</span>
+        <span class="state" id="state">생성 중</span>
+      </div>
+    </div>
+
+    <div class="win">
+      <div class="bar"><i></i><i></i><i></i><b>agy-cli-patch</b></div>
+      <div class="sw">
+        <div class="hd">적용할 패치를 고르세요 <span id="cnt">0/5 선택</span></div>
+        <button class="row" role="switch" aria-checked="false" data-k="nodrip"><span class="ck">○</span><span class="id">nodrip</span><span class="ds">16ms마다 12바이트씩 끊어 찍는 타자기 효과를 끄고 수신 즉시 반영</span></button>
+        <button class="row" role="switch" aria-checked="false" data-k="batch"><span class="ck">○</span><span class="id">batch</span><span class="ds">생성 중에는 본문을 숨겼다가 완료(DONE)되면 한 번에 출력</span></button>
+        <button class="row" role="switch" aria-checked="false" data-k="heading"><span class="ck">○</span><span class="id">heading</span><span class="ds">제목 앞의 '## ' 기호를 숨기고 색·볼드만 유지</span></button>
+        <button class="row" role="switch" aria-checked="false" data-k="cjk"><span class="ck">○</span><span class="id">cjk-bold</span><span class="ds">구두점 뒤에 한글 조사가 붙어도 볼드 유지</span></button>
+        <button class="row" role="switch" aria-checked="false" data-k="tilde"><span class="ck">○</span><span class="id">tilde-strike</span><span class="ds">'~' 하나는 그대로 두고 '~~'만 취소선</span></button>
+        <div class="flash" id="flash" role="status"></div>
+        <div class="acts">
+          <button class="btn" id="replay">다시 재생</button>
+          <button class="btn" id="all">모두 켜기</button>
+        </div>
+      </div>
+    </div>
+  </div>
+  <p class="note">그림으로 흉내 낸 시연입니다. 타자기 효과는 실제 속도(16ms마다 12바이트)의 ¼배속으로 재생하고, 수신 속도는 임의로 정한 값입니다.</p>
+</div>
+
+<section id="patches">
+  <div class="kicker">--list</div>
+  <h2>패치 일곱 가지, 골라서 적용</h2>
+  <p class="sub">필요한 것만 조합해 새 실행 파일로 만들거나, 기본 agy에 바로 덮어씁니다.</p>
+  <div class="plist">
+    <div class="p"><div class="id">nodrip</div><div class="d">16ms마다 12바이트씩 끊어 찍는 타자기 딜레이를 없애고 수신 즉시 반영합니다.</div><div class="sym">store.cutAtRuneBoundary</div></div>
+    <div class="p"><div class="id">batch</div><div class="d">응답 생성 중에는 본문 출력을 보류하고, 완료되면 완성된 마크다운 전체를 한 번에 출력합니다.</div><div class="sym">render.renderPlannerBody</div></div>
+    <div class="p"><div class="id">heading</div><div class="d">H2~H6 제목 앞에 붙는 <code>## </code>~<code>###### </code> 프리픽스를 숨기고 색상·볼드만 남깁니다.</div><div class="sym">render.glamourStyleForScheme</div></div>
+    <div class="p"><div class="id">cjk-bold</div><div class="d"><code>**"문구"**라는</code>, <code>**용어(`code`)**는</code>처럼 닫는 <code>**</code> 앞 구두점과 뒤 한글 조사가 만날 때 볼드가 풀리는 현상을 고칩니다.</div><div class="sym">goldmark/parser.ScanDelimiter</div></div>
+    <div class="p"><div class="id">tilde-strike</div><div class="d"><code>1.5.0~1.5.6</code>, <code>H2~H6</code> 같은 범위 표기의 물결표 하나에 취소선이 그어지지 않게 합니다. <code>~~</code> 두 개만 취소선입니다.</div><div class="sym">goldmark/extension.(*strikethroughParser).Parse</div></div>
+    <div class="p"><div class="id">banner</div><div class="d">상단 <code>Antigravity CLI 1.5.7</code> 옆에 <code>(patch v0.2.1)</code> 형태로 패치 버전을 표시합니다.<span class="tag">x86_64 전용</span></div><div class="sym">render.BannerWithInfo</div></div>
+    <div class="p"><div class="id">release-notes</div><div class="d">로고 아래에 패치 기능 요약과 저장소 정보를 표시합니다. <code>-p all,release-notes</code>처럼 명시해야 적용됩니다.<span class="tag">x86_64 전용</span><span class="tag">기본 꺼짐</span></div><div class="sym">render.BuildHeader</div></div>
+  </div>
+</section>
+
+<section id="how">
+  <div class="kicker">주소가 아니라 이름으로</div>
+  <h2>릴리즈마다 바뀌는 주소에 기대지 않습니다</h2>
+  <p class="sub">agy는 Go 바이너리라 함수 이름표(<code>.gopclntab</code>)를 품고 있습니다. 패처는 그 표에서 대상 함수를 찾고, 그 자리의 기계어가 아는 모양일 때만 손댑니다.</p>
+  <div class="flow">
+    <div class="st"><h3>매핑</h3><p><code>mmap</code> 제로카피로 바이너리를 엽니다. ELF64(Linux)와 Mach-O 64(macOS)를 읽습니다.</p></div>
+    <div class="st"><h3>심볼 찾기</h3><p>텍스트 섹션과 Go <code>.gopclntab</code> 심볼 테이블을 파싱해 대상 함수의 위치를 얻습니다.</p></div>
+    <div class="st"><h3>시그니처 검증</h3><p>x86_64·ARM64 각각의 기계어 시그니처와 대조합니다. 맞지 않으면 패치하지 않고 사유를 알립니다.</p></div>
+    <div class="st"><h3>쓰기</h3><p>Linux는 <code>FICLONE</code> reflink로 복사하고, macOS는 <code>codesign -f -s -</code>로 다시 서명합니다.</p></div>
+  </div>
+  <div class="bytes">
+    <div class="cap"><code>nodrip</code>이 실제로 바꾸는 바이트 — <code>store.cutAtRuneBoundary</code>의 첫머리 (<code>src/main.rs</code>)</div>
+    <table>
+      <tr><td>x86_64</td><td class="o">55 48 89 e5</td><td>→</td><td class="n">48 89 d8 c3</td></tr>
+      <tr><td>ARM64</td><td class="o">90 0b 40 f9 ff 63 30 eb</td><td>→</td><td class="n">e0 03 01 aa c0 03 5f d6</td><td class="c">mov x0, x1; ret</td></tr>
+    </table>
+  </div>
+  <p class="note">외부 크레이트 의존성 0. Rust 툴체인만 있으면 인터넷 없이 빌드됩니다.</p>
+</section>
+
+<section id="wizard">
+  <div class="kicker">인자 없이 실행</div>
+  <h2>세 단계로 고르고, 확인하고, 패치</h2>
+  <p class="sub">각 패치를 대상 바이너리에 미리 대조해, 적용할 수 없는 패치는 <code>✕</code>와 사유를 보여 주고 선택되지 않게 합니다. 원본을 망가뜨리는 출력 경로는 거부합니다.</p>
+  <div class="win">
+    <div class="bar"><i></i><i></i><i></i><b>agy-cli-patch</b></div>
+    <div class="tui head">
+      <div class="hdr"><span><span class="acc b" style="color:var(--accent)">agy-cli-patch</span> <span class="dim">v0.2.1</span></span><span class="dim">ELF · x86_64</span></div>
+      <div class="ln"><span class="dim">대상</span><span class="gr">~/.local/share/mise/installs/agy/1.5.6/antigravity</span><span class="dim" style="flex:none">1.5.7</span></div>
+    </div>
+    <div class="tabs" role="tablist" style="padding-top:0">
+      <button role="tab" aria-selected="true" data-t="0"><span class="n">1</span> 패치 선택</button><span class="sep">›</span>
+      <button role="tab" aria-selected="false" data-t="1"><span class="n">2</span> 출력 방식</button><span class="sep">›</span>
+      <button role="tab" aria-selected="false" data-t="2"><span class="n">3</span> 확인</button>
+    </div>
+    <div class="tui" style="padding-top:0">
+      <div class="rule"></div>
+      <div data-p="0">
+        <div class="hdr" style="padding-top:0"><span class="b">적용할 패치를 고르세요</span><span class="dim">6/7 선택</span></div>
+        <div class="ln"></div>
+        <div class="ln"><span class="acc b" style="color:var(--accent)">❯</span><span class="ok">◉</span><span class="acc b idc" style="color:var(--accent)">nodrip</span><span class="b">타자기 딜레이 제거 (No Drip)</span></div>
+        <div class="ln"><span>&nbsp;</span><span class="ok">◉</span><span class="acc idc">batch</span><span>응답 완료 시 한 번에 일괄 출력 (Batch Render)</span></div>
+        <div class="ln"><span>&nbsp;</span><span class="ok">◉</span><span class="acc idc">heading</span><span>마크다운 헤딩 '##' 기호 숨김 (Clean Headings)</span></div>
+        <div class="ln"><span>&nbsp;</span><span class="ok">◉</span><span class="acc idc">cjk-bold</span><span>구두점 뒤 한글 조사 볼드(**) 깨짐 수정 (CJK Bold Fix)</span></div>
+        <div class="ln"><span>&nbsp;</span><span class="ok">◉</span><span class="acc idc">tilde-strike</span><span>단일 물결표(~) 취소선 오작동 방지 (Double-Tilde Strikethrough)</span></div>
+        <div class="ln"><span>&nbsp;</span><span class="ok">◉</span><span class="acc idc">banner</span><span>제품명 옆 패치 버전 표시 (Patch Version Tag)</span></div>
+        <div class="ln"><span>&nbsp;</span><span class="dim">○</span><span class="acc idc">release-notes</span><span>상단 배너 릴리즈 노트 표시 (Release Notes)</span></div>
+        <div class="rule"></div>
+        <div class="ln"><span>16ms마다 12바이트씩 끊어 찍는 타자기 효과를 끄고 수신 즉시 반영</span></div>
+        <div class="ln"><span class="dim">심볼</span><span class="dim">store.cutAtRuneBoundary</span></div>
+        <div class="keys"><span><span class="b">↑↓</span> <span class="dim">이동</span></span><span><span class="b">space</span> <span class="dim">선택</span></span><span><span class="b">a</span> <span class="dim">전체</span></span><span><span class="b">enter</span> <span class="dim">다음</span></span><span><span class="b">q</span> <span class="dim">종료</span></span></div>
+      </div>
+      <div data-p="1" hidden>
+        <div class="ln"><span class="b">결과물을 어떻게 만들까요?</span></div>
+        <div class="ln"></div>
+        <div class="ln"><span class="acc b" style="color:var(--accent)">❯</span><span class="b">새 실행 파일 만들기</span><span class="dim">원본은 그대로 둡니다</span></div>
+        <div class="ln ind"><span class="dim">이름</span><span class="acc b" style="color:var(--accent)">agy-batch<span class="car">&nbsp;</span></span></div>
+        <div class="ln ind"><span class="dim">생성</span><span>~/.local/share/mise/installs/agy/1.5.6/agy-batch</span></div>
+        <div class="ln ind"><span class="dim">링크</span><span>~/.local/bin/agy-batch</span></div>
+        <div class="ln"></div>
+        <div class="ln"><span>&nbsp;</span><span>기본 agy에 직접 덮어쓰기</span><span class="dim">in-place</span></div>
+        <div class="ln ind"><span class="dim">백업</span><span class="gr">~/.local/share/mise/installs/agy/1.5.6/antigravity.orig</span><span class="dim">(새로 만듦)</span></div>
+        <div class="ln ind"><span class="dim">agy 자체 업데이트 시 패치가 사라지므로 다시 실행해야 합니다.</span></div>
+        <div class="keys"><span><span class="b">↑↓</span> <span class="dim">방식</span></span><span><span class="b">←→</span> <span class="dim">커서</span></span><span><span class="b">enter</span> <span class="dim">다음</span></span><span><span class="b">esc</span> <span class="dim">뒤로</span></span><span><span class="b">ctrl+c</span> <span class="dim">종료</span></span></div>
+      </div>
+      <div data-p="2" hidden>
+        <div class="ln"><span class="b">아래 내용으로 패치합니다</span></div>
+        <div class="ln"></div>
+        <div class="ln"><span class="dim">적용할 패치 6개</span></div>
+        <div class="ln"><span>&nbsp;</span><span class="ok">✓</span><span class="acc idc">nodrip</span><span>타자기 딜레이 제거 (No Drip)</span></div>
+        <div class="ln"><span>&nbsp;</span><span class="ok">✓</span><span class="acc idc">batch</span><span>응답 완료 시 한 번에 일괄 출력 (Batch Render)</span></div>
+        <div class="ln"><span>&nbsp;</span><span class="ok">✓</span><span class="acc idc">heading</span><span>마크다운 헤딩 '##' 기호 숨김 (Clean Headings)</span></div>
+        <div class="ln"><span>&nbsp;</span><span class="ok">✓</span><span class="acc idc">cjk-bold</span><span>구두점 뒤 한글 조사 볼드(**) 깨짐 수정 (CJK Bold Fix)</span></div>
+        <div class="ln"><span>&nbsp;</span><span class="ok">✓</span><span class="acc idc">tilde-strike</span><span>단일 물결표(~) 취소선 오작동 방지 (Double-Tilde Strikethrough)</span></div>
+        <div class="ln"><span>&nbsp;</span><span class="ok">✓</span><span class="acc idc">banner</span><span>제품명 옆 패치 버전 표시 (Patch Version Tag)</span></div>
+        <div class="ln"></div>
+        <div class="ln"><span class="dim">출력</span></div>
+        <div class="ln"><span>&nbsp;</span><span class="dim">생성</span><span>~/.local/share/mise/installs/agy/1.5.6/agy-batch</span></div>
+        <div class="ln"><span>&nbsp;</span><span class="dim">링크</span><span>~/.local/bin/agy-batch</span></div>
+        <div class="keys"><span><span class="b">enter</span> <span class="dim">패치 실행</span></span><span><span class="b">esc</span> <span class="dim">뒤로</span></span><span><span class="b">q</span> <span class="dim">종료</span></span></div>
+      </div>
+    </div>
+  </div>
+  <p class="note">실제 화면의 문구와 배치를 옮겨 그린 그림입니다. 단계 이름을 누르면 해당 화면으로 바뀝니다. 경로는 mise로 설치한 경우의 예시입니다.</p>
+</section>
+
+<section id="care">
+  <div class="kicker">알아 둘 것</div>
+  <h2>agy가 스스로 업데이트하면 패치가 풀립니다</h2>
+  <p class="sub">agy는 실행할 때마다 새 버전을 확인하고, 있으면 설치된 <code>antigravity</code> 바이너리를 직접 교체합니다.</p>
+  <div class="care">
+    <div><h3>in-place 패치는 다시 적용</h3><p><code>agy-cli-patch -p all --in-place</code>를 다시 실행하면 됩니다. 원본은 <code>antigravity.orig</code>로 백업되고 <code>--restore</code>로 되돌립니다.</p></div>
+    <div><h3>자체 업데이트 끄기</h3><p><code>export AGY_CLI_DISABLE_AUTO_UPDATE=true</code> — 값은 반드시 <code>true</code>여야 합니다(<code>1</code>은 적용되지 않음).</p></div>
+  </div>
+  <p class="note">링크 덮어쓰기 규칙, remote-control 데몬 등 나머지 주의 사항은 <a href="https://github.com/KyongSik-Yoon/agy-cli-patch#주의-사항">README</a>에 있습니다.</p>
+</section>
+
+<section id="install">
+  <div class="kicker">설치</div>
+  <h2>한 줄로 받고, 인자 없이 실행</h2>
+  <p class="plat">Linux(x86_64, aarch64)와 macOS(x86_64, Apple Silicon)용 프리빌트 바이너리를 <code>~/.local/bin/agy-cli-patch</code>에 설치합니다.</p>
+  <div class="cmd"><div class="lbl">원라이너 설치</div><button class="btn copy" data-copy="c1">복사</button>
+<pre id="c1">curl -fsSL https://raw.githubusercontent.com/KyongSik-Yoon/agy-cli-patch/main/install.sh | sh</pre></div>
+  <div class="cmd"><div class="lbl">소스에서 빌드</div><button class="btn copy" data-copy="c2">복사</button>
+<pre id="c2">git clone https://github.com/KyongSik-Yoon/agy-cli-patch.git
+cd agy-cli-patch
+./install.sh --build</pre></div>
+  <div class="cmd"><div class="lbl">쓰기</div>
+<pre><span class="c"># 대화형: 패치 선택 → 출력 방식 → 확인</span>
+agy-cli-patch
+
+<span class="c"># 기본 활성 패치 전체를 적용해 agy-batch 생성</span>
+agy-cli-patch -p all -o agy-batch
+
+<span class="c"># 마크다운 패치 3종만 적용해 agy-md 생성</span>
+agy-cli-patch -p heading,cjk-bold,tilde-strike -o agy-md</pre></div>
+  <p class="note">전체 옵션은 <a href="https://github.com/KyongSik-Yoon/agy-cli-patch#사용법">README의 사용법</a>을 보세요.</p>
+</section>
+</main>
+
+<footer>
+  <p>본 저장소는 어떠한 독점 바이너리나 소스 코드도 포함·재배포하지 않는 비공식 로컬 패치 도구입니다. 로컬 바이너리 수정에 따른 모든 책임은 사용자 본인에게 있으며, 공식 고객 지원 대상에서 제외될 수 있습니다.</p>
+  <p>MIT License · © 2026 KyongSik-Yoon</p>
+  <div class="links">
+    <a href="https://github.com/KyongSik-Yoon/agy-cli-patch">GitHub</a>
+    <a href="https://github.com/KyongSik-Yoon/agy-cli-patch/issues">이슈</a>
+    <a href="https://github.com/KyongSik-Yoon/agy-cli-patch/releases">릴리즈</a>
+    <a href="https://github.com/KyongSik-Yoon/agy-cli-patch/blob/main/LICENSE">라이선스</a>
+  </div>
+</footer>
+</div>
+
+<script>
+(function(){
+  var SRC = [
+    '## 스트리밍 출력',
+    'agy는 응답을 16ms마다 12바이트씩 끊어 찍습니다. 여기서 **"문구"**라는 표현과 **용어(`code`)**는 굵게 보여야 합니다.',
+    '',
+    '### 지원 범위',
+    '버전은 1.5.0~1.5.6, 헤딩은 H2~H6까지입니다. ~~지워진 글~~만 취소선이어야 합니다.'
+  ].join('\n');
+  var enc = new TextEncoder();
+  // 글자 경계별 누적 바이트 수 (cutAtRuneBoundary 처럼 글자 중간에서 자르지 않는다)
+  var chars = Array.from(SRC), cum = [0];
+  chars.forEach(function(c){ cum.push(cum[cum.length-1] + enc.encode(c).length); });
+  var TOTAL = cum[cum.length-1];
+  function cut(bytes){ var i = 0; while (i < chars.length && cum[i+1] <= bytes) i++; return {text: chars.slice(0,i).join(''), bytes: cum[i]}; }
+
+  var on = {nodrip:false, batch:false, heading:false, cjk:false, tilde:false};
+  var $ = function(id){ return document.getElementById(id); };
+  var term = $('term'), reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  function esc(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+  var PUNCT = /[!-\/:-@\[-`{-~]/;
+  function inline(s){
+    var out = '', i = 0;
+    while (i < s.length) {
+      var ch = s[i];
+      if (ch === '`') {
+        var e = s.indexOf('`', i+1);
+        if (e > i) { out += '<code>' + esc(s.slice(i+1, e)) + '</code>'; i = e+1; continue; }
+      }
+      if (ch === '*' && s[i+1] === '*') {
+        var j = i+2, close = -1;
+        while (j < s.length-1) {
+          if (s[j] === '`') { var e2 = s.indexOf('`', j+1); if (e2 > j) { j = e2+1; continue; } }
+          if (s[j] === '*' && s[j+1] === '*') {
+            var prev = s[j-1], next = s[j+2];
+            var nextOk = next === undefined || /\s/.test(next) || PUNCT.test(next);
+            // 닫는 ** 앞이 구두점이고 뒤에 글자가 바로 붙으면 닫는 표시로 인정되지 않는다 (cjk-bold 가 고치는 곳)
+            if (!/\s/.test(prev) && (!PUNCT.test(prev) || nextOk || on.cjk)) { close = j; break; }
+          }
+          j++;
+        }
+        if (close > 0) { out += '<b>' + inline(s.slice(i+2, close)) + '</b>'; i = close+2; continue; }
+      }
+      if (ch === '~') {
+        var n = s[i+1] === '~' ? 2 : 1;
+        if (n === 2 || !on.tilde) {
+          var mark = n === 2 ? '~~' : '~', k = i+n, c2 = -1;
+          while (k < s.length) {
+            if (s[k] === '~') {
+              var run = s[k+1] === '~' ? 2 : 1;
+              if (run === n) { c2 = k; break; }
+              k += run; continue;
+            }
+            k++;
+          }
+          if (c2 > 0) { out += '<s>' + inline(s.slice(i+n, c2)) + '</s>'; i = c2+n; continue; }
+          out += mark; i += n; continue;
+        }
+      }
+      out += esc(ch); i++;
+    }
+    return out;
+  }
+  function render(text, caret){
+    var lines = text.split('\n'), html = '';
+    lines.forEach(function(l, idx){
+      var last = idx === lines.length-1, c = (last && caret) ? '<span class="caret"></span>' : '';
+      var m = /^(#{2,6}) (.*)$/.exec(l);
+      if (m) html += '<div class="h">' + (on.heading ? '' : '<span class="px">' + m[1] + ' </span>') + inline(m[2]) + c + '</div>';
+      else if (l === '') html += '<div class="sp">' + c + '</div>';
+      else html += '<div>' + inline(l) + c + '</div>';
+    });
+    return html;
+  }
+
+  var timer = null, rx = 0, drip = 0, t0 = 0;
+  var RX_RATE = 420;        // 수신 속도(B/s) — 시연용으로 정한 값
+  var DRIP_RATE = 12 / 0.064; // 12바이트 / 16ms 를 ¼배속으로
+  function paint(){
+    var done = rx >= TOTAL;
+    var shownBytes;
+    if (on.batch) shownBytes = done ? TOTAL : 0;
+    else if (on.nodrip) shownBytes = rx;
+    else shownBytes = Math.min(rx, drip);
+    var c = cut(shownBytes);
+    var finished = done && c.bytes >= TOTAL;
+    term.innerHTML = render(c.text, !finished && !on.batch);
+    $('rx').textContent = cut(rx).bytes;
+    $('shown').textContent = c.bytes;
+    var st = $('state');
+    st.textContent = done ? 'DONE' : '생성 중';
+    st.className = 'state' + (done ? ' done' : '');
+    return finished;
+  }
+  function stop(){ if (timer) { clearInterval(timer); timer = null; } }
+  function play(){
+    stop();
+    if (reduce) { rx = drip = TOTAL; paint(); return; }
+    rx = 0; drip = 0; t0 = performance.now();
+    timer = setInterval(function(){
+      var t = (performance.now() - t0) / 1000;
+      rx = Math.min(TOTAL, Math.floor(t * RX_RATE / 40) * 40);          // 40바이트 덩어리로 도착
+      drip = Math.min(TOTAL, Math.floor(t * DRIP_RATE / 12) * 12);      // 12바이트씩 표시
+      if (paint()) stop();
+    }, 32);
+    paint();
+  }
+  function sync(){
+    var n = 0;
+    document.querySelectorAll('.sw button.row').forEach(function(b){
+      var v = on[b.dataset.k]; if (v) n++;
+      b.setAttribute('aria-checked', v ? 'true' : 'false');
+      b.querySelector('.ck').textContent = v ? '◉' : '○';
+    });
+    $('cnt').textContent = n + '/5 선택';
+    $('all').textContent = n === 5 ? '모두 끄기' : '모두 켜기';
+  }
+  document.querySelectorAll('.sw button.row').forEach(function(b){
+    b.addEventListener('click', function(){
+      var k = b.dataset.k; on[k] = !on[k]; $('flash').textContent = '';
+      if (k === 'batch' && on.batch && !on.nodrip) { on.nodrip = true; $('flash').textContent = 'batch 는 nodrip 과 함께 동작하므로 nodrip 도 선택했습니다.'; }
+      if (k === 'nodrip' && !on.nodrip && on.batch) { on.batch = false; $('flash').textContent = 'nodrip 을 해제하면 batch 도 함께 해제됩니다.'; }
+      sync();
+      if (k === 'nodrip' || k === 'batch') play(); else paint();
+    });
+  });
+  $('replay').addEventListener('click', play);
+  $('all').addEventListener('click', function(){
+    var allOn = Object.keys(on).every(function(k){ return on[k]; });
+    Object.keys(on).forEach(function(k){ on[k] = !allOn; });
+    $('flash').textContent = ''; sync(); play();
+  });
+  $('tot').textContent = TOTAL;
+  sync(); play();
+
+  // 대화형 화면 단계 전환
+  var tabs = document.querySelectorAll('.tabs button');
+  tabs.forEach(function(t){
+    t.addEventListener('click', function(){
+      var cur = +t.dataset.t;
+      tabs.forEach(function(x){
+        var i = +x.dataset.t;
+        x.setAttribute('aria-selected', i === cur ? 'true' : 'false');
+        var n = x.querySelector('.n');
+        n.textContent = i < cur ? '✓' : (i+1);
+        n.style.color = i < cur ? 'var(--ok)' : '';
+      });
+      document.querySelectorAll('[data-p]').forEach(function(p){ p.hidden = +p.dataset.p !== cur; });
+    });
+  });
+
+  // 복사
+  document.querySelectorAll('.copy').forEach(function(b){
+    b.addEventListener('click', function(){
+      var txt = $(b.dataset.copy).textContent;
+      var ok = function(){ b.textContent = '복사됨'; setTimeout(function(){ b.textContent = '복사'; }, 1400); };
+      if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(txt).then(ok, fallback); else fallback();
+      function fallback(){
+        var ta = document.createElement('textarea'); ta.value = txt; document.body.appendChild(ta); ta.select();
+        try { document.execCommand('copy'); ok(); } catch (e) {} document.body.removeChild(ta);
+      }
+    });
+  });
+})();
+</script>
+</body>
+</html>
