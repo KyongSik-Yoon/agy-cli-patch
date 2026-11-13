@@ -89,7 +89,11 @@ unsafe extern "C" {
     fn tcgetattr(fd: i32, termios_p: *mut Termios) -> i32;
     fn tcsetattr(fd: i32, optional_actions: i32, termios_p: *const Termios) -> i32;
     fn isatty(fd: i32) -> i32;
+    fn signal(signum: i32, handler: usize) -> usize;
 }
+
+const SIGPIPE: i32 = 13;
+const SIG_DFL: usize = 0;
 
 struct MmapFile {
     ptr: *mut u8,
@@ -2415,6 +2419,11 @@ fn run() -> Result<(), String> {
 }
 
 fn main() {
+    // Rust 런타임은 SIGPIPE 를 무시하도록 바꿔 두므로, `--list | head` 처럼 읽는 쪽이 먼저
+    // 닫히면 println! 이 EPIPE 로 패닉한다. 기본 동작으로 되돌려 조용히 종료되게 한다.
+    unsafe {
+        signal(SIGPIPE, SIG_DFL);
+    }
     if let Err(e) = run() {
         eprintln!("[!] 오류: {e}");
         process::exit(1);
