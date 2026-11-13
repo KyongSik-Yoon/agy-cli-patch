@@ -85,7 +85,7 @@ unsafe extern "C" {
     fn munmap(addr: *mut u8, len: usize) -> i32;
     fn ioctl(fd: i32, request: u64, ...) -> i32;
     #[link_name = "read"]
-    fn sys_read(fd: i32, buf: *mut u8, count: usize) -> isize;
+    fn sys_read(fd: i32, buf: *mut std::ffi::c_void, count: usize) -> isize;
     fn tcgetattr(fd: i32, termios_p: *mut Termios) -> i32;
     fn tcsetattr(fd: i32, optional_actions: i32, termios_p: *const Termios) -> i32;
     fn isatty(fd: i32) -> i32;
@@ -1436,7 +1436,7 @@ impl Tui {
 
     fn read_keys(&self) -> Vec<Key> {
         let mut buf = [0u8; 64];
-        let n = unsafe { sys_read(0, buf.as_mut_ptr(), buf.len()) };
+        let n = unsafe { sys_read(0, buf.as_mut_ptr().cast(), buf.len()) };
         if n <= 0 {
             return Vec::new();
         }

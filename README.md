@@ -16,15 +16,25 @@
 | `banner` | `render.BannerWithInfo` | 상단 `Antigravity CLI 1.5.7` 옆에 `(patch v0.2.0)` 형태로 패치 버전 표시 (`x86_64`) |
 | `release-notes` | `render.BuildHeader` | 로고 아래에 패치 기능 요약 및 GitHub 저장소 정보 표시 (`x86_64`, **기본 꺼짐** — `-p all,release-notes`처럼 명시해야 적용) |
 
-## 빌드 및 설치
+## 설치 및 빌드
+
+### 원라이너 설치 (프리빌트 바이너리)
+
+Linux(`x86_64`, `aarch64`)와 macOS(`x86_64`, `Apple Silicon`)용 GitHub Releases 바이너리를 내려받아 `~/.local/bin/agy-cli-patch`에 설치합니다.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/KyongSik-Yoon/agy-cli-patch/main/install.sh | sh
+```
+
+### 소스에서 직접 빌드
 
 외부 의존성이 없으므로 Rust 툴체인만 있으면 인터넷 연결 없이도 빠르게 빌드됩니다.
 
 ```bash
 git clone https://github.com/KyongSik-Yoon/agy-cli-patch.git
 cd agy-cli-patch
-cargo build --release
-ln -sf "$(pwd)/target/release/agy-cli-patch" ~/.local/bin/agy-cli-patch
+./install.sh --build          # 빌드 후 ~/.local/bin/agy-cli-patch 복사
+./install.sh --build --link   # 빌드 후 target/release 바이너리로 심볼릭 링크
 ```
 
 또는 `cargo install --path .`로 설치할 수 있습니다.
