@@ -716,7 +716,7 @@ fn resolve_banner(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
             let (bwi_start, bwi_end) = ctx.get_func("render.BannerWithInfo")?;
             let cave_offset = find_cave(ctx)?;
 
-            // 제품명 옆 괄호 안에 표시: "Antigravity CLI 1.5.7 (patch v0.2.0)"
+            // 제품명 옆 괄호 안에 표시: "Antigravity CLI 1.5.7 (patch v0.2.1)"
             let chan = format!("patch v{}", env!("CARGO_PKG_VERSION")).into_bytes();
             assert!(chan.len() <= CAVE_NOTES_OFF - CAVE_CHAN_OFF);
             let chan_va = cave_offset + CAVE_CHAN_OFF;
@@ -935,7 +935,7 @@ const PATCH_REGISTRY: &[PatchSpec] = &[
     PatchSpec {
         id: "banner",
         title: "제품명 옆 패치 버전 표시 (Patch Version Tag)",
-        description: "상단 'Antigravity CLI 1.5.7' 옆에 '(patch v0.2.0)' 형태로 패치 버전 표시",
+        description: "상단 'Antigravity CLI 1.5.7' 옆에 '(patch v0.2.1)' 형태로 패치 버전 표시",
         symbol: "render.BannerWithInfo",
         default_on: true,
         resolver: resolve_banner,
