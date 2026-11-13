@@ -1483,11 +1483,93 @@ enum Action {
     Done,
 }
 
+/// 검사를 통과한 출력 계획: 생성 경로, 만들 링크(없으면 None), 사용자에게 알릴 참고 사항
 struct OutputPlan {
     dst: PathBuf,
+    link_name: String,
     link: Option<PathBuf>,
-    error: Option<String>,
     notes: Vec<(&'static str, String)>,
+}
+
+enum OutputError {
+    Empty,
+    NoFileName,
+    NoDir(PathBuf),
+    SameAsOriginal,
+    LinkIsOriginal(PathBuf),
+}
+
+impl OutputError {
+    /// in_place_hint: 원본에 직접 적용하는 방법 안내 (대화형/CLI 에서 문구가 다르다)
+    fn message(&self, in_place_hint: &str) -> String {
+        match self {
+            OutputError::Empty => "실행 파일 이름을 입력하세요.".into(),
+            OutputError::NoFileName => "경로는 파일 이름으로 끝나야 합니다.".into(),
+            OutputError::NoDir(d) => format!("디렉토리가 없습니다: {}", d.display()),
+            OutputError::SameAsOriginal => format!("원본과 같은 경로입니다. {in_place_hint}"),
+            OutputError::LinkIsOriginal(l) => format!(
+                "{} 가 원본 바이너리라서 링크로 바꿀 수 없습니다. 다른 이름을 쓰세요.",
+                tilde_path(l)
+            ),
+        }
+    }
+}
+
+/// 실제 경로로 정규화한다. 파일이 아직 없어도 상위 디렉토리만 있으면 된다.
+fn real_path(p: &Path) -> Option<PathBuf> {
+    let parent = match p.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
+    Some(fs::canonicalize(parent).ok()?.join(p.file_name()?))
+}
+
+/// 출력 이름을 검사해 생성 경로와 링크를 정한다 (대화형 UI 와 -o 옵션이 함께 사용).
+/// 원본(대상, 패치 원본, antigravity.orig 백업)을 덮어쓰거나 링크로 바꾸는 경우를 막는다.
+fn plan_output(bin_dir: &Path, target_bin: &Path, src_bin: &Path, name: &str) -> Result<OutputPlan, OutputError> {
+    if name.is_empty() {
+        return Err(OutputError::Empty);
+    }
+    let (dst, link_name) = output_paths(bin_dir, name);
+    if name.ends_with('/') || dst.file_name().is_none() {
+        return Err(OutputError::NoFileName);
+    }
+    let real_dst = real_path(&dst).ok_or_else(|| {
+        OutputError::NoDir(match dst.parent() {
+            Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+            _ => PathBuf::from("."),
+        })
+    })?;
+    let originals = [target_bin.to_path_buf(), src_bin.to_path_buf(), bin_dir.join("antigravity.orig")];
+    if originals.contains(&real_dst) {
+        return Err(OutputError::SameAsOriginal);
+    }
+
+    let mut notes = Vec::new();
+    if real_dst.exists() {
+        notes.push((S_DIM, "같은 이름의 기존 파일을 새로 덮어씁니다.".to_string()));
+    }
+
+    let mut link = local_bin_link(&link_name);
+    if let Some(l) = &link {
+        let real_link = real_path(l).unwrap_or_else(|| l.clone());
+        if real_link == real_dst {
+            // 결과물이 곧 ~/.local/bin/<이름> 이면 링크를 따로 만들지 않는다
+            link = None;
+        } else if originals.contains(&real_link) {
+            return Err(OutputError::LinkIsOriginal(l.clone()));
+        } else if l.exists() || l.is_symlink() {
+            match fs::read_link(l) {
+                Ok(t) if t == real_dst || t == dst => {}
+                Ok(t) => notes.push((
+                    S_WARN,
+                    format!("{} 링크가 다른 파일({})을 가리키고 있어 교체됩니다.", tilde_path(l), tilde_path(&t)),
+                )),
+                Err(_) => notes.push((S_WARN, format!("{} 에 있는 일반 파일을 링크로 교체합니다.", tilde_path(l)))),
+            }
+        }
+    }
+    Ok(OutputPlan { dst, link_name, link, notes })
 }
 
 /// 대화형 설정의 결과: (적용할 패치, 출력 이름, in-place 여부)
@@ -1611,58 +1693,8 @@ impl<'a> Wizard<'a> {
         }
     }
 
-    fn output_plan(&self) -> OutputPlan {
-        let name = self.name_str();
-        let (dst, link_name) = output_paths(self.bin_dir, &name);
-        let mut plan = OutputPlan {
-            dst: dst.clone(),
-            link: local_bin_link(&link_name),
-            error: None,
-            notes: Vec::new(),
-        };
-
-        if name.is_empty() {
-            plan.error = Some("실행 파일 이름을 입력하세요.".into());
-            return plan;
-        }
-        if name.ends_with('/') || dst.file_name().is_none() {
-            plan.error = Some("경로는 파일 이름으로 끝나야 합니다.".into());
-            return plan;
-        }
-        let parent = match dst.parent() {
-            Some(p) if p.as_os_str().is_empty() => PathBuf::from("."),
-            Some(p) => p.to_path_buf(),
-            None => PathBuf::from("."),
-        };
-        let Ok(parent) = fs::canonicalize(&parent) else {
-            plan.error = Some(format!("디렉토리가 없습니다: {}", parent.display()));
-            return plan;
-        };
-        let real_dst = parent.join(dst.file_name().unwrap_or_default());
-        let backup = self.bin_dir.join("antigravity.orig");
-        if real_dst == self.target_bin || real_dst == self.src_bin || real_dst == backup {
-            plan.error = Some("원본과 같은 경로입니다. 원본에 적용하려면 아래 in-place 를 고르세요.".into());
-            return plan;
-        }
-
-        if real_dst.exists() {
-            plan.notes.push((S_DIM, "같은 이름의 기존 파일을 새로 덮어씁니다.".into()));
-        }
-        if let Some(link) = &plan.link {
-            if link.exists() || link.is_symlink() {
-                match fs::read_link(link) {
-                    Ok(t) if t == real_dst || t == dst => {}
-                    Ok(t) => plan.notes.push((
-                        S_WARN,
-                        format!("{} 링크가 다른 파일({})을 가리키고 있어 교체됩니다.", tilde_path(link), tilde_path(&t)),
-                    )),
-                    Err(_) => plan
-                        .notes
-                        .push((S_WARN, format!("{} 에 있는 일반 파일을 링크로 교체합니다.", tilde_path(link)))),
-                }
-            }
-        }
-        plan
+    fn output_plan(&self) -> Result<OutputPlan, OutputError> {
+        plan_output(self.bin_dir, self.target_bin, self.src_bin, &self.name_str())
     }
 
     fn handle_key(&mut self, key: Key) -> Action {
@@ -1707,7 +1739,7 @@ impl<'a> Wizard<'a> {
                 Key::Enter => {
                     if self.out_choice == 1 {
                         self.step = Step::Confirm;
-                    } else if self.output_plan().error.is_some() {
+                    } else if self.output_plan().is_err() {
                         // 오류 내용은 이름 칸 아래에 이미 표시되어 있다
                     } else {
                         self.step = Step::Confirm;
@@ -1906,26 +1938,30 @@ impl<'a> Wizard<'a> {
             field = field.s(S_PLAIN, self.name.iter().collect::<String>());
         }
         lines.push(field);
-        let plan = self.output_plan();
         let pw = w.saturating_sub(13);
-        if let Some(err) = &plan.error {
-            lines.push(Line::new().s(S_ERR, format!("     {err}")));
-        } else {
-            lines.push(
-                Line::new()
-                    .s(S_DIM, "     생성  ")
-                    .s(S_PLAIN, truncate_start(&tilde_path(&plan.dst), pw)),
-            );
-            if let Some(link) = &plan.link {
+        match self.output_plan() {
+            Err(err) => {
+                for l in wrap_text(&err.message("원본에 적용하려면 아래 in-place 를 고르세요."), w.saturating_sub(6)) {
+                    lines.push(Line::new().s(S_ERR, format!("     {l}")));
+                }
+            }
+            Ok(plan) => {
                 lines.push(
                     Line::new()
-                        .s(S_DIM, "     링크  ")
-                        .s(S_PLAIN, truncate_start(&tilde_path(link), pw)),
+                        .s(S_DIM, "     생성  ")
+                        .s(S_PLAIN, truncate_start(&tilde_path(&plan.dst), pw)),
                 );
-            }
-            for (style, note) in &plan.notes {
-                for l in wrap_text(note, w.saturating_sub(6)) {
-                    lines.push(Line::new().s(style, format!("     {l}")));
+                if let Some(link) = &plan.link {
+                    lines.push(
+                        Line::new()
+                            .s(S_DIM, "     링크  ")
+                            .s(S_PLAIN, truncate_start(&tilde_path(link), pw)),
+                    );
+                }
+                for (style, note) in &plan.notes {
+                    for l in wrap_text(note, w.saturating_sub(6)) {
+                        lines.push(Line::new().s(style, format!("     {l}")));
+                    }
                 }
             }
         }
@@ -1992,8 +2028,7 @@ impl<'a> Wizard<'a> {
                     .s(S_DIM, "   원본 백업  ")
                     .s(S_PLAIN, truncate_start(&tilde_path(&backup), pw)),
             );
-        } else {
-            let plan = self.output_plan();
+        } else if let Ok(plan) = self.output_plan() {
             lines.push(
                 Line::new()
                     .s(S_DIM, "   생성  ")
@@ -2345,9 +2380,21 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
 
-    let (dst_path, symlink_name) = output_paths(bin_dir, &out_name);
+    let plan = plan_output(bin_dir, &target_bin, &src_bin, &out_name)
+        .map_err(|e| e.message("원본에 직접 적용하려면 --in-place 를 사용하세요."))?;
+    for (style, note) in &plan.notes {
+        if *style == S_WARN {
+            println!("[!] {note}");
+        }
+    }
 
-    build_patched_binary(&src_bin, &ctx, &chosen_patches, &dst_path, Some(&symlink_name))
+    build_patched_binary(
+        &src_bin,
+        &ctx,
+        &chosen_patches,
+        &plan.dst,
+        plan.link.as_ref().map(|_| plan.link_name.as_str()),
+    )
 }
 
 fn main() {
