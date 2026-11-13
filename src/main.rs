@@ -1497,6 +1497,7 @@ enum OutputError {
     NoDir(PathBuf),
     SameAsOriginal,
     LinkIsOriginal(PathBuf),
+    LinkIsNotSymlink(PathBuf),
 }
 
 impl OutputError {
@@ -1509,6 +1510,10 @@ impl OutputError {
             OutputError::SameAsOriginal => format!("원본과 같은 경로입니다. {in_place_hint}"),
             OutputError::LinkIsOriginal(l) => format!(
                 "{} 가 원본 바이너리라서 링크로 바꿀 수 없습니다. 다른 이름을 쓰세요.",
+                tilde_path(l)
+            ),
+            OutputError::LinkIsNotSymlink(l) => format!(
+                "{} 에 링크가 아닌 파일이 있어 덮어쓸 수 없습니다. 다른 이름을 쓰거나 직접 옮긴 뒤 다시 실행하세요.",
                 tilde_path(l)
             ),
         }
@@ -1565,7 +1570,8 @@ fn plan_output(bin_dir: &Path, target_bin: &Path, src_bin: &Path, name: &str) ->
                     S_WARN,
                     format!("{} 링크가 다른 파일({})을 가리키고 있어 교체됩니다.", tilde_path(l), tilde_path(&t)),
                 )),
-                Err(_) => notes.push((S_WARN, format!("{} 에 있는 일반 파일을 링크로 교체합니다.", tilde_path(l)))),
+                // 일반 파일·디렉토리: 사용자가 쓰던 다른 프로그램일 수 있으므로 지우지 않는다
+                Err(_) => return Err(OutputError::LinkIsNotSymlink(l.clone())),
             }
         }
     }
@@ -2146,6 +2152,14 @@ fn build_patched_binary(
     dst_bin: &Path,
     symlink_name: Option<&str>,
 ) -> Result<(), String> {
+    // 최후 방어선: ~/.local/bin 에 링크가 아닌 파일이 있으면 아무것도 쓰기 전에 중단한다
+    let link = symlink_name.and_then(local_bin_link);
+    if let Some(l) = &link {
+        if l.exists() && !l.is_symlink() {
+            return Err(OutputError::LinkIsNotSymlink(l.clone()).message(""));
+        }
+    }
+
     let mut resolved = Vec::with_capacity(patches.len());
     for &spec in patches {
         let edits = (spec.resolver)(ctx)?;
@@ -2182,21 +2196,41 @@ fn build_patched_binary(
 
     resign_if_macho(dst_bin, ctx.format);
 
-    if let Some(link_name) = symlink_name {
-        if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
-            let local_bin = home.join(".local/bin");
-            let _ = fs::create_dir_all(&local_bin);
-            let link = local_bin.join(link_name);
-            if link.exists() || link.is_symlink() {
-                let _ = fs::remove_file(&link);
-            }
-            symlink(dst_bin, &link)
-                .map_err(|e| format!("심볼릭 링크 생성 실패 ({}): {e}", link.display()))?;
-            println!("[+] 심볼릭 링크 연결 완료: {} -> {}", link.display(), dst_bin.display());
+    if let Some(link) = link {
+        if let Some(local_bin) = link.parent() {
+            let _ = fs::create_dir_all(local_bin);
         }
+        if link.is_symlink() {
+            let _ = fs::remove_file(&link);
+        }
+        symlink(dst_bin, &link).map_err(|e| format!("심볼릭 링크 생성 실패 ({}): {e}", link.display()))?;
+        println!("[+] 심볼릭 링크 연결 완료: {} -> {}", link.display(), dst_bin.display());
     }
 
     Ok(())
+}
+
+const CLI_IN_PLACE_HINT: &str = "원본에 직접 적용하려면 --in-place 를 사용하세요.";
+
+/// plan_output() 결과대로 바이너리를 만든다. 경고성 참고 사항은 먼저 출력한다.
+fn build_from_plan(
+    src_bin: &Path,
+    ctx: &BinaryContext,
+    patches: &[&'static PatchSpec],
+    plan: &OutputPlan,
+) -> Result<(), String> {
+    for (style, note) in &plan.notes {
+        if *style == S_WARN {
+            println!("[!] {note}");
+        }
+    }
+    build_patched_binary(
+        src_bin,
+        ctx,
+        patches,
+        &plan.dst,
+        plan.link.as_ref().map(|_| plan.link_name.as_str()),
+    )
 }
 
 fn print_help() {
@@ -2331,20 +2365,16 @@ fn run() -> Result<(), String> {
             PATCH_REGISTRY.iter().filter(|p| p.default_on && p.id != "batch").collect();
         let batch_patches: Vec<&'static PatchSpec> =
             PATCH_REGISTRY.iter().filter(|p| p.default_on).collect();
-        build_patched_binary(
-            &src_bin,
-            &ctx,
-            &nodrip_patches,
-            &bin_dir.join("agy-nodrip"),
-            Some("agy-nodrip"),
-        )?;
-        build_patched_binary(
-            &src_bin,
-            &ctx,
-            &batch_patches,
-            &bin_dir.join("agy-batch"),
-            Some("agy-batch"),
-        )?;
+        let jobs = [("agy-nodrip", nodrip_patches), ("agy-batch", batch_patches)];
+        // 둘 다 먼저 검사해서 하나만 만들어진 채로 멈추는 일이 없게 한다
+        let plans = jobs
+            .iter()
+            .map(|(name, _)| plan_output(bin_dir, &target_bin, &src_bin, name))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.message(CLI_IN_PLACE_HINT))?;
+        for ((_, patches), plan) in jobs.iter().zip(&plans) {
+            build_from_plan(&src_bin, &ctx, patches, plan)?;
+        }
         return Ok(());
     }
 
@@ -2380,21 +2410,8 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
 
-    let plan = plan_output(bin_dir, &target_bin, &src_bin, &out_name)
-        .map_err(|e| e.message("원본에 직접 적용하려면 --in-place 를 사용하세요."))?;
-    for (style, note) in &plan.notes {
-        if *style == S_WARN {
-            println!("[!] {note}");
-        }
-    }
-
-    build_patched_binary(
-        &src_bin,
-        &ctx,
-        &chosen_patches,
-        &plan.dst,
-        plan.link.as_ref().map(|_| plan.link_name.as_str()),
-    )
+    let plan = plan_output(bin_dir, &target_bin, &src_bin, &out_name).map_err(|e| e.message(CLI_IN_PLACE_HINT))?;
+    build_from_plan(&src_bin, &ctx, &chosen_patches, &plan)
 }
 
 fn main() {

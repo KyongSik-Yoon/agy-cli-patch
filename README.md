@@ -109,6 +109,7 @@ AGY_CLI_DISABLE_AUTO_UPDATE = "true"
 
 - 결과물 경로가 대상 바이너리, 패치 원본, `antigravity.orig` 백업과 같은 경우 (원본에 적용하려면 `--in-place`)
 - `~/.local/bin/<파일 이름>` 자리에 원본 바이너리가 있어 링크로 바뀌게 되는 경우
+- `~/.local/bin/<파일 이름>` 자리에 링크가 아닌 일반 파일·디렉토리가 있는 경우 (원래 쓰던 다른 프로그램을 지우지 않도록. `--preset`도 동일)
 - 결과물이 곧 `~/.local/bin/<파일 이름>`인 경우(agy가 `~/.local/bin`에 설치된 경우)에는 링크를 따로 만들지 않습니다.
 
 ### remote-control 데몬
