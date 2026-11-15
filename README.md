@@ -4,7 +4,7 @@
 
 `agy`(Antigravity CLI — **Linux & macOS**, **x86_64 & ARM64/Apple Silicon**) 바이너리의 스트리밍 출력 방식과 마크다운 렌더링 결함을 동적 심볼/시그니처 탐색으로 패치하는 초고속 모듈형 도구(Rust)입니다.
 
-릴리즈마다 바뀌는 고정 주소에 의존하지 않고, `mmap` 제로카피 매핑으로 **ELF64**(Linux) 및 **Mach-O 64**(macOS)의 텍스트 섹션과 Go `.gopclntab` 심볼 테이블을 파싱하여 대상 함수를 찾고, 아키텍처별(`x86_64` / `ARM64`) 기계어 시그니처를 검증한 뒤 패치합니다(외부 크레이트 의존성 0, Linux `FICLONE` reflink 및 macOS `codesign -f -s -` 자동 서명 지원). 단, `banner`·`release-notes` 패치는 현재 `x86_64`에서만 지원합니다.
+릴리즈마다 바뀌는 고정 주소에 의존하지 않고, `mmap` 제로카피 매핑으로 **ELF64**(Linux) 및 **Mach-O 64**(macOS)의 텍스트 섹션과 Go `.gopclntab` 심볼 테이블을 파싱하여 대상 함수를 찾고, 아키텍처별(`x86_64` / `ARM64`) 기계어 시그니처를 검증한 뒤 패치합니다(외부 크레이트 의존성 0, Linux `FICLONE` reflink 및 macOS `codesign -f -s -` 자동 서명 지원). 단, `compact`·`banner`·`release-notes` 패치는 현재 `x86_64`에서만 지원합니다.
 
 ## 지원하는 패치 목록 (`--list`)
 
@@ -16,7 +16,7 @@
 | `cjk-bold` | `goldmark/parser.ScanDelimiter` | `` **"문구"**라는 ``, `` **용어(`code`)**는 ``처럼 닫는 `**` 앞 구두점과 뒤 한글 조사가 결합될 때 볼드가 풀리는 현상 수정 |
 | `tilde-strike` | `goldmark/extension.(*strikethroughParser).Parse` | `1.5.0~1.5.6`, `H2~H6` 같은 범위 표기용 단일 물결표(`~`)에 취소선이 그어지는 현상 방지 (`~~` 2개만 취소선으로 인식) |
 | `compact` | `utils.GetCheckpointConfig`, `config.applyFeatureProviderCheckpointOverrideConfig` | 내장 자동 컴팩션(CHECKPOINT) 발동 임계값(기본 256k)을 임의 토큰 수(`32k~1000k`, 기본 `180k`)로 변경 (`x86_64`, **기본 꺼짐** — `--compact 180k` 또는 `-p all,compact=160k`로 적용) |
-| `banner` | `render.BannerWithInfo` | 상단 `Antigravity CLI 1.5.7` 옆에 `(patch v0.2.1)` 형태로 패치 버전 표시 (`x86_64`) |
+| `banner` | `render.BannerWithInfo` | 상단 `Antigravity CLI 1.5.7` 옆에 `(patch v0.2.2)` 형태로 패치 버전 표시 (`x86_64`) |
 | `release-notes` | `render.BuildHeader` | 로고 아래에 패치 기능 요약 및 GitHub 저장소 정보 표시 (`x86_64`, **기본 꺼짐** — `-p all,release-notes`처럼 명시해야 적용) |
 
 ## 설치 및 빌드

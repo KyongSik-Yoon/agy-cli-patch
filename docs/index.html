@@ -4,9 +4,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>agy-cli-patch — agy 출력을 고치는 패처</title>
-<meta name="description" content="Antigravity CLI(agy)의 타자기 딜레이와 마크다운 렌더링 결함을, 주소가 아니라 심볼과 시그니처로 찾아 고치는 Rust 패처. Linux·macOS, x86_64·ARM64.">
+<meta name="description" content="Antigravity CLI(agy)의 타자기 딜레이와 마크다운 렌더링 결함을 고치고 자동 컴팩션 임계값을 조절하는 Rust 패처. Linux·macOS, x86_64·ARM64.">
 <meta property="og:title" content="agy-cli-patch">
-<meta property="og:description" content="agy의 타자기 딜레이와 한글 마크다운 결함을 스위치 하나씩 끄는 바이너리 패처.">
+<meta property="og:description" content="agy의 타자기 딜레이·한글 마크다운 결함·자동 컴팩션 임계값을 스위치 하나씩 고치는 바이너리 패처.">
 <meta property="og:url" content="https://kyongsik-yoon.github.io/agy-cli-patch/">
 <meta property="og:type" content="website">
 <meta name="theme-color" content="#0c1013">
@@ -290,7 +290,7 @@ footer .links{display:flex;flex-wrap:wrap;gap:6px 18px;margin-top:12px}
 
 <div class="topbar" id="topbar">
   <div class="wrap in">
-    <div class="brand">agy-cli-patch <span>v0.2.1</span></div>
+    <div class="brand">agy-cli-patch <span>v0.2.2</span></div>
     <nav>
       <a class="opt" href="#patches">패치</a>
       <a class="opt" href="#how">원리</a>
@@ -308,7 +308,7 @@ footer .links{display:flex;flex-wrap:wrap;gap:6px 18px;margin-top:12px}
 <div class="wrap">
 <div class="hero">
   <h1 class="up">agy 출력의 거슬리는 곳을<br><em>스위치 하나씩</em> 끕니다.</h1>
-  <p class="lead up d1">Antigravity CLI(<code>agy</code>) 바이너리의 <b>타자기 딜레이</b>와 <b>한글 마크다운 결함</b>을 고치는 Rust 패처입니다. 스위치가 하나씩 켜지며 같은 응답이 달라지는 걸 보세요. 직접 눌러도 됩니다.</p>
+  <p class="lead up d1">Antigravity CLI(<code>agy</code>) 바이너리의 <b>타자기 딜레이</b>와 <b>한글 마크다운 결함</b>을 고치고 <b>자동 컴팩션 임계값</b>을 원하는 수치로 바꾸는 Rust 패처입니다. 스위치가 하나씩 켜지며 같은 응답이 달라지는 걸 보세요. 직접 눌러도 됩니다.</p>
 
   <div class="demo up d2">
     <div class="win">
@@ -363,12 +363,12 @@ footer .links{display:flex;flex-wrap:wrap;gap:6px 18px;margin-top:12px}
       <button class="mini" data-on="0" aria-label="cjk-bold 패치 전후 보기"><span class="lab"><i></i></span><span class="c"><span class="px">**</span><span class="bd">"문구"</span><span class="px">**</span>라는 표현</span></button></div>
     <div class="p glow"><div class="id">tilde-strike</div><div><div class="d"><code>1.5.0~1.5.6</code>, <code>H2~H6</code> 같은 범위 표기의 물결표 하나에 취소선이 그어지지 않게 합니다. <code>~~</code> 두 개만 취소선입니다.</div><div class="sym">goldmark/extension.(*strikethroughParser).Parse</div></div>
       <button class="mini" data-on="0" aria-label="tilde-strike 패치 전후 보기"><span class="lab"><i></i></span><span class="c">1.5.0<span class="tl">~</span><span class="sk">1.5.6, H2</span><span class="tl">~</span>H6</span></button></div>
-    <div class="p glow"><div class="id">compact</div><div><div class="d">내장 자동 컴팩션(CHECKPOINT) 발동 기준(기본 <code>256k</code>)을 <code>--compact 180k</code>처럼 원하는 토큰 수(<code>32k~1000k</code>)로 바꿉니다.<span class="tag">x86_64 전용</span><span class="tag">기본 꺼짐</span></div><div class="sym">utils.GetCheckpointConfig</div></div>
-      <button class="mini" data-on="0" aria-label="compact 패치 전후 보기"><span class="lab"><i></i></span><span class="c"><span class="px">256k </span><span class="add">180k</span> limit</span></button></div>
-    <div class="p glow"><div class="id">banner</div><div><div class="d">상단 <code>Antigravity CLI 1.5.7</code> 옆에 <code>(patch v0.2.1)</code> 형태로 패치 버전을 표시합니다.<span class="tag">x86_64 전용</span></div><div class="sym">render.BannerWithInfo</div></div>
-      <button class="mini" data-on="0" aria-label="banner 패치 전후 보기"><span class="lab"><i></i></span><span class="c">Antigravity CLI 1.5.7<span class="add"> (patch v0.2.1)</span></span></button></div>
+    <div class="p glow"><div class="id">compact</div><div><div class="d">내장 자동 컴팩션(CHECKPOINT) 발동 기준(기본 <code>256k</code>)을 <code>--compact 180k</code>처럼 원하는 토큰 수(<code>32k~1000k</code>)로 바꿉니다.<span class="tag">x86_64 전용</span><span class="tag">기본 꺼짐</span></div><div class="sym">utils.GetCheckpointConfig · config.applyFeatureProviderCheckpointOverrideConfig</div></div>
+      <button class="mini" data-on="0" aria-label="compact 패치 전후 보기"><span class="lab"><i></i></span><span class="c">CHECKPOINT <span class="px" style="color:var(--fg)">256k</span><span class="add">180k</span></span></button></div>
+    <div class="p glow"><div class="id">banner</div><div><div class="d">상단 <code>Antigravity CLI 1.5.7</code> 옆에 <code>(patch v0.2.2)</code> 형태로 패치 버전을 표시합니다.<span class="tag">x86_64 전용</span></div><div class="sym">render.BannerWithInfo</div></div>
+      <button class="mini" data-on="0" aria-label="banner 패치 전후 보기"><span class="lab"><i></i></span><span class="c">Antigravity CLI 1.5.7<span class="add"> (patch v0.2.2)</span></span></button></div>
     <div class="p glow"><div class="id">release-notes</div><div><div class="d">로고 아래에 패치 기능 요약과 저장소 정보를 표시합니다. <code>-p all,release-notes</code>처럼 명시해야 적용됩니다.<span class="tag">x86_64 전용</span><span class="tag">기본 꺼짐</span></div><div class="sym">render.BuildHeader</div></div>
-      <button class="mini" data-on="0" aria-label="release-notes 패치 전후 보기"><span class="lab"><i></i></span><span class="c stt">로고 아래</span><span class="rn"><b>What's new in agy-cli-patch v0.2.1:</b><br><u>•</u> <b>nodrip</b>: instant streaming …<br><u>•</u> <b>batch</b>: full answer rendered at once …</span></button></div>
+      <button class="mini" data-on="0" aria-label="release-notes 패치 전후 보기"><span class="lab"><i></i></span><span class="c stt">로고 아래</span><span class="rn"><b>What's new in agy-cli-patch v0.2.2:</b><br><u>•</u> <b>compact</b>: custom auto-compaction token limit …<br><u>•</u> <b>nodrip</b>: instant streaming …</span></button></div>
   </div>
 </section>
 
@@ -411,7 +411,7 @@ footer .links{display:flex;flex-wrap:wrap;gap:6px 18px;margin-top:12px}
 <section id="wizard">
   <div class="kicker rv">인자 없이 실행</div>
   <h2 class="rv">세 단계로 고르고, 확인하고, 패치</h2>
-  <p class="sub rv">아래 화면은 실제로 조작됩니다. 화면을 누른 뒤 <code>↑↓</code> <code>space</code> <code>a</code> <code>enter</code> <code>esc</code>를 쓰거나, 줄과 아래 키를 직접 누르세요. <code>batch</code>를 켜면 <code>nodrip</code>도 함께 켜집니다.</p>
+  <p class="sub rv">아래 화면은 실제로 조작됩니다. 화면을 누른 뒤 <code>↑↓</code> <code>space</code> <code>a</code> <code>enter</code> <code>esc</code>를 쓰거나, 줄과 아래 키를 직접 누르세요. <code>compact</code> 줄에서는 <code>-</code> <code>+</code> <code>e</code>로 토큰 수를 조절할 수 있고, <code>batch</code>를 켜면 <code>nodrip</code>도 함께 켜집니다.</p>
   <div class="win wz rv" id="wz" tabindex="0" role="application" aria-label="agy-cli-patch 대화형 화면 따라 하기">
     <div class="bar"><i></i><i></i><i></i><b>agy-cli-patch</b><span class="r" id="wzhint">눌러서 키보드로 조작</span></div>
     <div class="tui" id="tui"></div>
@@ -447,7 +447,7 @@ agy-cli-patch
 <span class="c"># 기본 활성 패치 전체를 적용해 agy-batch 생성</span>
 agy-cli-patch -p all -o agy-batch
 
-<span class="c"># 기본 패치 + 자동 컴팩션 180k 임계값 적용</span>
+<span class="c"># 기본 패치 + 자동 컴팩션 180k 임계값 적용 (32k~1000k)</span>
 agy-cli-patch -p all --compact 180k -o agy-batch
 
 <span class="c"># 마크다운 패치 3종만 적용해 agy-md 생성</span>
@@ -824,7 +824,7 @@ part('wizard', function(){
     {id: 'cjk-bold', t: '구두점 뒤 한글 조사 볼드(**) 깨짐 수정 (CJK Bold Fix)', d: '**"문구"**라는, **용어(`code`)**는 처럼 뒤에 한글 조사가 붙어도 볼드 유지', s: 'goldmark/parser.ScanDelimiter', def: true, off: '0xa1b9c91, 0xa1b9cc3'},
     {id: 'tilde-strike', t: '단일 물결표(~) 취소선 오작동 방지 (Double-Tilde Strikethrough)', d: "1.5.0~1.5.6 같은 범위 표기용 단일 '~'에 취소선이 그어지지 않도록 '~~'만 허용", s: 'goldmark/extension.(*strikethroughParser).Parse', def: true, off: '0xa1d5015'},
     {id: 'compact', t: '자동 컴팩션 토큰 임계값 변경 (Auto-Compact Limit)', d: '내장 자동 컴팩션(CHECKPOINT) 발동 기준(기본 256k)을 원하는 토큰 수(기본 180k, 32k~1000k)로 변경 (기본 꺼짐)', s: 'utils.GetCheckpointConfig', def: false, off: '0x86858d8, 0x84f5e04, 0x84f5e09, 0x84f617d'},
-    {id: 'banner', t: '제품명 옆 패치 버전 표시 (Patch Version Tag)', d: "상단 'Antigravity CLI 1.5.7' 옆에 '(patch v0.2.1)' 형태로 패치 버전 표시", s: 'render.BannerWithInfo', def: true, off: '0xa8a4287, 0xa326f90'},
+    {id: 'banner', t: '제품명 옆 패치 버전 표시 (Patch Version Tag)', d: "상단 'Antigravity CLI 1.5.7' 옆에 '(patch v0.2.2)' 형태로 패치 버전 표시", s: 'render.BannerWithInfo', def: true, off: '0xa8a4287, 0xa326f90'},
     {id: 'release-notes', t: '상단 배너 릴리즈 노트 표시 (Release Notes)', d: '로고 아래에 패치 기능 요약 및 GitHub 정보 표시 (기본 꺼짐, -p 로 명시해야 적용)', s: 'render.BuildHeader', def: false, off: '0xa8a42c7, 0xa8a4520, 0xa318180'}
   ];
   var N = P.length, B = 1, ND = 0, CI = 5;
@@ -931,7 +931,7 @@ part('wizard', function(){
   }
   function flashLines(){ return ln('') + (W.flash ? ln(sp(W.flash[0], W.flash[1])) + ln('') : ''); }
   function draw(){
-    var h = '<div class="hdr"><span><span class="ab">agy-cli-patch</span> <span class="dim">v0.2.1</span></span><span class="dim">ELF · x86_64</span></div>';
+    var h = '<div class="hdr"><span><span class="ab">agy-cli-patch</span> <span class="dim">v0.2.2</span></span><span class="dim">ELF · x86_64</span></div>';
     h += ln(sp('dim', '대상') + sp('gr', DIR + '/antigravity') + '<span class="dim" style="flex:none">1.5.7</span>');
     h += ln('');
     var names = ['패치 선택', '출력 방식', '확인'];
