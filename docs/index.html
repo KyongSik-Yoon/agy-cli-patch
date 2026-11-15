@@ -73,6 +73,7 @@ button{font:inherit;color:inherit;cursor:pointer}
 .term .sp{height:.9em}
 .term .ctxline{font-size:12px;color:var(--faint);border-bottom:1px dashed var(--line2);padding-bottom:8px;margin-bottom:10px;transition:color .3s,border-color .3s}
 .term .ctxline.cp{color:var(--ok);border-bottom-color:rgba(127,216,143,.35)}
+.term .ctxline.dl{color:var(--accent);border-bottom-color:rgba(95,215,215,.35)}
 .term .caret{display:inline-block;width:.55em;height:1.05em;background:var(--fg);vertical-align:-.18em;margin-left:1px;animation:blink 1s steps(2) infinite}
 @keyframes blink{50%{opacity:.25}}
 .term .fx{animation:fx 1.1s ease-out;border-radius:4px}
@@ -85,11 +86,13 @@ button{font:inherit;color:inherit;cursor:pointer}
 .meter .tr i.sh{background:var(--accent)}
 .meter .tr i.ctx{background:var(--warn);transition:width .4s ease,background .3s}
 .meter .tr i.ctx.cp{background:var(--ok)}
+.meter .tr i.ctx.dl{background:var(--accent)}
 .meter em{font-style:normal;color:var(--fg);min-width:4.2em;text-align:right;white-space:nowrap}
 .stat{display:flex;flex-wrap:wrap;gap:6px 16px;padding:4px 14px 10px;font-family:var(--mono);font-size:12px;color:var(--dim)}
 .stat .state{margin-left:auto}
 .stat .state.done{color:var(--ok)}
 .stat .cstat.cp{color:var(--ok)}
+.stat .cstat.dl{color:var(--accent)}
 .stat .lag.hot{color:var(--warn)}
 
 .sw{font-family:var(--mono);font-size:13.5px;padding:14px 8px 10px;flex:1;display:flex;flex-direction:column}
@@ -107,6 +110,7 @@ button{font:inherit;color:inherit;cursor:pointer}
 .sw .tokctl{display:inline-flex;gap:4px;margin-left:auto}
 .sw .tokbtn{display:inline-flex;align-items:center;justify-content:center;min-width:22px;height:20px;padding:0 5px;border:1px solid var(--line2);border-radius:4px;background:var(--bg);color:var(--fg);font-family:var(--mono);font-size:12px;line-height:1}
 .sw .tokbtn:hover{border-color:var(--accent);color:var(--accent)}
+.sw .tokbtn.on{border-color:var(--accent);color:var(--accent);background:rgba(95,215,215,.12)}
 .sw .ds{grid-column:3;color:var(--dim);font-family:var(--sans);font-size:12.5px;line-height:1.45}
 .sw button.row[aria-checked="true"] .ck{color:var(--ok);transform:scale(1.15)}
 .sw button.row[aria-checked="true"] .id{font-weight:700}
@@ -353,7 +357,7 @@ footer .links{display:flex;flex-wrap:wrap;gap:6px 18px;margin-top:12px}
         <button class="row" role="switch" aria-checked="false" data-k="heading"><span class="pt">❯</span><span class="ck">○</span><span class="id">heading</span><span class="ds">제목 앞의 '## ' 기호를 숨기고 색·볼드만 유지</span></button>
         <button class="row" role="switch" aria-checked="false" data-k="cjk"><span class="pt">❯</span><span class="ck">○</span><span class="id">cjk-bold</span><span class="ds">구두점 뒤에 한글 조사가 붙어도 볼드 유지</span></button>
         <button class="row" role="switch" aria-checked="false" data-k="tilde"><span class="pt">❯</span><span class="ck">○</span><span class="id">tilde-strike</span><span class="ds">'~' 하나는 그대로 두고 '~~'만 취소선</span></button>
-        <button class="row" role="switch" aria-checked="false" data-k="compact"><span class="pt">❯</span><span class="ck">○</span><span class="idrow"><span class="id">compact</span><span class="subtok" id="herotok">[180k]</span><span class="tokctl"><span role="button" tabindex="0" class="tokbtn" data-d="-10000" aria-label="10k 감소">−</span><span role="button" tabindex="0" class="tokbtn" data-d="10000" aria-label="10k 증가">+</span></span></span><span class="ds">자동 컴팩션(CHECKPOINT) 발동 한도를 256k에서 원하는 수치로 조절</span></button>
+        <button class="row" role="switch" aria-checked="false" data-k="compact"><span class="pt">❯</span><span class="ck">○</span><span class="idrow"><span class="id">compact</span><span class="subtok" id="herotok">[180k]</span><span class="tokctl"><span role="button" tabindex="0" class="tokbtn" data-set="180000" aria-label="180k로 낮추기">180k</span><span role="button" tabindex="0" class="tokbtn" data-set="500000" aria-label="500k로 높이기">500k</span><span role="button" tabindex="0" class="tokbtn" data-d="-10000" aria-label="10k 감소">−</span><span role="button" tabindex="0" class="tokbtn" data-d="10000" aria-label="10k 증가">+</span></span></span><span class="ds">자동 컴팩션(256k)을 낮춰 비용을 아끼거나 높여 원문 맥락을 유지</span></button>
         <div class="flash" id="flash" role="status"></div>
         <div class="acts">
           <button class="btn" id="auto">자동 시연</button>
@@ -363,7 +367,7 @@ footer .links{display:flex;flex-wrap:wrap;gap:6px 18px;margin-top:12px}
       </div>
     </div>
   </div>
-  <p class="note">그림으로 흉내 낸 시연입니다. 타자기 효과는 실제 속도(16ms마다 12바이트)의 ¼배속으로 재생하며, <code>compact</code>의 컨텍스트 압축 수치(192k → 15k)는 <code>CHECKPOINT</code> 동작을 바탕으로 한 예시입니다. 배경의 바이트는 <code>nodrip</code> 패치가 실제로 바꾸는 x86_64 바이트입니다.</p>
+  <p class="note">그림으로 흉내 낸 시연입니다. 타자기 효과는 실제 속도(16ms마다 12바이트)의 ¼배속으로 재생하며, <code>compact</code>의 컨텍스트 수치(180k 조기 요약 192k → 15k, 500k 상한 연장)는 <code>CHECKPOINT</code> 동작을 바탕으로 한 예시입니다. 배경의 바이트는 <code>nodrip</code> 패치가 실제로 바꾸는 x86_64 바이트입니다.</p>
 </div>
 </div>
 </div>
@@ -384,7 +388,7 @@ footer .links{display:flex;flex-wrap:wrap;gap:6px 18px;margin-top:12px}
       <button class="mini" data-on="0" aria-label="cjk-bold 패치 전후 보기"><span class="lab"><i></i></span><span class="c"><span class="px">**</span><span class="bd">"문구"</span><span class="px">**</span>라는 표현</span></button></div>
     <div class="p glow"><div class="id">tilde-strike</div><div><div class="d"><code>1.5.0~1.5.6</code>, <code>H2~H6</code> 같은 범위 표기의 물결표 하나에 취소선이 그어지지 않게 합니다. <code>~~</code> 두 개만 취소선입니다.</div><div class="sym">goldmark/extension.(*strikethroughParser).Parse</div></div>
       <button class="mini" data-on="0" aria-label="tilde-strike 패치 전후 보기"><span class="lab"><i></i></span><span class="c">1.5.0<span class="tl">~</span><span class="sk">1.5.6, H2</span><span class="tl">~</span>H6</span></button></div>
-    <div class="p glow"><div class="id">compact</div><div><div class="d">내장 자동 컴팩션(CHECKPOINT) 발동 기준(기본 <code>256k</code>)을 <code>--compact 180k</code>나 <code>-p all,compact=160k</code>처럼 원하는 토큰 수(<code>32k~1000k</code>)로 바꾸고 서버 플래그 덮어쓰기를 막습니다.<span class="tag">x86_64 전용</span><span class="tag">기본 꺼짐</span></div><div class="sym">utils.GetCheckpointConfig · config.applyFeatureProviderCheckpointOverrideConfig</div></div>
+    <div class="p glow"><div class="id">compact</div><div><div class="d">내장 자동 컴팩션(CHECKPOINT) 기준(기본 <code>256k</code>)을 <code>32k~1000k</code> 범위에서 조절합니다. <code>180k</code>로 낮춰 <code>200k</code> 단가 할증 전에 조기 요약하거나, <code>500k+</code>로 높여 1M 모델의 원문 맥락을 오래 유지할 수 있습니다.<span class="tag">x86_64 전용</span><span class="tag">기본 꺼짐</span></div><div class="sym">utils.GetCheckpointConfig · config.applyFeatureProviderCheckpointOverrideConfig</div></div>
       <button class="mini" data-on="0" aria-label="compact 패치 전후 보기"><span class="lab"><i></i></span><span class="c"><span class="c-before">192k / 256k · 압축 대기</span><span class="c-after">192k ≥ 180k<b> → CHECKPOINT (15k)</b></span></span></button></div>
     <div class="p glow"><div class="id">banner</div><div><div class="d">상단 <code>Antigravity CLI 1.5.7</code> 옆에 <code>(patch v0.2.2)</code> 형태로 패치 버전을 표시합니다.<span class="tag">x86_64 전용</span></div><div class="sym">render.BannerWithInfo</div></div>
       <button class="mini" data-on="0" aria-label="banner 패치 전후 보기"><span class="lab"><i></i></span><span class="c">Antigravity CLI 1.5.7<span class="add"> (patch v0.2.2)</span></span></button></div>
@@ -446,8 +450,8 @@ footer .links{display:flex;flex-wrap:wrap;gap:6px 18px;margin-top:12px}
   <h2 class="rv">자동 컴팩션과 자체 업데이트</h2>
   <p class="sub rv">컴팩션 임계값 설계 기준과 <code>antigravity</code> 바이너리의 자동 업데이트 동작을 확인하세요.</p>
   <div class="care">
-    <div class="glow rv"><h3>왜 256k 대신 180k인가요?</h3><p>agy의 기본 자동 컴팩션(<code>CHECKPOINT</code>)은 <code>256k</code>에서야 동작하지만, <code>200k</code>를 넘기면 토큰 단가 상승과 응답 지연이 먼저 옵니다. <code>150k~180k</code>로 낮춰 두면 그 전에 대화를 자동 요약해 세션을 가볍게 이어 갑니다.</p></div>
-    <div class="glow rv" style="--d:.04s"><h3>작은 모델 보호 · 서버 덮어쓰기 차단</h3><p>지정한 값보다 컨텍스트 창이 작은 모델은 내장 클램프 로직이 그대로 한도를 낮춰 보호하며, 서버 <code>FeatureProvider</code> 플래그가 로컬 임계값을 덮어쓰지 못하도록 함께 패치합니다.</p></div>
+    <div class="glow rv"><h3>낮추기 (150k~180k) · 비용과 속도 방어</h3><p>agy의 기본 자동 컴팩션(<code>256k</code>) 전에 <code>200k</code> 초과 시 토큰 단가 할증(Gemini 2배)과 오케스트레이터 핸드오프 프리필 부담이 먼저 옵니다. <code>150k~180k</code>로 당겨 두면 할증 구간 진입 전에 대화를 자동 요약해 세션을 가볍게 이어 갑니다.</p></div>
+    <div class="glow rv" style="--d:.04s"><h3>높이기 (500k+) · 원문 맥락 유지와 안전장치</h3><p>1M 컨텍스트 모델에서 요약 손실 없이 긴 코드·로그 원문을 끝까지 유지하려면 <code>--compact 500k</code>처럼 상한을 늦출 수 있습니다(<code>200k</code> 초과 과금 감수). 작은 모델은 내장 클램프가 한도를 자동 제한하며, 서버 <code>FeatureProvider</code> 덮어쓰기도 함께 차단합니다.</p></div>
     <div class="glow rv" style="--d:.08s"><h3>in-place 패치는 다시 적용</h3><p>agy가 자체 업데이트하면 <code>agy-cli-patch -p all --compact 180k --in-place</code>를 다시 실행하면 됩니다. 원본은 <code>antigravity.orig</code>로 백업되고 <code>--restore</code>로 되돌립니다.</p></div>
     <div class="glow rv" style="--d:.12s"><h3>자체 업데이트 끄기</h3><p><code>export AGY_CLI_DISABLE_AUTO_UPDATE=true</code> — 값은 반드시 <code>true</code>여야 합니다(<code>1</code>은 적용되지 않음).</p></div>
   </div>
@@ -471,8 +475,9 @@ agy-cli-patch
 <span class="c"># 기본 활성 패치 전체를 적용해 agy-batch 생성</span>
 agy-cli-patch -p all -o agy-batch
 
-<span class="c"># 기본 패치 + 자동 컴팩션 180k 임계값 적용 (32k~1000k)</span>
+<span class="c"># 자동 컴팩션 앞당기기 (200k 할증 방지) / 늦추기 (1M 원문 맥락 유지)</span>
 agy-cli-patch -p all --compact 180k -o agy-batch
+agy-cli-patch -p all --compact 500k -o agy-long
 
 <span class="c"># 인라인 값 지정 / 프리셋 2종(agy-batch, agy-nodrip) 동시 적용</span>
 agy-cli-patch -p all,compact=160k -o agy-batch
@@ -652,18 +657,26 @@ part('hero', function(){
   function paintCtx(fx){
     var limit = on.compact ? compactTok : 256000;
     var triggered = on.compact && CTX_RAW >= compactTok;
+    var delayed = on.compact && compactTok > 256000;
     var cur = triggered ? CTX_COMPACT : CTX_RAW;
     var pct = Math.min(100, cur / limit * 100);
+    var stateCls = triggered ? ' cp' : delayed ? ' dl' : '';
     var bar = $('ctxbar'), cstat = $('cstat');
     bar.style.width = pct + '%';
-    bar.className = 'ctx' + (triggered ? ' cp' : '');
+    bar.className = 'ctx' + stateCls;
     $('ctxtxt').textContent = fmtK(cur) + ' / ' + fmtK(limit);
-    cstat.className = 'cstat' + (triggered ? ' cp' : '');
-    cstat.textContent = triggered ? '✓ CHECKPOINT ' + fmtK(CTX_RAW) + '→' + fmtK(CTX_COMPACT) : '컴팩션 전 (기준 ' + fmtK(limit) + ')';
-    var cls = 'ctxline' + (triggered ? ' cp' : '') + (fx === 'compact' ? ' fx' : '');
+    cstat.className = 'cstat' + stateCls;
+    cstat.textContent = triggered
+      ? '✓ CHECKPOINT ' + fmtK(CTX_RAW) + '→' + fmtK(CTX_COMPACT)
+      : delayed
+        ? '↗ 원문 유지 (256k→' + fmtK(compactTok) + ')'
+        : '컴팩션 전 (기준 ' + fmtK(limit) + ')';
+    var cls = 'ctxline' + stateCls + (fx === 'compact' ? ' fx' : '');
     var msg = triggered
       ? '◈ CHECKPOINT (≥' + fmtK(compactTok) + ') — 대화를 ' + fmtK(CTX_RAW) + ' → ' + fmtK(CTX_COMPACT) + ' 토큰으로 자동 요약'
-      : '◇ context ' + fmtK(CTX_RAW) + ' / ' + fmtK(limit) + ' — 자동 컴팩션 대기';
+      : delayed
+        ? '◈ context ' + fmtK(CTX_RAW) + ' / ' + fmtK(compactTok) + ' — 256k 상한을 늦춰 원문 맥락 유지'
+        : '◇ context ' + fmtK(CTX_RAW) + ' / ' + fmtK(limit) + ' — 자동 컴팩션 대기';
     return '<div class="' + cls + '">' + msg + '</div>';
   }
   function paint(fx){
@@ -702,17 +715,21 @@ part('hero', function(){
       b.setAttribute('aria-checked', v ? 'true' : 'false');
       b.querySelector('.ck').textContent = v ? '◉' : '○';
     });
+    document.querySelectorAll('#sw .tokbtn[data-set]').forEach(function(b){
+      b.classList.toggle('on', on.compact && compactTok === +b.dataset.set);
+    });
     $('herotok').textContent = '[' + fmtK(compactTok) + ']';
     $('cnt').textContent = n + '/' + KEYS.length + ' 선택';
     $('all').textContent = n === KEYS.length ? '모두 끄기' : '모두 켜기';
   }
-  function adjustHeroTok(delta){
+  function setHeroTok(v, msg){
     stopAuto();
-    compactTok = Math.max(32000, Math.min(1000000, compactTok + delta));
+    compactTok = Math.max(32000, Math.min(1000000, v));
     on.compact = true;
-    $('flash').textContent = '컴팩션 임계값: ' + fmtK(compactTok) + ' (' + compactTok + ' 토큰)';
+    $('flash').textContent = msg || ('컴팩션 임계값: ' + fmtK(compactTok) + ' (' + compactTok + ' 토큰)');
     sync(); paint('compact');
   }
+  function adjustHeroTok(delta){ setHeroTok(compactTok + delta); }
   function toggle(k){
     on[k] = !on[k]; $('flash').textContent = '';
     if (k === 'batch' && on.batch && !on.nodrip) { on.nodrip = true; $('flash').textContent = 'batch 는 nodrip 과 함께 동작하므로 nodrip 도 선택했습니다.'; }
@@ -741,9 +758,22 @@ part('hero', function(){
     });
     p.then(function(){ if (live()) stopAuto(); });
   }
+  function activateTokBtn(b){
+    if (b.dataset.set) {
+      var v = +b.dataset.set;
+      var msg = v === 180000
+        ? '컴팩션 임계값: 180k — 200k 단가 할증 전에 대화를 자동 요약합니다.'
+        : v === 500000
+          ? '컴팩션 임계값: 500k — 256k 상한을 늦춰 1M 모델 원문 맥락을 유지합니다 (200k 초과 할증 주의).'
+          : null;
+      setHeroTok(v, msg);
+    } else if (b.dataset.d) {
+      adjustHeroTok(+b.dataset.d);
+    }
+  }
   document.querySelectorAll('#sw .tokbtn').forEach(function(b){
-    b.addEventListener('click', function(e){ e.stopPropagation(); adjustHeroTok(+b.dataset.d); });
-    b.addEventListener('keydown', function(e){ if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); adjustHeroTok(+b.dataset.d); } });
+    b.addEventListener('click', function(e){ e.stopPropagation(); activateTokBtn(b); });
+    b.addEventListener('keydown', function(e){ if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); activateTokBtn(b); } });
   });
   rows.forEach(function(b){ b.addEventListener('click', function(){ stopAuto(); toggle(b.dataset.k); }); });
   $('replay').addEventListener('click', function(){ stopAuto(); play(); });

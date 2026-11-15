@@ -15,7 +15,7 @@
 | `heading` | `render.glamourStyleForScheme` | 마크다운 헤딩(`H2`~`H6`) 앞에 붙는 `## `~`###### ` 프리픽스를 숨기고 색상·볼드만 유지 |
 | `cjk-bold` | `goldmark/parser.ScanDelimiter` | `` **"문구"**라는 ``, `` **용어(`code`)**는 ``처럼 닫는 `**` 앞 구두점과 뒤 한글 조사가 결합될 때 볼드가 풀리는 현상 수정 |
 | `tilde-strike` | `goldmark/extension.(*strikethroughParser).Parse` | `1.5.0~1.5.6`, `H2~H6` 같은 범위 표기용 단일 물결표(`~`)에 취소선이 그어지는 현상 방지 (`~~` 2개만 취소선으로 인식) |
-| `compact` | `utils.GetCheckpointConfig`, `config.applyFeatureProviderCheckpointOverrideConfig` | 내장 자동 컴팩션(CHECKPOINT) 발동 임계값(기본 256k)을 임의 토큰 수(`32k~1000k`, 기본 `180k`)로 변경 (`x86_64`, **기본 꺼짐** — `--compact 180k` 또는 `-p all,compact=160k`로 적용) |
+| `compact` | `utils.GetCheckpointConfig`, `config.applyFeatureProviderCheckpointOverrideConfig` | 내장 자동 컴팩션(CHECKPOINT) 발동 임계값(기본 256k)을 `32k~1000k`로 조절 (`180k`로 낮춰 `200k` 단가 할증 전 조기 요약 또는 `500k+`로 높여 1M 모델 원문 맥락 유지, `x86_64` · **기본 꺼짐**) |
 | `banner` | `render.BannerWithInfo` | 상단 `Antigravity CLI 1.5.7` 옆에 `(patch v0.2.2)` 형태로 패치 버전 표시 (`x86_64`) |
 | `release-notes` | `render.BuildHeader` | 로고 아래에 패치 기능 요약 및 GitHub 저장소 정보 표시 (`x86_64`, **기본 꺼짐** — `-p all,release-notes`처럼 명시해야 적용) |
 
@@ -78,8 +78,9 @@ agy-cli-patch --notes
 # 일괄 출력(batch)만 빼고 나머지 패치를 적용해 agy-nodrip 생성
 agy-cli-patch -p nodrip,heading,cjk-bold,tilde-strike,banner -o agy-nodrip
 
-# 기본 활성 패치 전체 + 자동 컴팩션 180k 임계값 적용
+# 자동 컴팩션 앞당기기 (200k 초과 할증·핸드오프 프리필 방지) / 늦추기 (1M 모델 원문 맥락 유지)
 agy-cli-patch -p all --compact 180k -o agy-batch
+agy-cli-patch -p all --compact 500k -o agy-long
 
 # 인라인 값으로 특정 토큰 임계값 지정 (32k~1000k)
 agy-cli-patch -p all,compact=160k -o agy-batch
