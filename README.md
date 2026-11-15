@@ -1,6 +1,6 @@
 # agy-cli-patch
 
-[Homepage](https://kyongsik-yoon.github.io/agy-cli-patch/) · [Releases](https://github.com/KyongSik-Yoon/agy-cli-patch/releases)
+[Homepage](https://agy-cli-patch.ksyoon.com/) · [Releases](https://github.com/KyongSik-Yoon/agy-cli-patch/releases)
 
 `agy`(Antigravity CLI — **Linux & macOS**, **x86_64 & ARM64/Apple Silicon**) 바이너리의 스트리밍 출력 방식과 마크다운 렌더링 결함을 동적 심볼/시그니처 탐색으로 패치하는 초고속 모듈형 도구(Rust)입니다.
 
