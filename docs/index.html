@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>agy-cli-patch — agy 출력을 고치는 패처</title>
+<title>agy-cli-patch — agy 출력과 자동 컴팩션을 고치는 패처</title>
 <meta name="description" content="Antigravity CLI(agy)의 타자기 딜레이와 마크다운 렌더링 결함을 고치고 자동 컴팩션 임계값을 조절하는 Rust 패처. Linux·macOS, x86_64·ARM64.">
 <meta property="og:title" content="agy-cli-patch">
 <meta property="og:description" content="agy의 타자기 딜레이·한글 마크다운 결함·자동 컴팩션 임계값을 스위치 하나씩 고치는 바이너리 패처.">
@@ -71,6 +71,8 @@ button{font:inherit;color:inherit;cursor:pointer}
 .term code{background:#22303a;color:var(--warn);padding:1px 5px;border-radius:3px}
 .term s{color:var(--faint)}
 .term .sp{height:.9em}
+.term .ctxline{font-size:12px;color:var(--faint);border-bottom:1px dashed var(--line2);padding-bottom:8px;margin-bottom:10px;transition:color .3s,border-color .3s}
+.term .ctxline.cp{color:var(--ok);border-bottom-color:rgba(127,216,143,.35)}
 .term .caret{display:inline-block;width:.55em;height:1.05em;background:var(--fg);vertical-align:-.18em;margin-left:1px;animation:blink 1s steps(2) infinite}
 @keyframes blink{50%{opacity:.25}}
 .term .fx{animation:fx 1.1s ease-out;border-radius:4px}
@@ -81,10 +83,13 @@ button{font:inherit;color:inherit;cursor:pointer}
 .meter .tr{height:6px;background:#1d272e;border-radius:3px;overflow:hidden}
 .meter .tr i{display:block;height:100%;width:0;border-radius:3px;background:var(--dim)}
 .meter .tr i.sh{background:var(--accent)}
-.meter em{font-style:normal;color:var(--fg);min-width:4.2em;text-align:right}
-.stat{display:flex;gap:16px;padding:4px 14px 10px;font-family:var(--mono);font-size:12px;color:var(--dim)}
+.meter .tr i.ctx{background:var(--warn);transition:width .4s ease,background .3s}
+.meter .tr i.ctx.cp{background:var(--ok)}
+.meter em{font-style:normal;color:var(--fg);min-width:4.2em;text-align:right;white-space:nowrap}
+.stat{display:flex;flex-wrap:wrap;gap:6px 16px;padding:4px 14px 10px;font-family:var(--mono);font-size:12px;color:var(--dim)}
 .stat .state{margin-left:auto}
 .stat .state.done{color:var(--ok)}
+.stat .cstat.cp{color:var(--ok)}
 .stat .lag.hot{color:var(--warn)}
 
 .sw{font-family:var(--mono);font-size:13.5px;padding:14px 8px 10px;flex:1;display:flex;flex-direction:column}
@@ -96,6 +101,12 @@ button{font:inherit;color:inherit;cursor:pointer}
 .sw button.row.cur .pt{opacity:1}
 .sw .ck{color:var(--faint);transition:color .2s,transform .25s}
 .sw .id{color:var(--accent)}
+.sw .idrow{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.sw .subtok{font-size:12px;color:var(--dim)}
+.sw button.row[aria-checked="true"] .subtok{color:var(--ok)}
+.sw .tokctl{display:inline-flex;gap:4px;margin-left:auto}
+.sw .tokbtn{display:inline-flex;align-items:center;justify-content:center;min-width:22px;height:20px;padding:0 5px;border:1px solid var(--line2);border-radius:4px;background:var(--bg);color:var(--fg);font-family:var(--mono);font-size:12px;line-height:1}
+.sw .tokbtn:hover{border-color:var(--accent);color:var(--accent)}
 .sw .ds{grid-column:3;color:var(--dim);font-family:var(--sans);font-size:12.5px;line-height:1.45}
 .sw button.row[aria-checked="true"] .ck{color:var(--ok);transform:scale(1.15)}
 .sw button.row[aria-checked="true"] .id{font-weight:700}
@@ -145,7 +156,12 @@ section p.sub{color:var(--dim);max-width:660px;margin:0 0 30px}
 .mini .sk{text-decoration:line-through;color:var(--faint);transition:color .4s,text-decoration-color .4s}
 .mini[data-on="1"] .sk{text-decoration-color:transparent;color:var(--fg)}
 .mini .add{color:var(--ok);display:inline-block;max-width:0;overflow:hidden;vertical-align:bottom;white-space:pre;transition:max-width .7s cubic-bezier(.2,.8,.2,1)}
-.mini[data-on="1"] .add{max-width:17ch}
+.mini[data-on="1"] .add{max-width:26ch}
+.mini .c-before{display:inline-block;max-width:28ch;overflow:hidden;vertical-align:bottom;white-space:pre;color:var(--dim);transition:max-width .5s cubic-bezier(.2,.8,.2,1),opacity .35s}
+.mini[data-on="1"] .c-before{max-width:0;opacity:0}
+.mini .c-after{display:inline-block;max-width:0;overflow:hidden;vertical-align:bottom;white-space:pre;color:var(--fg);opacity:0;transition:max-width .7s cubic-bezier(.2,.8,.2,1),opacity .45s}
+.mini[data-on="1"] .c-after{max-width:36ch;opacity:1}
+.mini .c-after b{color:var(--ok);font-weight:700}
 .mini .rn{display:block;font-size:11.5px;line-height:1.55;color:var(--dim);max-height:0;opacity:0;overflow:hidden;transition:max-height .6s,opacity .5s}
 .mini .rn b{color:var(--fg)}.mini .rn u{text-decoration:none;color:var(--ok)}
 .mini[data-on="1"] .rn{max-height:5em;opacity:1}
@@ -222,6 +238,8 @@ section p.sub{color:var(--dim);max-width:660px;margin:0 0 30px}
 .tui .ln>span:last-child,.tui .ln>span.gr{flex:0 1 auto;min-width:0}
 .tui .ln.row{cursor:pointer;border-radius:4px}
 .tui .ln.row:hover{background:#1a242a}
+.tui [data-edit-tok]{cursor:pointer;border-radius:3px;padding:0 2px}
+.tui [data-edit-tok]:hover{background:#1d2a31;text-decoration:underline}
 .tui .idc{display:inline-block;min-width:118px}
 .tui .ptr{display:inline-block;width:10px}
 .tui .ind{padding-left:38px}
@@ -307,8 +325,8 @@ footer .links{display:flex;flex-wrap:wrap;gap:6px 18px;margin-top:12px}
 <canvas id="field" aria-hidden="true"></canvas>
 <div class="wrap">
 <div class="hero">
-  <h1 class="up">agy 출력의 거슬리는 곳을<br><em>스위치 하나씩</em> 끕니다.</h1>
-  <p class="lead up d1">Antigravity CLI(<code>agy</code>) 바이너리의 <b>타자기 딜레이</b>와 <b>한글 마크다운 결함</b>을 고치고 <b>자동 컴팩션 임계값</b>을 원하는 수치로 바꾸는 Rust 패처입니다. 스위치가 하나씩 켜지며 같은 응답이 달라지는 걸 보세요. 직접 눌러도 됩니다.</p>
+  <h1 class="up">agy 출력과 컴팩션 기준을<br><em>스위치 하나씩</em> 바꿉니다.</h1>
+  <p class="lead up d1">Antigravity CLI(<code>agy</code>) 바이너리의 <b>타자기 딜레이</b>와 <b>한글 마크다운 결함</b>을 고치고 <b>자동 컴팩션 임계값</b>을 원하는 수치로 바꾸는 Rust 패처입니다. 스위치가 하나씩 켜지며 같은 응답과 컨텍스트 한도가 달라지는 걸 보세요. 직접 눌러도 됩니다.</p>
 
   <div class="demo up d2">
     <div class="win">
@@ -317,9 +335,11 @@ footer .links{display:flex;flex-wrap:wrap;gap:6px 18px;margin-top:12px}
       <div class="meter">
         <span>수신</span><span class="tr"><i id="rxbar"></i></span><em><span id="rx">0</span> B</em>
         <span>표시</span><span class="tr"><i class="sh" id="shbar"></i></span><em><span id="shown">0</span> B</em>
+        <span>컨텍스트</span><span class="tr"><i class="ctx" id="ctxbar"></i></span><em id="ctxtxt">192k / 256k</em>
       </div>
       <div class="stat">
         <span class="lag" id="lag">밀린 양 0 B</span>
+        <span class="cstat" id="cstat">컴팩션 전 (기준 256k)</span>
         <span class="state" id="state">생성 중</span>
       </div>
     </div>
@@ -327,12 +347,13 @@ footer .links{display:flex;flex-wrap:wrap;gap:6px 18px;margin-top:12px}
     <div class="win">
       <div class="bar"><i></i><i></i><i></i><b>agy-cli-patch</b></div>
       <div class="sw" id="sw">
-        <div class="hd">적용할 패치를 고르세요 <span id="cnt">0/5 선택</span></div>
+        <div class="hd">적용할 패치를 고르세요 <span id="cnt">0/6 선택</span></div>
         <button class="row" role="switch" aria-checked="false" data-k="nodrip"><span class="pt">❯</span><span class="ck">○</span><span class="id">nodrip</span><span class="ds">16ms마다 12바이트씩 끊어 찍는 타자기 효과를 끄고 수신 즉시 반영</span></button>
         <button class="row" role="switch" aria-checked="false" data-k="batch"><span class="pt">❯</span><span class="ck">○</span><span class="id">batch</span><span class="ds">생성 중에는 본문을 숨겼다가 완료(DONE)되면 한 번에 출력</span></button>
         <button class="row" role="switch" aria-checked="false" data-k="heading"><span class="pt">❯</span><span class="ck">○</span><span class="id">heading</span><span class="ds">제목 앞의 '## ' 기호를 숨기고 색·볼드만 유지</span></button>
         <button class="row" role="switch" aria-checked="false" data-k="cjk"><span class="pt">❯</span><span class="ck">○</span><span class="id">cjk-bold</span><span class="ds">구두점 뒤에 한글 조사가 붙어도 볼드 유지</span></button>
         <button class="row" role="switch" aria-checked="false" data-k="tilde"><span class="pt">❯</span><span class="ck">○</span><span class="id">tilde-strike</span><span class="ds">'~' 하나는 그대로 두고 '~~'만 취소선</span></button>
+        <button class="row" role="switch" aria-checked="false" data-k="compact"><span class="pt">❯</span><span class="ck">○</span><span class="idrow"><span class="id">compact</span><span class="subtok" id="herotok">[180k]</span><span class="tokctl"><span role="button" tabindex="0" class="tokbtn" data-d="-10000" aria-label="10k 감소">−</span><span role="button" tabindex="0" class="tokbtn" data-d="10000" aria-label="10k 증가">+</span></span></span><span class="ds">자동 컴팩션(CHECKPOINT) 발동 한도를 256k에서 원하는 수치로 조절</span></button>
         <div class="flash" id="flash" role="status"></div>
         <div class="acts">
           <button class="btn" id="auto">자동 시연</button>
@@ -342,7 +363,7 @@ footer .links{display:flex;flex-wrap:wrap;gap:6px 18px;margin-top:12px}
       </div>
     </div>
   </div>
-  <p class="note">그림으로 흉내 낸 시연입니다. 타자기 효과는 실제 속도(16ms마다 12바이트)의 ¼배속으로 재생하고, 수신 속도는 임의로 정한 값입니다. 배경의 바이트는 <code>nodrip</code> 패치가 실제로 바꾸는 x86_64 바이트입니다.</p>
+  <p class="note">그림으로 흉내 낸 시연입니다. 타자기 효과는 실제 속도(16ms마다 12바이트)의 ¼배속으로 재생하며, <code>compact</code>의 컨텍스트 압축 수치(192k → 15k)는 <code>CHECKPOINT</code> 동작을 바탕으로 한 예시입니다. 배경의 바이트는 <code>nodrip</code> 패치가 실제로 바꾸는 x86_64 바이트입니다.</p>
 </div>
 </div>
 </div>
@@ -363,8 +384,8 @@ footer .links{display:flex;flex-wrap:wrap;gap:6px 18px;margin-top:12px}
       <button class="mini" data-on="0" aria-label="cjk-bold 패치 전후 보기"><span class="lab"><i></i></span><span class="c"><span class="px">**</span><span class="bd">"문구"</span><span class="px">**</span>라는 표현</span></button></div>
     <div class="p glow"><div class="id">tilde-strike</div><div><div class="d"><code>1.5.0~1.5.6</code>, <code>H2~H6</code> 같은 범위 표기의 물결표 하나에 취소선이 그어지지 않게 합니다. <code>~~</code> 두 개만 취소선입니다.</div><div class="sym">goldmark/extension.(*strikethroughParser).Parse</div></div>
       <button class="mini" data-on="0" aria-label="tilde-strike 패치 전후 보기"><span class="lab"><i></i></span><span class="c">1.5.0<span class="tl">~</span><span class="sk">1.5.6, H2</span><span class="tl">~</span>H6</span></button></div>
-    <div class="p glow"><div class="id">compact</div><div><div class="d">내장 자동 컴팩션(CHECKPOINT) 발동 기준(기본 <code>256k</code>)을 <code>--compact 180k</code>처럼 원하는 토큰 수(<code>32k~1000k</code>)로 바꿉니다.<span class="tag">x86_64 전용</span><span class="tag">기본 꺼짐</span></div><div class="sym">utils.GetCheckpointConfig · config.applyFeatureProviderCheckpointOverrideConfig</div></div>
-      <button class="mini" data-on="0" aria-label="compact 패치 전후 보기"><span class="lab"><i></i></span><span class="c">CHECKPOINT <span class="px" style="color:var(--fg)">256k</span><span class="add">180k</span></span></button></div>
+    <div class="p glow"><div class="id">compact</div><div><div class="d">내장 자동 컴팩션(CHECKPOINT) 발동 기준(기본 <code>256k</code>)을 <code>--compact 180k</code>나 <code>-p all,compact=160k</code>처럼 원하는 토큰 수(<code>32k~1000k</code>)로 바꾸고 서버 플래그 덮어쓰기를 막습니다.<span class="tag">x86_64 전용</span><span class="tag">기본 꺼짐</span></div><div class="sym">utils.GetCheckpointConfig · config.applyFeatureProviderCheckpointOverrideConfig</div></div>
+      <button class="mini" data-on="0" aria-label="compact 패치 전후 보기"><span class="lab"><i></i></span><span class="c"><span class="c-before">192k / 256k · 압축 대기</span><span class="c-after">192k ≥ 180k<b> → CHECKPOINT (15k)</b></span></span></button></div>
     <div class="p glow"><div class="id">banner</div><div><div class="d">상단 <code>Antigravity CLI 1.5.7</code> 옆에 <code>(patch v0.2.2)</code> 형태로 패치 버전을 표시합니다.<span class="tag">x86_64 전용</span></div><div class="sym">render.BannerWithInfo</div></div>
       <button class="mini" data-on="0" aria-label="banner 패치 전후 보기"><span class="lab"><i></i></span><span class="c">Antigravity CLI 1.5.7<span class="add"> (patch v0.2.2)</span></span></button></div>
     <div class="p glow"><div class="id">release-notes</div><div><div class="d">로고 아래에 패치 기능 요약과 저장소 정보를 표시합니다. <code>-p all,release-notes</code>처럼 명시해야 적용됩니다.<span class="tag">x86_64 전용</span><span class="tag">기본 꺼짐</span></div><div class="sym">render.BuildHeader</div></div>
@@ -375,7 +396,7 @@ footer .links{display:flex;flex-wrap:wrap;gap:6px 18px;margin-top:12px}
 <section id="how">
   <div class="kicker rv">주소가 아니라 이름으로</div>
   <h2 class="rv">릴리즈마다 바뀌는 주소에 기대지 않습니다</h2>
-  <p class="sub rv">agy는 Go 바이너리라 함수 이름표(<code>.gopclntab</code>)를 품고 있습니다. 패처는 그 표에서 대상 함수를 찾고, 그 자리의 기계어가 아는 모양일 때만 손댑니다. 아래는 <code>nodrip</code> 한 건이 지나가는 길입니다.</p>
+  <p class="sub rv">agy는 Go 바이너리라 함수 이름표(<code>.gopclntab</code>)를 품고 있습니다. 패처는 그 표에서 대상 함수를 찾고, 그 자리의 기계어가 아는 모양일 때만 손댑니다. 아래는 <code>nodrip</code>과 <code>compact</code>가 실제로 지나가는 길입니다.</p>
   <div class="flow rv" id="flow">
     <div class="st glow"><h3>매핑</h3><p><code>mmap</code> 제로카피로 바이너리를 엽니다. ELF64(Linux)와 Mach-O 64(macOS)를 읽습니다.</p></div>
     <div class="st glow"><h3>심볼 찾기</h3><p>텍스트 섹션과 Go <code>.gopclntab</code> 심볼 테이블을 파싱해 대상 함수의 위치를 얻습니다.</p></div>
@@ -384,8 +405,9 @@ footer .links{display:flex;flex-wrap:wrap;gap:6px 18px;margin-top:12px}
   </div>
   <div class="stage rv" id="stage">
     <div class="ctl">
-      <button class="btn" data-arch="x86" aria-pressed="true">x86_64</button>
-      <button class="btn" data-arch="arm" aria-pressed="false">ARM64</button>
+      <button class="btn" data-arch="x86" aria-pressed="true">nodrip · x86_64</button>
+      <button class="btn" data-arch="arm" aria-pressed="false">nodrip · ARM64</button>
+      <button class="btn" data-arch="compact" aria-pressed="false">compact · x86_64</button>
       <span class="sp"></span>
       <button class="btn" id="mis" aria-pressed="false">시그니처가 다르면?</button>
       <button class="btn" id="scanAgain">다시 보기</button>
@@ -405,7 +427,7 @@ footer .links{display:flex;flex-wrap:wrap;gap:6px 18px;margin-top:12px}
       </div>
     </div>
   </div>
-  <p class="note">바이트 값은 <code>src/main.rs</code>의 시그니처 그대로이고, <code>0xa4720c0</code>은 agy 1.5.7(Linux x86_64)에서 패처가 실제로 찾은 위치입니다. 버전이 바뀌면 이 숫자도 바뀝니다. 외부 크레이트 의존성 0 — Rust 툴체인만 있으면 인터넷 없이 빌드됩니다.</p>
+  <p class="note">바이트 값은 <code>src/main.rs</code>의 시그니처 그대로이고, <code>0xa4720c0</code>·<code>0x84f5e02</code>는 agy 1.5.7(Linux x86_64)에서 패처가 실제로 찾은 위치입니다. 버전이 바뀌면 이 숫자도 바뀝니다. 외부 크레이트 의존성 0 — Rust 툴체인만 있으면 인터넷 없이 빌드됩니다.</p>
 </section>
 
 <section id="wizard">
@@ -421,11 +443,13 @@ footer .links{display:flex;flex-wrap:wrap;gap:6px 18px;margin-top:12px}
 
 <section id="care">
   <div class="kicker rv">알아 둘 것</div>
-  <h2 class="rv">agy가 스스로 업데이트하면 패치가 풀립니다</h2>
-  <p class="sub rv">agy는 실행할 때마다 새 버전을 확인하고, 있으면 설치된 <code>antigravity</code> 바이너리를 직접 교체합니다.</p>
+  <h2 class="rv">자동 컴팩션과 자체 업데이트</h2>
+  <p class="sub rv">컴팩션 임계값 설계 기준과 <code>antigravity</code> 바이너리의 자동 업데이트 동작을 확인하세요.</p>
   <div class="care">
-    <div class="glow rv"><h3>in-place 패치는 다시 적용</h3><p><code>agy-cli-patch -p all --in-place</code>를 다시 실행하면 됩니다. 원본은 <code>antigravity.orig</code>로 백업되고 <code>--restore</code>로 되돌립니다.</p></div>
-    <div class="glow rv" style="--d:.08s"><h3>자체 업데이트 끄기</h3><p><code>export AGY_CLI_DISABLE_AUTO_UPDATE=true</code> — 값은 반드시 <code>true</code>여야 합니다(<code>1</code>은 적용되지 않음).</p></div>
+    <div class="glow rv"><h3>왜 256k 대신 180k인가요?</h3><p>agy의 기본 자동 컴팩션(<code>CHECKPOINT</code>)은 <code>256k</code>에서야 동작하지만, <code>200k</code>를 넘기면 토큰 단가 상승과 응답 지연이 먼저 옵니다. <code>150k~180k</code>로 낮춰 두면 그 전에 대화를 자동 요약해 세션을 가볍게 이어 갑니다.</p></div>
+    <div class="glow rv" style="--d:.04s"><h3>작은 모델 보호 · 서버 덮어쓰기 차단</h3><p>지정한 값보다 컨텍스트 창이 작은 모델은 내장 클램프 로직이 그대로 한도를 낮춰 보호하며, 서버 <code>FeatureProvider</code> 플래그가 로컬 임계값을 덮어쓰지 못하도록 함께 패치합니다.</p></div>
+    <div class="glow rv" style="--d:.08s"><h3>in-place 패치는 다시 적용</h3><p>agy가 자체 업데이트하면 <code>agy-cli-patch -p all --compact 180k --in-place</code>를 다시 실행하면 됩니다. 원본은 <code>antigravity.orig</code>로 백업되고 <code>--restore</code>로 되돌립니다.</p></div>
+    <div class="glow rv" style="--d:.12s"><h3>자체 업데이트 끄기</h3><p><code>export AGY_CLI_DISABLE_AUTO_UPDATE=true</code> — 값은 반드시 <code>true</code>여야 합니다(<code>1</code>은 적용되지 않음).</p></div>
   </div>
   <p class="note">링크 덮어쓰기 규칙, remote-control 데몬 등 나머지 주의 사항은 <a href="https://github.com/KyongSik-Yoon/agy-cli-patch#주의-사항">README</a>에 있습니다.</p>
 </section>
@@ -449,6 +473,10 @@ agy-cli-patch -p all -o agy-batch
 
 <span class="c"># 기본 패치 + 자동 컴팩션 180k 임계값 적용 (32k~1000k)</span>
 agy-cli-patch -p all --compact 180k -o agy-batch
+
+<span class="c"># 인라인 값 지정 / 프리셋 2종(agy-batch, agy-nodrip) 동시 적용</span>
+agy-cli-patch -p all,compact=160k -o agy-batch
+agy-cli-patch --preset --compact 180k
 
 <span class="c"># 마크다운 패치 3종만 적용해 agy-md 생성</span>
 agy-cli-patch -p heading,cjk-bold,tilde-strike -o agy-md</pre></div>
@@ -559,8 +587,10 @@ part('hero', function(){
   var TOTAL = cum[cum.length - 1];
   function cut(bytes){ var i = 0; while (i < chars.length && cum[i + 1] <= bytes) i++; return {text: chars.slice(0, i).join(''), bytes: cum[i]}; }
 
-  var KEYS = ['nodrip', 'batch', 'heading', 'cjk', 'tilde'];
-  var on = {nodrip: false, batch: false, heading: false, cjk: false, tilde: false};
+  var KEYS = ['nodrip', 'batch', 'heading', 'cjk', 'tilde', 'compact'];
+  var on = {nodrip: false, batch: false, heading: false, cjk: false, tilde: false, compact: false};
+  var CTX_RAW = 192000, CTX_COMPACT = 15000, compactTok = 180000;
+  function fmtK(t){ return t % 1000 === 0 ? (t / 1000) + 'k' : String(t); }
   var term = $('term'), rows = Array.prototype.slice.call(document.querySelectorAll('#sw button.row'));
   function rowOf(k){ return rows.filter(function(b){ return b.dataset.k === k; })[0]; }
 
@@ -619,6 +649,23 @@ part('hero', function(){
   var timer = null, rx = 0, drip = 0, t0 = 0, finished = false, wasEmpty = false;
   var RX_RATE = 420;          // 수신 속도(B/s) — 시연용으로 정한 값
   var DRIP_RATE = 12 / 0.064; // 12바이트 / 16ms 를 ¼배속으로
+  function paintCtx(fx){
+    var limit = on.compact ? compactTok : 256000;
+    var triggered = on.compact && CTX_RAW >= compactTok;
+    var cur = triggered ? CTX_COMPACT : CTX_RAW;
+    var pct = Math.min(100, cur / limit * 100);
+    var bar = $('ctxbar'), cstat = $('cstat');
+    bar.style.width = pct + '%';
+    bar.className = 'ctx' + (triggered ? ' cp' : '');
+    $('ctxtxt').textContent = fmtK(cur) + ' / ' + fmtK(limit);
+    cstat.className = 'cstat' + (triggered ? ' cp' : '');
+    cstat.textContent = triggered ? '✓ CHECKPOINT ' + fmtK(CTX_RAW) + '→' + fmtK(CTX_COMPACT) : '컴팩션 전 (기준 ' + fmtK(limit) + ')';
+    var cls = 'ctxline' + (triggered ? ' cp' : '') + (fx === 'compact' ? ' fx' : '');
+    var msg = triggered
+      ? '◈ CHECKPOINT (≥' + fmtK(compactTok) + ') — 대화를 ' + fmtK(CTX_RAW) + ' → ' + fmtK(CTX_COMPACT) + ' 토큰으로 자동 요약'
+      : '◇ context ' + fmtK(CTX_RAW) + ' / ' + fmtK(limit) + ' — 자동 컴팩션 대기';
+    return '<div class="' + cls + '">' + msg + '</div>';
+  }
   function paint(fx){
     var done = rx >= TOTAL, shownBytes;
     if (on.batch) shownBytes = done ? TOTAL : 0;
@@ -628,7 +675,7 @@ part('hero', function(){
     finished = done && c.bytes >= TOTAL;
     term.classList.toggle('pop', on.batch && finished && wasEmpty);
     wasEmpty = c.bytes === 0;
-    term.innerHTML = render(c.text, !finished && !on.batch, fx);
+    term.innerHTML = paintCtx(fx) + render(c.text, !finished && !on.batch, fx);
     $('rx').textContent = r; $('shown').textContent = c.bytes;
     $('rxbar').style.width = (r / TOTAL * 100) + '%'; $('shbar').style.width = (c.bytes / TOTAL * 100) + '%';
     var lag = $('lag'); lag.textContent = '밀린 양 ' + (r - c.bytes) + ' B'; lag.classList.toggle('hot', r - c.bytes > 0);
@@ -655,8 +702,16 @@ part('hero', function(){
       b.setAttribute('aria-checked', v ? 'true' : 'false');
       b.querySelector('.ck').textContent = v ? '◉' : '○';
     });
-    $('cnt').textContent = n + '/5 선택';
-    $('all').textContent = n === 5 ? '모두 끄기' : '모두 켜기';
+    $('herotok').textContent = '[' + fmtK(compactTok) + ']';
+    $('cnt').textContent = n + '/' + KEYS.length + ' 선택';
+    $('all').textContent = n === KEYS.length ? '모두 끄기' : '모두 켜기';
+  }
+  function adjustHeroTok(delta){
+    stopAuto();
+    compactTok = Math.max(32000, Math.min(1000000, compactTok + delta));
+    on.compact = true;
+    $('flash').textContent = '컴팩션 임계값: ' + fmtK(compactTok) + ' (' + compactTok + ' 토큰)';
+    sync(); paint('compact');
   }
   function toggle(k){
     on[k] = !on[k]; $('flash').textContent = '';
@@ -676,8 +731,8 @@ part('hero', function(){
   function autopilot(){
     stopAuto(); var tok = autoTok, live = function(){ return tok === autoTok; };
     $('auto').textContent = '자동 시연 중'; $('auto').setAttribute('aria-pressed', 'true');
-    KEYS.forEach(function(k){ on[k] = false; }); $('flash').textContent = ''; sync(); play();
-    var seq = ['heading', 'cjk', 'tilde', 'nodrip', 'batch'], p = until(function(){ return finished || !live(); });
+    KEYS.forEach(function(k){ on[k] = false; }); compactTok = 180000; $('flash').textContent = ''; sync(); play();
+    var seq = ['heading', 'cjk', 'tilde', 'compact', 'nodrip', 'batch'], p = until(function(){ return finished || !live(); });
     seq.forEach(function(k){
       p = p.then(function(){ return live() && sleep(1000); })
         .then(function(){ if (live()) rowOf(k).classList.add('cur'); return live() && sleep(700); })
@@ -686,6 +741,10 @@ part('hero', function(){
     });
     p.then(function(){ if (live()) stopAuto(); });
   }
+  document.querySelectorAll('#sw .tokbtn').forEach(function(b){
+    b.addEventListener('click', function(e){ e.stopPropagation(); adjustHeroTok(+b.dataset.d); });
+    b.addEventListener('keydown', function(e){ if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); adjustHeroTok(+b.dataset.d); } });
+  });
   rows.forEach(function(b){ b.addEventListener('click', function(){ stopAuto(); toggle(b.dataset.k); }); });
   $('replay').addEventListener('click', function(){ stopAuto(); play(); });
   $('all').addEventListener('click', function(){
@@ -718,14 +777,16 @@ part('minis', function(){
 /* ── 원리: 이름으로 찾고, 대조하고, 쓴다 ──────────────────── */
 part('scan', function(){
   var SYMS = ['render.BuildHeader', 'render.BannerWithInfo', 'render.glamourStyleForScheme', 'goldmark/parser.ScanDelimiter', 'store.cutAtRuneBoundary', 'render.renderPlannerBody', 'goldmark/extension.(*strikethroughParser).Parse', 'utils.GetCheckpointConfig'];
-  var TARGET = 4;
   var A = {
-    x86: {old: ['55', '48', '89', 'e5'], neu: ['48', '89', 'd8', 'c3'], at: '0xa4720c0', atNote: ' <span>(agy 1.5.7 · Linux x86_64)</span>',
+    x86: {target: 4, old: ['55', '48', '89', 'e5'], neu: ['48', '89', 'd8', 'c3'], at: '0xa4720c0', atNote: ' <span>(agy 1.5.7 · Linux x86_64)</span>',
           asmOld: '<b>push rbp</b> · <b>mov rbp, rsp</b>', asmNew: '<b>mov rax, rbx</b> · <b>ret</b> — 받은 값을 자르지 않고 바로 돌려줍니다',
           err: 'cutAtRuneBoundary x86_64 프롤로그 불일치 (@0xa4720c0)'},
-    arm: {old: ['90', '0b', '40', 'f9', 'ff', '63', '30', 'eb'], neu: ['e0', '03', '01', 'aa', 'c0', '03', '5f', 'd6'], at: '', atNote: '',
+    arm: {target: 4, old: ['90', '0b', '40', 'f9', 'ff', '63', '30', 'eb'], neu: ['e0', '03', '01', 'aa', 'c0', '03', '5f', 'd6'], at: '', atNote: '',
           asmOld: '', asmNew: '<b>mov x0, x1</b> · <b>ret</b> — 받은 값을 자르지 않고 바로 돌려줍니다',
-          err: 'cutAtRuneBoundary ARM64 프롤로그 불일치 (@0x…)'}
+          err: 'cutAtRuneBoundary ARM64 프롤로그 불일치 (@0x…)'},
+    compact: {target: 7, old: ['81', 'fa', '00', 'e8', '03', '00'], neu: ['81', 'fa', '20', 'bf', '02', '00'], at: '0x84f5e02', atNote: ' <span>(GetCheckpointConfig 상한 비교 · agy 1.5.7)</span>',
+          asmOld: '<b>cmp edx, 256000</b> (<code>0x0003e800</code>)', asmNew: '<b>cmp edx, 180000</b> (<code>0x0002bf20</code>) · 오버라이드 분기 <b>nop</b> 처리',
+          err: 'GetCheckpointConfig 상한 패턴 매칭 실패 (매칭 수: 0)', changed: 4}
   };
   var stage = $('stage'), flow = $('flow'), cards = flow.querySelectorAll('.st'), syms = $('syms');
   var arch = 'x86', mis = false, gen = 0, started = false;
@@ -748,12 +809,12 @@ part('scan', function(){
     stage.className = 'stage rv in';
     var p = w(60).then(function(){ if (ok()) setStep(0); return w(1100); })
       .then(function(){ if (ok()) setStep(1); return w(350); });
-    for (var s = 0; s <= TARGET; s++) (function(s){
+    for (var s = 0; s <= a.target; s++) (function(s){
       p = p.then(function(){
         if (!ok()) return;
         if (s > 0) symEls[s - 1].className = '';
-        symEls[s].className = s === TARGET ? 'hit' : 'scan';
-        return w(s === TARGET ? 500 : 190);
+        symEls[s].className = s === a.target ? 'hit' : 'scan';
+        return w(s === a.target ? 500 : 160);
       });
     })(s);
     p = p.then(function(){
@@ -787,6 +848,7 @@ part('scan', function(){
       return w(900);
     }).then(function(){ if (ok()) setStep(3); return w(300); });
     a.neu.forEach(function(b, i){
+      if (b === a.old[i]) return;
       p = p.then(function(){
         if (!ok()) return;
         var c = $('brow').querySelectorAll('.cell')[i];
@@ -798,8 +860,8 @@ part('scan', function(){
     p.then(function(){
       if (!ok()) return;
       $('asm').innerHTML = a.asmNew;
-      $('verdict').textContent = '✓ ' + a.neu.length + '바이트를 바꿔 썼습니다';
-      $('chipL').className = 'on'; $('chipM').className = 'on';
+      $('verdict').textContent = '✓ ' + (a.changed || a.neu.length) + '바이트를 바꿔 썼습니다';
+      $('chipL').className = 'on'; if (arch !== 'compact') $('chipM').className = 'on';
       for (var i = 0; i < 4; i++) cards[i].className = 'st glow done';
     }).catch(function(e){ if (e !== 'stop') console.error(e); });
   }
@@ -863,8 +925,9 @@ part('wizard', function(){
       if (W.editTok) {
         if (k === 'Esc') W.editTok = false;
         else if (k === 'Enter') {
-          var v = parseTok(W.tokBuf.join(''));
-          if (v === null) W.flash = ['er', '컴팩션 토큰 임계값은 32k~1000k (32000~1000000) 범위여야 합니다'];
+          var rawTok = W.tokBuf.join('');
+          var v = parseTok(rawTok);
+          if (v === null) W.flash = ['er', "컴팩션 토큰 임계값은 32k~1000k (32000~1000000) 범위여야 합니다: '" + rawTok + "' (예: 180k, 180000)"];
           else { W.tokens = v; W.editTok = false; W.sel[CI] = true; W.flash = ['ok', '컴팩션 임계값이 ' + fmtTok(v) + ' (' + v + ' 토큰)으로 설정되었습니다.']; }
         }
         else if (k === 'Left') W.tokPos = Math.max(0, W.tokPos - 1);
@@ -946,7 +1009,7 @@ part('wizard', function(){
         var c = i === W.cursor, extra = '';
         if (p.id === 'compact') {
           if (W.editTok) extra = sp('dim', '  [') + '<span class="ab">' + esc(W.tokBuf.slice(0, W.tokPos).join('')) + '<span class="car">' + esc(W.tokBuf[W.tokPos] || ' ').replace(' ', '&nbsp;') + '</span>' + esc(W.tokBuf.slice(W.tokPos + 1).join('')) + '</span>' + sp('dim', ']');
-          else extra = sp(W.sel[i] ? 'acc' : 'dim', '  [' + fmtTok(W.tokens) + ']');
+          else extra = '<span class="' + (W.sel[i] ? 'acc' : 'dim') + '" data-edit-tok="1" title="눌러서 수치 직접 입력">  [' + fmtTok(W.tokens) + ']</span>';
         }
         h += ln('<span class="ptr ab">' + (c ? '❯' : '') + '</span>' + sp(W.sel[i] ? 'ok' : 'dim', W.sel[i] ? '◉' : '○') + sp((c ? 'ab' : 'acc') + ' idc', p.id) + sp(c ? 'b' : '', p.t) + extra, 'row', ' data-i="' + i + '"');
       });
@@ -1019,8 +1082,9 @@ part('wizard', function(){
   wz.addEventListener('focus', function(){ wz.classList.add('foc'); $('wzhint').textContent = '키보드 조작 중'; });
   wz.addEventListener('blur', function(){ wz.classList.remove('foc'); $('wzhint').textContent = '눌러서 키보드로 조작'; });
   tui.addEventListener('click', function(e){
-    var b = e.target.closest('[data-key]'), r = e.target.closest('[data-i]'), c = e.target.closest('[data-c]');
-    if (b) { if (b.dataset.key === 'Restart') { reset(); draw(); } else key(b.dataset.key); }
+    var et = e.target.closest('[data-edit-tok]'), b = e.target.closest('[data-key]'), r = e.target.closest('[data-i]'), c = e.target.closest('[data-c]');
+    if (et && W.mode === 'tui') { W.flash = null; W.step = 0; W.cursor = CI; W.tokBuf = Array.from(fmtTok(W.tokens)); W.tokPos = W.tokBuf.length; W.editTok = true; draw(); }
+    else if (b) { if (b.dataset.key === 'Restart') { reset(); draw(); } else key(b.dataset.key); }
     else if (r && W.mode === 'tui') { W.flash = null; W.cursor = +r.dataset.i; toggle(W.cursor); draw(); }
     else if (c && W.mode === 'tui') { W.choice = +c.dataset.c; draw(); }
     wz.focus({preventScroll: true});
