@@ -350,7 +350,7 @@ footer .links{display:flex;flex-wrap:wrap;gap:6px 18px;margin-top:12px}
 <div class="wrap">
 <section id="patches">
   <div class="kicker rv">--list</div>
-  <h2 class="rv">패치 일곱 가지, 골라서 적용</h2>
+  <h2 class="rv">패치 여덟 가지, 골라서 적용</h2>
   <p class="sub rv">필요한 것만 조합해 새 실행 파일로 만들거나, 기본 agy에 바로 덮어씁니다. 오른쪽 칸은 패치 전후를 번갈아 보여 주고, 누르면 그 상태로 멈춥니다.</p>
   <div class="plist rv">
     <div class="p glow"><div class="id">nodrip</div><div><div class="d">16ms마다 12바이트씩 끊어 찍는 타자기 딜레이를 없애고 수신 즉시 반영합니다.</div><div class="sym">store.cutAtRuneBoundary</div></div>
@@ -363,6 +363,8 @@ footer .links{display:flex;flex-wrap:wrap;gap:6px 18px;margin-top:12px}
       <button class="mini" data-on="0" aria-label="cjk-bold 패치 전후 보기"><span class="lab"><i></i></span><span class="c"><span class="px">**</span><span class="bd">"문구"</span><span class="px">**</span>라는 표현</span></button></div>
     <div class="p glow"><div class="id">tilde-strike</div><div><div class="d"><code>1.5.0~1.5.6</code>, <code>H2~H6</code> 같은 범위 표기의 물결표 하나에 취소선이 그어지지 않게 합니다. <code>~~</code> 두 개만 취소선입니다.</div><div class="sym">goldmark/extension.(*strikethroughParser).Parse</div></div>
       <button class="mini" data-on="0" aria-label="tilde-strike 패치 전후 보기"><span class="lab"><i></i></span><span class="c">1.5.0<span class="tl">~</span><span class="sk">1.5.6, H2</span><span class="tl">~</span>H6</span></button></div>
+    <div class="p glow"><div class="id">compact</div><div><div class="d">내장 자동 컴팩션(CHECKPOINT) 발동 기준(기본 <code>256k</code>)을 <code>--compact 180k</code>처럼 원하는 토큰 수(<code>32k~1000k</code>)로 바꿉니다.<span class="tag">x86_64 전용</span><span class="tag">기본 꺼짐</span></div><div class="sym">utils.GetCheckpointConfig</div></div>
+      <button class="mini" data-on="0" aria-label="compact 패치 전후 보기"><span class="lab"><i></i></span><span class="c"><span class="px">256k </span><span class="add">180k</span> limit</span></button></div>
     <div class="p glow"><div class="id">banner</div><div><div class="d">상단 <code>Antigravity CLI 1.5.7</code> 옆에 <code>(patch v0.2.1)</code> 형태로 패치 버전을 표시합니다.<span class="tag">x86_64 전용</span></div><div class="sym">render.BannerWithInfo</div></div>
       <button class="mini" data-on="0" aria-label="banner 패치 전후 보기"><span class="lab"><i></i></span><span class="c">Antigravity CLI 1.5.7<span class="add"> (patch v0.2.1)</span></span></button></div>
     <div class="p glow"><div class="id">release-notes</div><div><div class="d">로고 아래에 패치 기능 요약과 저장소 정보를 표시합니다. <code>-p all,release-notes</code>처럼 명시해야 적용됩니다.<span class="tag">x86_64 전용</span><span class="tag">기본 꺼짐</span></div><div class="sym">render.BuildHeader</div></div>
@@ -444,6 +446,9 @@ agy-cli-patch
 
 <span class="c"># 기본 활성 패치 전체를 적용해 agy-batch 생성</span>
 agy-cli-patch -p all -o agy-batch
+
+<span class="c"># 기본 패치 + 자동 컴팩션 180k 임계값 적용</span>
+agy-cli-patch -p all --compact 180k -o agy-batch
 
 <span class="c"># 마크다운 패치 3종만 적용해 agy-md 생성</span>
 agy-cli-patch -p heading,cjk-bold,tilde-strike -o agy-md</pre></div>
@@ -712,7 +717,7 @@ part('minis', function(){
 
 /* ── 원리: 이름으로 찾고, 대조하고, 쓴다 ──────────────────── */
 part('scan', function(){
-  var SYMS = ['render.BuildHeader', 'render.BannerWithInfo', 'render.glamourStyleForScheme', 'goldmark/parser.ScanDelimiter', 'store.cutAtRuneBoundary', 'render.renderPlannerBody', 'goldmark/extension.(*strikethroughParser).Parse'];
+  var SYMS = ['render.BuildHeader', 'render.BannerWithInfo', 'render.glamourStyleForScheme', 'goldmark/parser.ScanDelimiter', 'store.cutAtRuneBoundary', 'render.renderPlannerBody', 'goldmark/extension.(*strikethroughParser).Parse', 'utils.GetCheckpointConfig'];
   var TARGET = 4;
   var A = {
     x86: {old: ['55', '48', '89', 'e5'], neu: ['48', '89', 'd8', 'c3'], at: '0xa4720c0', atNote: ' <span>(agy 1.5.7 · Linux x86_64)</span>',
@@ -818,13 +823,25 @@ part('wizard', function(){
     {id: 'heading', t: "마크다운 헤딩 '##' 기호 숨김 (Clean Headings)", d: "H2~H6 제목 앞에 붙는 '## '~'###### ' 프리픽스를 제거하고 스타일만 유지", s: 'render.glamourStyleForScheme', def: true, off: '0xa31fbf6, 0xa31fc11, 0xa31fc2c, 0xa31fc47, 0xa31fc62'},
     {id: 'cjk-bold', t: '구두점 뒤 한글 조사 볼드(**) 깨짐 수정 (CJK Bold Fix)', d: '**"문구"**라는, **용어(`code`)**는 처럼 뒤에 한글 조사가 붙어도 볼드 유지', s: 'goldmark/parser.ScanDelimiter', def: true, off: '0xa1b9c91, 0xa1b9cc3'},
     {id: 'tilde-strike', t: '단일 물결표(~) 취소선 오작동 방지 (Double-Tilde Strikethrough)', d: "1.5.0~1.5.6 같은 범위 표기용 단일 '~'에 취소선이 그어지지 않도록 '~~'만 허용", s: 'goldmark/extension.(*strikethroughParser).Parse', def: true, off: '0xa1d5015'},
+    {id: 'compact', t: '자동 컴팩션 토큰 임계값 변경 (Auto-Compact Limit)', d: '내장 자동 컴팩션(CHECKPOINT) 발동 기준(기본 256k)을 원하는 토큰 수(기본 180k, 32k~1000k)로 변경 (기본 꺼짐)', s: 'utils.GetCheckpointConfig', def: false, off: '0x86858d8, 0x84f5e04, 0x84f5e09, 0x84f617d'},
     {id: 'banner', t: '제품명 옆 패치 버전 표시 (Patch Version Tag)', d: "상단 'Antigravity CLI 1.5.7' 옆에 '(patch v0.2.1)' 형태로 패치 버전 표시", s: 'render.BannerWithInfo', def: true, off: '0xa8a4287, 0xa326f90'},
     {id: 'release-notes', t: '상단 배너 릴리즈 노트 표시 (Release Notes)', d: '로고 아래에 패치 기능 요약 및 GitHub 정보 표시 (기본 꺼짐, -p 로 명시해야 적용)', s: 'render.BuildHeader', def: false, off: '0xa8a42c7, 0xa8a4520, 0xa318180'}
   ];
-  var N = P.length, B = 1, ND = 0;
+  var N = P.length, B = 1, ND = 0, CI = 5;
   var DIR = '~/.local/share/mise/installs/agy/1.5.7', ADIR = '/home/user/.local/share/mise/installs/agy/1.5.7', ABIN = '/home/user/.local/bin';
   var wz = $('wz'), tui = $('tui'), W, logTok = 0;
-  function reset(){ W = {mode: 'tui', step: 0, cursor: 0, sel: P.map(function(p){ return p.def; }), choice: 0, name: [], pos: 0, edited: false, flash: null}; }
+  function fmtTok(t){ return t % 1000 === 0 ? (t / 1000) + 'k' : String(t); }
+  function parseTok(raw){
+    var s = String(raw || '').trim().replace(/[,_]/g, '');
+    if (!s) return null;
+    var mul = 1;
+    if (/[kK]$/.test(s)) { mul = 1000; s = s.slice(0, -1); }
+    else if (/[mM]$/.test(s)) { mul = 1000000; s = s.slice(0, -1); }
+    if (!/^\d+$/.test(s)) return null;
+    var v = Number(s) * mul;
+    return (v >= 32000 && v <= 1000000) ? v : null;
+  }
+  function reset(){ W = {mode: 'tui', step: 0, cursor: 0, sel: P.map(function(p){ return p.def; }), choice: 0, name: [], pos: 0, edited: false, flash: null, tokens: 180000, editTok: false, tokBuf: [], tokPos: 0}; }
   function chosen(){ return P.filter(function(p, i){ return W.sel[i]; }); }
   function nameStr(){ return W.name.join('').trim(); }
   function plan(){
@@ -843,6 +860,24 @@ part('wizard', function(){
     if (k === 'CtrlC') { cancel(); return true; }
     W.flash = null;
     if (W.step === 0) {
+      if (W.editTok) {
+        if (k === 'Esc') W.editTok = false;
+        else if (k === 'Enter') {
+          var v = parseTok(W.tokBuf.join(''));
+          if (v === null) W.flash = ['er', '컴팩션 토큰 임계값은 32k~1000k (32000~1000000) 범위여야 합니다'];
+          else { W.tokens = v; W.editTok = false; W.sel[CI] = true; W.flash = ['ok', '컴팩션 임계값이 ' + fmtTok(v) + ' (' + v + ' 토큰)으로 설정되었습니다.']; }
+        }
+        else if (k === 'Left') W.tokPos = Math.max(0, W.tokPos - 1);
+        else if (k === 'Right') W.tokPos = Math.min(W.tokBuf.length, W.tokPos + 1);
+        else if (k === 'Home') W.tokPos = 0;
+        else if (k === 'End') W.tokPos = W.tokBuf.length;
+        else if (k === 'Backspace' && W.tokPos > 0) { W.tokPos--; W.tokBuf.splice(W.tokPos, 1); }
+        else if (k === 'Delete' && W.tokPos < W.tokBuf.length) { W.tokBuf.splice(W.tokPos, 1); }
+        else if (k.length === 1 && /[0-9kKmM,_]/.test(k) && W.tokBuf.length < 12) { W.tokBuf.splice(W.tokPos, 0, k); W.tokPos++; }
+        else return false;
+        draw(); return true;
+      }
+      var onCompact = W.cursor === CI;
       if (k === 'Esc' || k === 'q' || k === 'Q') { cancel(); return true; }
       else if (k === 'Up' || k === 'k') W.cursor = (W.cursor + N - 1) % N;
       else if (k === 'Down' || k === 'j') W.cursor = (W.cursor + 1) % N;
@@ -850,6 +885,14 @@ part('wizard', function(){
       else if (k === 'End') W.cursor = N - 1;
       else if (k === ' ') toggle(W.cursor);
       else if (k === 'a' || k === 'A') { var all = W.sel.every(Boolean); W.sel = W.sel.map(function(){ return !all; }); }
+      else if (onCompact && (k === '-' || k === '[' || k === '+' || k === '=' || k === ']')) {
+        W.tokens = Math.max(32000, Math.min(1000000, W.tokens + (k === '-' || k === '[' ? -10000 : 10000)));
+        W.sel[CI] = true;
+        W.flash = ['acc', '컴팩션 임계값: ' + fmtTok(W.tokens) + ' (' + W.tokens + ' 토큰)'];
+      }
+      else if (onCompact && (k === 'e' || k === 'E')) {
+        W.tokBuf = Array.from(fmtTok(W.tokens)); W.tokPos = W.tokBuf.length; W.editTok = true;
+      }
       else if (/^[0-9]$/.test(k)) { var idx = +k; if (idx >= 1 && idx <= N) { W.cursor = idx - 1; toggle(idx - 1); } }
       else if (k === 'Enter' || k === 'Right') {
         if (W.sel.some(Boolean)) {
@@ -900,11 +943,19 @@ part('wizard', function(){
       var cnt = W.sel.filter(Boolean).length, cur = P[W.cursor];
       h += '<div class="hdr">' + sp('b', '적용할 패치를 고르세요') + sp('dim', cnt + '/' + N + ' 선택') + '</div>' + ln('');
       P.forEach(function(p, i){
-        var c = i === W.cursor;
-        h += ln('<span class="ptr ab">' + (c ? '❯' : '') + '</span>' + sp(W.sel[i] ? 'ok' : 'dim', W.sel[i] ? '◉' : '○') + sp((c ? 'ab' : 'acc') + ' idc', p.id) + sp(c ? 'b' : '', p.t), 'row', ' data-i="' + i + '"');
+        var c = i === W.cursor, extra = '';
+        if (p.id === 'compact') {
+          if (W.editTok) extra = sp('dim', '  [') + '<span class="ab">' + esc(W.tokBuf.slice(0, W.tokPos).join('')) + '<span class="car">' + esc(W.tokBuf[W.tokPos] || ' ').replace(' ', '&nbsp;') + '</span>' + esc(W.tokBuf.slice(W.tokPos + 1).join('')) + '</span>' + sp('dim', ']');
+          else extra = sp(W.sel[i] ? 'acc' : 'dim', '  [' + fmtTok(W.tokens) + ']');
+        }
+        h += ln('<span class="ptr ab">' + (c ? '❯' : '') + '</span>' + sp(W.sel[i] ? 'ok' : 'dim', W.sel[i] ? '◉' : '○') + sp((c ? 'ab' : 'acc') + ' idc', p.id) + sp(c ? 'b' : '', p.t) + extra, 'row', ' data-i="' + i + '"');
       });
       h += '<div class="rule"></div>' + ln(sp('', cur.d)) + ln(sp('dim', '심볼') + sp('dim', cur.s)) + flashLines();
-      h += keys([[[['↑', 'Up'], ['↓', 'Down']], '이동'], [[['space', ' ']], '선택'], [[['a', 'a']], '전체'], [[['enter', 'Enter']], '다음'], [[['q', 'q']], '종료']]);
+      h += W.editTok
+        ? keys([[[['←', 'Left'], ['→', 'Right']], '커서'], [[['enter', 'Enter']], '확정'], [[['esc', 'Esc']], '취소']])
+        : (W.cursor === CI
+          ? keys([[[['↑', 'Up'], ['↓', 'Down']], '이동'], [[['space', ' ']], '선택'], [[['-', '-'], ['+', '+']], '±10k'], [[['e', 'e']], '수치'], [[['enter', 'Enter']], '다음'], [[['q', 'q']], '종료']])
+          : keys([[[['↑', 'Up'], ['↓', 'Down']], '이동'], [[['space', ' ']], '선택'], [[['a', 'a']], '전체'], [[['enter', 'Enter']], '다음'], [[['q', 'q']], '종료']]));
     } else if (W.step === 1) {
       var s0 = W.choice === 0, pl = plan();
       h += ln(sp('b', '결과물을 어떻게 만들까요?')) + ln('');
@@ -925,7 +976,7 @@ part('wizard', function(){
     } else {
       var ch = chosen(), p2 = plan();
       h += ln(sp('b', '아래 내용으로 패치합니다')) + ln('') + ln(sp('dim', '적용할 패치 ' + ch.length + '개'));
-      ch.forEach(function(p){ h += ln('<span class="ptr"></span>' + sp('ok', '✓') + sp('acc idc', p.id) + sp('', p.t)); });
+      ch.forEach(function(p){ h += ln('<span class="ptr"></span>' + sp('ok', '✓') + sp('acc idc', p.id) + sp('', p.t) + (p.id === 'compact' ? sp('acc', '  [' + fmtTok(W.tokens) + ']') : '')); });
       h += ln('') + ln(sp('dim', '출력'));
       if (W.choice === 1) h += ln('<span class="ptr"></span>' + sp('dim', '덮어쓰기') + sp('', DIR + '/antigravity')) + ln('<span class="ptr"></span>' + sp('dim', '원본 백업') + sp('', DIR + '/antigravity.orig'));
       else h += ln('<span class="ptr"></span>' + sp('dim', '생성') + sp('', p2.dst)) + ln('<span class="ptr"></span>' + sp('dim', '링크') + sp('', p2.link));
@@ -951,7 +1002,7 @@ part('wizard', function(){
     var ch = chosen(), L = HEAD.slice(), inpl = W.choice === 1, pl = plan(), dst = inpl ? ADIR + '/antigravity' : pl.adst;
     if (inpl) L.push(['g', '[+] 원본 백업 저장: ' + ADIR + '/antigravity.orig']);
     L.push(['', '']); L.push(['g', '[+] 패치 적용 내역 (Elf64 / X86_64) -> ' + dst]);
-    ch.forEach(function(p){ L.push(['', '    - [' + p.id + '] ' + p.t + ' (' + p.off + ')']); });
+    ch.forEach(function(p){ L.push(['', '    - [' + p.id + '] ' + p.t + (p.id === 'compact' ? ' [' + fmtTok(W.tokens) + ' = ' + W.tokens + ' tokens]' : '') + ' (' + p.off + ')']); });
     if (inpl) L.push(['g', '[+] 기본 agy 바이너리에 패치 적용 완료: ' + dst]);
     else L.push(['g', '[+] 심볼릭 링크 연결 완료: ' + pl.alink + ' -> ' + dst]);
     showLog(L);

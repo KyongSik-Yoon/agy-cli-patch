@@ -15,6 +15,7 @@
 | `heading` | `render.glamourStyleForScheme` | 마크다운 헤딩(`H2`~`H6`) 앞에 붙는 `## `~`###### ` 프리픽스를 숨기고 색상·볼드만 유지 |
 | `cjk-bold` | `goldmark/parser.ScanDelimiter` | `` **"문구"**라는 ``, `` **용어(`code`)**는 ``처럼 닫는 `**` 앞 구두점과 뒤 한글 조사가 결합될 때 볼드가 풀리는 현상 수정 |
 | `tilde-strike` | `goldmark/extension.(*strikethroughParser).Parse` | `1.5.0~1.5.6`, `H2~H6` 같은 범위 표기용 단일 물결표(`~`)에 취소선이 그어지는 현상 방지 (`~~` 2개만 취소선으로 인식) |
+| `compact` | `utils.GetCheckpointConfig`, `config.applyFeatureProviderCheckpointOverrideConfig` | 내장 자동 컴팩션(CHECKPOINT) 발동 임계값(기본 256k)을 임의 토큰 수(`32k~1000k`, 기본 `180k`)로 변경 (`x86_64`, **기본 꺼짐** — `--compact 180k` 또는 `-p all,compact=160k`로 적용) |
 | `banner` | `render.BannerWithInfo` | 상단 `Antigravity CLI 1.5.7` 옆에 `(patch v0.2.1)` 형태로 패치 버전 표시 (`x86_64`) |
 | `release-notes` | `render.BuildHeader` | 로고 아래에 패치 기능 요약 및 GitHub 저장소 정보 표시 (`x86_64`, **기본 꺼짐** — `-p all,release-notes`처럼 명시해야 적용) |
 
@@ -51,7 +52,7 @@ cd agy-cli-patch
 agy-cli-patch
 ```
 
-- **패치 선택**: `↑↓`(또는 `j`/`k`)로 이동, `space`나 숫자키로 선택, `a`로 전체 선택/해제. 커서가 가리키는 패치의 설명과 대상 심볼이 하단에 표시됩니다. 실행 전에 각 패치를 대상 바이너리에 미리 대조하므로, 적용할 수 없는 패치(예: ARM64의 `banner`)는 `✕`와 사유가 표시되고 선택되지 않습니다. `batch`를 켜면 `nodrip`도 함께 켜집니다.
+- **패치 선택**: `↑↓`(또는 `j`/`k`)로 이동, `space`나 숫자키로 선택, `a`로 전체 선택/해제. `compact` 줄에서는 `-`/`+`로 ±10k씩 증감하거나 `e`를 눌러 `180k`·`160000`처럼 임의 토큰 임계값을 직접 입력합니다. 커서가 가리키는 패치의 설명과 대상 심볼이 하단에 표시됩니다. 실행 전에 각 패치를 대상 바이너리에 미리 대조하므로, 적용할 수 없는 패치(예: ARM64의 `banner`)는 `✕`와 사유가 표시되고 선택되지 않습니다. `batch`를 켜면 `nodrip`도 함께 켜집니다.
 - **출력 방식**: 새 실행 파일(이름을 바로 편집, 생성 경로와 `~/.local/bin` 링크를 미리 보여줌) 또는 기본 agy에 직접 덮어쓰기(in-place) 중에서 고릅니다. 원본과 같은 경로나 존재하지 않는 디렉토리는 막고, 기존 링크가 다른 파일을 가리키면 교체된다고 경고합니다.
 - **확인**: 적용할 패치와 출력 경로를 확인한 뒤 `enter`로 실행합니다. `esc`로 이전 단계, `q`나 `ctrl+c`로 종료합니다(터미널 상태는 항상 복구됩니다).
 
@@ -76,6 +77,12 @@ agy-cli-patch --notes
 
 # 일괄 출력(batch)만 빼고 나머지 패치를 적용해 agy-nodrip 생성
 agy-cli-patch -p nodrip,heading,cjk-bold,tilde-strike,banner -o agy-nodrip
+
+# 기본 활성 패치 전체 + 자동 컴팩션 180k 임계값 적용
+agy-cli-patch -p all --compact 180k -o agy-batch
+
+# 인라인 값으로 특정 토큰 임계값 지정 (32k~1000k)
+agy-cli-patch -p all,compact=160k -o agy-batch
 
 # 마크다운 패치 3종만 적용해 agy-md 생성
 agy-cli-patch -p heading,cjk-bold,tilde-strike -o agy-md

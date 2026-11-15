@@ -175,6 +175,7 @@ struct BinaryContext<'a> {
     format: Format,
     arch: Arch,
     funcs: HashMap<&'a str, (usize, usize)>,
+    compact_tokens: u32,
 }
 
 impl<'a> BinaryContext<'a> {
@@ -310,6 +311,8 @@ impl<'a> BinaryContext<'a> {
             "render.glamourStyleForScheme",
             "parser.ScanDelimiter",
             "extension.(*strikethroughParser).Parse",
+            "utils.GetCheckpointConfig",
+            "config.applyFeatureProviderCheckpointOverrideConfig",
             "render.BuildHeader",
             "render.BannerWithInfo",
             "runtime.concatstring3",
@@ -345,6 +348,7 @@ impl<'a> BinaryContext<'a> {
             format,
             arch,
             funcs,
+            compact_tokens: DEFAULT_COMPACT_TOKENS,
         })
     }
 
@@ -696,6 +700,160 @@ fn resolve_tilde_strike(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
     }
 }
 
+const DEFAULT_COMPACT_TOKENS: u32 = 180_000;
+const MIN_COMPACT_TOKENS: u32 = 32_000;
+const MAX_COMPACT_TOKENS: u32 = 1_000_000;
+
+fn parse_compact_tokens(raw: &str) -> Result<u32, String> {
+    let cleaned: String = raw
+        .trim()
+        .chars()
+        .filter(|&c| c != '_' && c != ',')
+        .collect();
+    let err = || {
+        format!(
+            "컴팩션 토큰 임계값은 32k~1000k (32000~1000000) 범위여야 합니다: '{raw}' (예: 180k, 180000)"
+        )
+    };
+    if cleaned.is_empty() {
+        return Err(err());
+    }
+
+    let (num_str, mul): (&str, u64) = if let Some(s) = cleaned.strip_suffix(['k', 'K']) {
+        (s, 1_000)
+    } else if let Some(s) = cleaned.strip_suffix(['m', 'M']) {
+        (s, 1_000_000)
+    } else {
+        (&cleaned, 1)
+    };
+
+    let base: u64 = num_str.parse().map_err(|_| err())?;
+    let total = base.checked_mul(mul).ok_or_else(err)?;
+    if total < MIN_COMPACT_TOKENS as u64 || total > MAX_COMPACT_TOKENS as u64 {
+        return Err(err());
+    }
+    Ok(total as u32)
+}
+
+fn format_compact_tokens(tokens: u32) -> String {
+    if tokens.is_multiple_of(1_000) {
+        format!("{}k", tokens / 1_000)
+    } else {
+        tokens.to_string()
+    }
+}
+
+struct CompactSites {
+    override_branch_off: usize,
+    is_override_patched: bool,
+    slot1_off: usize,
+    slot2_off: usize,
+    slot3_off: usize,
+    current_tokens: u32,
+}
+
+fn find_compact_sites(ctx: &BinaryContext) -> Result<CompactSites, String> {
+    if ctx.arch != Arch::X86_64 {
+        return Err("compact 패치는 현재 x86_64 환경에서 우선 지원됩니다.".into());
+    }
+
+    let (ov_start, ov_end) = ctx.get_func("config.applyFeatureProviderCheckpointOverrideConfig")?;
+    let ov_body = &ctx.data[ov_start..ov_end];
+    let mut ov_matches = Vec::new();
+    for i in 0..ov_body.len().saturating_sub(10) {
+        let w = &ov_body[i..i + 10];
+        if &w[0..4] == &[0xff, 0xd2, 0x84, 0xc0]
+            && (&w[4..6] == &[0x75, 0x08] || &w[4..6] == &[0x90, 0x90])
+            && &w[6..10] == &[0x48, 0x8b, 0x44, 0x24]
+        {
+            ov_matches.push((ov_start + i + 4, &w[4..6] == &[0x90, 0x90]));
+        }
+    }
+    if ov_matches.len() != 1 {
+        return Err(format!(
+            "applyFeatureProviderCheckpointOverrideConfig 분기 패턴 매칭 실패 (매칭 수: {})",
+            ov_matches.len()
+        ));
+    }
+    let (override_branch_off, is_override_patched) = ov_matches[0];
+
+    let (gc_start, gc_end) = ctx.get_func("utils.GetCheckpointConfig")?;
+    let gc_body = &ctx.data[gc_start..gc_end];
+
+    let mut limit_matches = Vec::new();
+    for i in 0..gc_body.len().saturating_sub(14) {
+        let w = &gc_body[i..i + 14];
+        if &w[0..2] == &[0x81, 0xfa] && w[6] == 0xbe && &w[11..14] == &[0x0f, 0x42, 0xf2] {
+            let v1 = read_u32(w, 2);
+            let v2 = read_u32(w, 7);
+            if v1 == v2 && (MIN_COMPACT_TOKENS..=MAX_COMPACT_TOKENS).contains(&v1) {
+                limit_matches.push((gc_start + i + 2, gc_start + i + 7, v1));
+            }
+        }
+    }
+    if limit_matches.len() != 1 {
+        return Err(format!(
+            "GetCheckpointConfig 상한 패턴 매칭 실패 (매칭 수: {})",
+            limit_matches.len()
+        ));
+    }
+    let (slot1_off, slot2_off, current_tokens) = limit_matches[0];
+
+    let mut fallback_matches = Vec::new();
+    for i in 0..gc_body.len().saturating_sub(13) {
+        let w = &gc_body[i..i + 13];
+        if &w[0..2] == &[0x83, 0x7a]
+            && &w[3..9] == &[0x00, 0x7f, 0x07, 0xc7, 0x40, 0x0c]
+            && read_u32(w, 9) == current_tokens
+        {
+            fallback_matches.push(gc_start + i + 9);
+        }
+    }
+    if fallback_matches.len() != 1 {
+        return Err(format!(
+            "GetCheckpointConfig fallback 패턴 매칭 실패 (매칭 수: {})",
+            fallback_matches.len()
+        ));
+    }
+
+    Ok(CompactSites {
+        override_branch_off,
+        is_override_patched,
+        slot1_off,
+        slot2_off,
+        slot3_off: fallback_matches[0],
+        current_tokens,
+    })
+}
+
+fn detect_patched_compact_tokens(ctx: &BinaryContext) -> Option<u32> {
+    let sites = find_compact_sites(ctx).ok()?;
+    sites.is_override_patched.then_some(sites.current_tokens)
+}
+
+fn resolve_compact(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
+    let sites = find_compact_sites(ctx)?;
+    let imm = ctx.compact_tokens.to_le_bytes().to_vec();
+    Ok(vec![
+        ByteEdit {
+            offset: sites.override_branch_off,
+            payload: vec![0x90, 0x90],
+        },
+        ByteEdit {
+            offset: sites.slot1_off,
+            payload: imm.clone(),
+        },
+        ByteEdit {
+            offset: sites.slot2_off,
+            payload: imm.clone(),
+        },
+        ByteEdit {
+            offset: sites.slot3_off,
+            payload: imm,
+        },
+    ])
+}
+
 // banner / release-notes 패치가 공유하는 0xcc 패딩 공간(cave) 배치.
 // 두 패치를 따로 적용해도 겹치지 않도록 고정 오프셋을 쓴다.
 const CAVE_MIN: usize = 1024;
@@ -786,6 +944,7 @@ fn release_notes_text() -> String {
         ("heading", "'##' prefixes hidden on H2-H6"),
         ("cjk-bold", "**bold** kept before Korean particles"),
         ("tilde-strike", "only '~~' strikes through, single '~' stays"),
+        ("compact", "custom auto-compaction token limit (--compact 180k)"),
         ("banner", "patch version shown next to the product name"),
     ];
     let mut out = format!(
@@ -931,6 +1090,14 @@ const PATCH_REGISTRY: &[PatchSpec] = &[
         symbol: "goldmark/extension.(*strikethroughParser).Parse",
         default_on: true,
         resolver: resolve_tilde_strike,
+    },
+    PatchSpec {
+        id: "compact",
+        title: "자동 컴팩션 토큰 임계값 변경 (Auto-Compact Limit)",
+        description: "내장 자동 컴팩션(CHECKPOINT) 발동 기준(기본 256k)을 원하는 토큰 수(기본 180k, 32k~1000k)로 변경 (기본 꺼짐)",
+        symbol: "utils.GetCheckpointConfig",
+        default_on: false,
+        resolver: resolve_compact,
     },
     PatchSpec {
         id: "banner",
@@ -1582,8 +1749,8 @@ fn plan_output(bin_dir: &Path, target_bin: &Path, src_bin: &Path, name: &str) ->
     Ok(OutputPlan { dst, link_name, link, notes })
 }
 
-/// 대화형 설정의 결과: (적용할 패치, 출력 이름, in-place 여부)
-type WizardResult = (Vec<&'static PatchSpec>, String, bool);
+/// 대화형 설정의 결과: (적용할 패치, 출력 이름, in-place 여부, 컴팩션 토큰 한도)
+type WizardResult = (Vec<&'static PatchSpec>, String, bool, u32);
 
 struct Wizard<'a> {
     src_bin: &'a Path,
@@ -1605,6 +1772,10 @@ struct Wizard<'a> {
     flash: Option<(&'static str, String)>,
     /// 터미널 높이가 낮을 때 빈 줄을 줄여 목록 공간을 확보
     compact: bool,
+    compact_tokens: u32,
+    editing_compact: bool,
+    compact_buf: Vec<char>,
+    compact_pos: usize,
 }
 
 fn patch_index(id: &str) -> Option<usize> {
@@ -1646,6 +1817,10 @@ impl<'a> Wizard<'a> {
             name_edited: false,
             flash: None,
             compact: false,
+            compact_tokens: detect_patched_compact_tokens(ctx).unwrap_or(ctx.compact_tokens),
+            editing_compact: false,
+            compact_buf: Vec::new(),
+            compact_pos: 0,
         }
     }
 
@@ -1707,6 +1882,28 @@ impl<'a> Wizard<'a> {
         plan_output(self.bin_dir, self.target_bin, self.src_bin, &self.name_str())
     }
 
+    fn adjust_compact_tokens(&mut self, delta: i32) {
+        let Some(ci) = patch_index("compact") else {
+            return;
+        };
+        if self.avail[ci].is_err() {
+            self.flash = Some((S_WARN, "'compact' 패치는 이 바이너리에 적용할 수 없습니다.".into()));
+            return;
+        }
+        let next = if delta.is_negative() {
+            self.compact_tokens.saturating_sub(delta.unsigned_abs())
+        } else {
+            self.compact_tokens.saturating_add(delta as u32)
+        }
+        .clamp(MIN_COMPACT_TOKENS, MAX_COMPACT_TOKENS);
+        self.compact_tokens = next;
+        self.selected[ci] = true;
+        self.flash = Some((
+            S_ACCENT,
+            format!("컴팩션 임계값: {} ({} 토큰)", format_compact_tokens(next), next),
+        ));
+    }
+
     fn handle_key(&mut self, key: Key) -> Action {
         if key == Key::CtrlC {
             return Action::Cancel;
@@ -1714,34 +1911,104 @@ impl<'a> Wizard<'a> {
         self.flash = None;
         let n = PATCH_REGISTRY.len();
         match self.step {
-            Step::Patches => match key {
-                Key::Esc | Key::Char('q') | Key::Char('Q') => return Action::Cancel,
-                Key::Up | Key::Char('k') => self.cursor = (self.cursor + n - 1) % n,
-                Key::Down | Key::Char('j') => self.cursor = (self.cursor + 1) % n,
-                Key::Home => self.cursor = 0,
-                Key::End => self.cursor = n - 1,
-                Key::Char(' ') => self.toggle(self.cursor),
-                Key::Char('a') | Key::Char('A') => self.toggle_all(),
-                Key::Char(c) if c.is_ascii_digit() => {
-                    let idx = (c as u8 - b'0') as usize;
-                    if (1..=n).contains(&idx) {
-                        self.cursor = idx - 1;
-                        self.toggle(idx - 1);
-                    }
-                }
-                Key::Enter | Key::Right => {
-                    if self.selected.iter().any(|&x| x) {
-                        if !self.name_edited {
-                            self.name = self.default_name().chars().collect();
-                            self.name_pos = self.name.len();
+            Step::Patches => {
+                if self.editing_compact {
+                    match key {
+                        Key::Esc => self.editing_compact = false,
+                        Key::Enter => {
+                            let raw: String = self.compact_buf.iter().collect();
+                            match parse_compact_tokens(&raw) {
+                                Ok(tokens) => {
+                                    self.compact_tokens = tokens;
+                                    self.editing_compact = false;
+                                    if let Some(ci) = patch_index("compact") {
+                                        if self.avail[ci].is_ok() {
+                                            self.selected[ci] = true;
+                                        }
+                                    }
+                                    self.flash = Some((
+                                        S_OK,
+                                        format!(
+                                            "컴팩션 임계값이 {} ({} 토큰)으로 설정되었습니다.",
+                                            format_compact_tokens(tokens),
+                                            tokens
+                                        ),
+                                    ));
+                                }
+                                Err(err) => {
+                                    self.flash = Some((S_ERR, err));
+                                }
+                            }
                         }
-                        self.step = Step::Output;
-                    } else {
-                        self.flash = Some((S_WARN, "적용할 패치를 하나 이상 선택하세요.".into()));
+                        Key::Left => self.compact_pos = self.compact_pos.saturating_sub(1),
+                        Key::Right => self.compact_pos = (self.compact_pos + 1).min(self.compact_buf.len()),
+                        Key::Home => self.compact_pos = 0,
+                        Key::End => self.compact_pos = self.compact_buf.len(),
+                        Key::Backspace if self.compact_pos > 0 => {
+                            self.compact_pos -= 1;
+                            self.compact_buf.remove(self.compact_pos);
+                        }
+                        Key::Delete if self.compact_pos < self.compact_buf.len() => {
+                            self.compact_buf.remove(self.compact_pos);
+                        }
+                        Key::Char(c) if !c.is_control() => {
+                            if self.compact_buf.len() < 16 {
+                                self.compact_buf.insert(self.compact_pos, c);
+                                self.compact_pos += 1;
+                            }
+                        }
+                        _ => {}
                     }
+                    return Action::Continue;
                 }
-                _ => {}
-            },
+
+                let on_compact = PATCH_REGISTRY.get(self.cursor).is_some_and(|p| p.id == "compact");
+                match key {
+                    Key::Esc | Key::Char('q') | Key::Char('Q') => return Action::Cancel,
+                    Key::Up | Key::Char('k') => self.cursor = (self.cursor + n - 1) % n,
+                    Key::Down | Key::Char('j') => self.cursor = (self.cursor + 1) % n,
+                    Key::Home => self.cursor = 0,
+                    Key::End => self.cursor = n - 1,
+                    Key::Char(' ') => self.toggle(self.cursor),
+                    Key::Char('a') | Key::Char('A') => self.toggle_all(),
+                    Key::Char('-') | Key::Char('[') if on_compact => self.adjust_compact_tokens(-10_000),
+                    Key::Char('+') | Key::Char('=') | Key::Char(']') if on_compact => {
+                        self.adjust_compact_tokens(10_000)
+                    }
+                    Key::Char('e') | Key::Char('E') if on_compact => {
+                        if self.avail[self.cursor].is_err() {
+                            self.flash = Some((
+                                S_WARN,
+                                "'compact' 패치는 이 바이너리에 적용할 수 없습니다.".into(),
+                            ));
+                        } else {
+                            self.compact_buf =
+                                format_compact_tokens(self.compact_tokens).chars().collect();
+                            self.compact_pos = self.compact_buf.len();
+                            self.editing_compact = true;
+                        }
+                    }
+                    Key::Char(c) if c.is_ascii_digit() => {
+                        let idx = (c as u8 - b'0') as usize;
+                        if (1..=n).contains(&idx) {
+                            self.cursor = idx - 1;
+                            self.toggle(idx - 1);
+                        }
+                    }
+                    Key::Enter | Key::Right => {
+                        if self.selected.iter().any(|&x| x) {
+                            if !self.name_edited {
+                                self.name = self.default_name().chars().collect();
+                                self.name_pos = self.name.len();
+                            }
+                            self.step = Step::Output;
+                        } else {
+                            self.flash = Some((S_WARN, "적용할 패치를 하나 이상 선택하세요.".into()));
+                        }
+                    }
+                    _ => {}
+                }
+            }
             Step::Output => match key {
                 Key::Esc => self.step = Step::Patches,
                 Key::Up => self.out_choice = 0,
@@ -1906,6 +2173,30 @@ impl<'a> Wizard<'a> {
                 .s(check.0, check.1)
                 .s(id_style, format!("{}{pad}", p.id))
                 .s(title_style, p.title);
+            if p.id == "compact" && ok {
+                if self.editing_compact {
+                    let before: String = self.compact_buf[..self.compact_pos].iter().collect();
+                    let at = self
+                        .compact_buf
+                        .get(self.compact_pos)
+                        .map_or(" ".to_string(), |c| c.to_string());
+                    let after: String = self
+                        .compact_buf
+                        .get(self.compact_pos + 1..)
+                        .map_or(String::new(), |s| s.iter().collect());
+                    line = line
+                        .s(S_DIM, "  [")
+                        .s(S_ACCENT_B, before)
+                        .s(S_CARET, at)
+                        .s(S_ACCENT_B, after)
+                        .s(S_DIM, "]");
+                } else {
+                    line = line.s(
+                        if self.selected[i] { S_ACCENT } else { S_DIM },
+                        format!("  [{}]", format_compact_tokens(self.compact_tokens)),
+                    );
+                }
+            }
             if !ok {
                 line = line.s(S_DIM, "  (사용 불가)");
             }
@@ -1917,13 +2208,31 @@ impl<'a> Wizard<'a> {
             }
         }
         lines.extend(bottom);
-        let footer = vec![key_hints(&[
-            ("↑↓", "이동"),
-            ("space", "선택"),
-            ("a", "전체"),
-            ("enter", "다음"),
-            ("q", "종료"),
-        ])];
+        let on_compact = PATCH_REGISTRY.get(self.cursor).is_some_and(|p| p.id == "compact");
+        let footer = if self.editing_compact {
+            vec![key_hints(&[
+                ("←→", "커서"),
+                ("enter", "확정"),
+                ("esc", "취소"),
+            ])]
+        } else if on_compact {
+            vec![key_hints(&[
+                ("↑↓", "이동"),
+                ("space", "선택"),
+                ("-/+", "±10k"),
+                ("e", "수치"),
+                ("enter", "다음"),
+                ("q", "종료"),
+            ])]
+        } else {
+            vec![key_hints(&[
+                ("↑↓", "이동"),
+                ("space", "선택"),
+                ("a", "전체"),
+                ("enter", "다음"),
+                ("q", "종료"),
+            ])]
+        };
         (lines, footer)
     }
 
@@ -2016,12 +2325,17 @@ impl<'a> Wizard<'a> {
         ];
         for p in &chosen {
             let pad = " ".repeat(idw.saturating_sub(str_width(p.id)));
-            lines.push(
-                Line::new()
-                    .s(S_OK, "   ✓ ")
-                    .s(S_ACCENT, format!("{}{pad}", p.id))
-                    .s(S_PLAIN, p.title),
-            );
+            let mut l = Line::new()
+                .s(S_OK, "   ✓ ")
+                .s(S_ACCENT, format!("{}{pad}", p.id))
+                .s(S_PLAIN, p.title);
+            if p.id == "compact" {
+                l = l.s(
+                    S_ACCENT,
+                    format!("  [{}]", format_compact_tokens(self.compact_tokens)),
+                );
+            }
+            lines.push(l);
         }
         lines.push(Line::new());
         lines.push(Line::new().s(S_DIM, " 출력"));
@@ -2116,9 +2430,9 @@ fn interactive_wizard(
                         chosen.insert(0, &PATCH_REGISTRY[0]);
                     }
                     return Ok(Some(if wiz.out_choice == 1 {
-                        (chosen, String::new(), true)
+                        (chosen, String::new(), true, wiz.compact_tokens)
                     } else {
-                        (chosen, wiz.name_str(), false)
+                        (chosen, wiz.name_str(), false, wiz.compact_tokens)
                     }));
                 }
             }
@@ -2126,25 +2440,43 @@ fn interactive_wizard(
     }
 }
 
-fn parse_patch_list(spec_str: &str) -> Result<Vec<&'static PatchSpec>, String> {
+fn parse_patch_list(spec_str: &str, compact_override: &mut Option<u32>) -> Result<Vec<&'static PatchSpec>, String> {
     let items: Vec<&str> = spec_str.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
     if items.is_empty() || items.contains(&"all") {
-        // 'all' 은 기본 활성(default_on) 패치 전체. 기본 꺼짐 패치는 'all,release-notes' 처럼 명시한다.
+        // 'all' 은 기본 활성(default_on) 패치 전체. 기본 꺼짐 패치는 'all,release-notes' 나 'all,compact=180k' 처럼 명시한다.
         let mut v: Vec<&'static PatchSpec> = PATCH_REGISTRY.iter().filter(|p| p.default_on).collect();
         for item in &items {
-            if let Some(spec) = PATCH_REGISTRY.iter().find(|p| p.id == *item && !p.default_on) {
-                v.push(spec);
+            let (id, val) = item.split_once('=').map_or((*item, None), |(k, rhs)| (k.trim(), Some(rhs.trim())));
+            if let Some(raw_val) = val {
+                if id != "compact" {
+                    return Err(format!("'{id}' 패치는 '=값' 인자를 지원하지 않습니다."));
+                }
+                *compact_override = Some(parse_compact_tokens(raw_val)?);
+            }
+            if let Some(spec) = PATCH_REGISTRY.iter().find(|p| p.id == id && !p.default_on) {
+                if !v.iter().any(|p| p.id == spec.id) {
+                    v.push(spec);
+                }
             }
         }
         return Ok(v);
     }
     let mut out = Vec::new();
     for item in items {
-        let Some(spec) = PATCH_REGISTRY.iter().find(|p| p.id == item) else {
+        let (id, val) = item.split_once('=').map_or((item, None), |(k, rhs)| (k.trim(), Some(rhs.trim())));
+        if let Some(raw_val) = val {
+            if id != "compact" {
+                return Err(format!("'{id}' 패치는 '=값' 인자를 지원하지 않습니다."));
+            }
+            *compact_override = Some(parse_compact_tokens(raw_val)?);
+        }
+        let Some(spec) = PATCH_REGISTRY.iter().find(|p| p.id == id) else {
             let valid: Vec<&str> = PATCH_REGISTRY.iter().map(|p| p.id).collect();
-            return Err(format!("알 수 없는 패치 ID: '{item}' (사용 가능: all, {})", valid.join(", ")));
+            return Err(format!("알 수 없는 패치 ID: '{id}' (사용 가능: all, {})", valid.join(", ")));
         };
-        out.push(spec);
+        if !out.iter().any(|p: &&PatchSpec| p.id == spec.id) {
+            out.push(spec);
+        }
     }
     Ok(out)
 }
@@ -2195,7 +2527,18 @@ fn build_patched_binary(
     );
     for (spec, edits) in &resolved {
         let offs: Vec<String> = edits.iter().map(|e| format!("0x{:x}", e.offset)).collect();
-        println!("    - [{}] {} ({})", spec.id, spec.title, offs.join(", "));
+        if spec.id == "compact" {
+            println!(
+                "    - [{}] {} [{} = {} tokens] ({})",
+                spec.id,
+                spec.title,
+                format_compact_tokens(ctx.compact_tokens),
+                ctx.compact_tokens,
+                offs.join(", ")
+            );
+        } else {
+            println!("    - [{}] {} ({})", spec.id, spec.title, offs.join(", "));
+        }
     }
 
     resign_if_macho(dst_bin, ctx.format);
@@ -2245,21 +2588,31 @@ fn print_help() {
   agy-cli-patch                           대화형(Interactive) 패치 선택 및 출력 파일명 지정
   agy-cli-patch --list                    사용 가능한 패치 ID 및 상세 설명 출력
   agy-cli-patch -p <목록> -o <파일명>     원하는 패치만 골라 지정한 이름으로 바이너리 생성
+  agy-cli-patch -p all --compact 180k -o agy-batch  자동 컴팩션 임계값을 180k 토큰으로 변경
   agy-cli-patch --preset                  기본 프리셋 2종(agy-batch, agy-nodrip) 일괄 생성
   agy-cli-patch -p all --in-place         원본 백업(antigravity.orig) 후 기본 agy에 직접 적용
   agy-cli-patch --restore                 antigravity.orig 백업에서 원본 복구
   agy-cli-patch --notes                   패치 릴리즈 노트 출력
 
 옵션:
-  --bin <경로>       원본 antigravity 바이너리 경로 직접 지정 (미지정 시 자동 탐색)
-  -p, --patches <ID> 쉼표로 구분된 패치 ID 또는 'all' (예: nodrip,batch,heading)
-  -o, --output <이름> 생성할 실행 파일 이름 또는 경로
-  --preset           프롬프트 없이 agy-batch와 agy-nodrip 생성
-  --in-place         원본 백업 후 기본 바이너리 덮어쓰기
-  --restore          --in-place 백업 복구
-  --notes            패치 릴리즈 노트 출력 (agy 화면에 넣으려면 -p all,release-notes)
-  -h, --help         도움말 출력"
+  --bin <경로>              원본 antigravity 바이너리 경로 직접 지정 (미지정 시 자동 탐색)
+  -p, --patches <ID>        쉼표로 구분된 패치 ID 또는 'all' (예: nodrip,batch,compact=180k)
+  --compact <토큰>          자동 컴팩션 토큰 임계값 지정 (32k~1000k, 예: 180k, 180000; 지정 시 compact 자동 활성화)
+  -o, --output <이름>       생성할 실행 파일 이름 또는 경로
+  --preset                  프롬프트 없이 agy-batch와 agy-nodrip 생성
+  --in-place                원본 백업 후 기본 바이너리 덮어쓰기
+  --restore                 --in-place 백업 복구
+  --notes                   패치 릴리즈 노트 출력 (agy 화면에 넣으려면 -p all,release-notes)
+  -h, --help                도움말 출력"
     );
+}
+
+fn ensure_compact_selected(patches: &mut Vec<&'static PatchSpec>) {
+    if let Some(spec) = PATCH_REGISTRY.iter().find(|p| p.id == "compact") {
+        if !patches.iter().any(|p| p.id == "compact") {
+            patches.push(spec);
+        }
+    }
 }
 
 fn run() -> Result<(), String> {
@@ -2267,6 +2620,7 @@ fn run() -> Result<(), String> {
     let mut list_mode = false;
     let mut patches_arg: Option<String> = None;
     let mut output_arg: Option<String> = None;
+    let mut compact_arg: Option<u32> = None;
     let mut preset_mode = false;
     let mut in_place = false;
     let mut restore_mode = false;
@@ -2293,6 +2647,10 @@ fn run() -> Result<(), String> {
             }
             "-p" | "--patches" => {
                 patches_arg = Some(args.next().ok_or("-p/--patches 옵션에 값이 필요합니다.")?);
+            }
+            "--compact" | "--compact-tokens" => {
+                let raw = args.next().ok_or("--compact 옵션에 토큰 수치(예: 180k)가 필요합니다.")?;
+                compact_arg = Some(parse_compact_tokens(&raw)?);
             }
             "-o" | "--output" => {
                 output_arg = Some(args.next().ok_or("-o/--output 옵션에 파일명이 필요합니다.")?);
@@ -2359,16 +2717,23 @@ fn run() -> Result<(), String> {
     }
 
     let mmap = MmapFile::open(&src_bin)?;
-    let ctx = BinaryContext::parse(mmap.as_slice())?;
+    let mut ctx = BinaryContext::parse(mmap.as_slice())?;
+    if let Some(tokens) = compact_arg {
+        ctx.compact_tokens = tokens;
+    }
 
     let is_tty = unsafe { isatty(0) == 1 };
     if preset_mode
-        || (!is_tty && patches_arg.is_none() && output_arg.is_none() && !in_place)
+        || (!is_tty && patches_arg.is_none() && output_arg.is_none() && !in_place && compact_arg.is_none())
     {
-        let nodrip_patches: Vec<&'static PatchSpec> =
+        let mut nodrip_patches: Vec<&'static PatchSpec> =
             PATCH_REGISTRY.iter().filter(|p| p.default_on && p.id != "batch").collect();
-        let batch_patches: Vec<&'static PatchSpec> =
+        let mut batch_patches: Vec<&'static PatchSpec> =
             PATCH_REGISTRY.iter().filter(|p| p.default_on).collect();
+        if compact_arg.is_some() {
+            ensure_compact_selected(&mut nodrip_patches);
+            ensure_compact_selected(&mut batch_patches);
+        }
         let jobs = [("agy-nodrip", nodrip_patches), ("agy-batch", batch_patches)];
         // 둘 다 먼저 검사해서 하나만 만들어진 채로 멈추는 일이 없게 한다
         let plans = jobs
@@ -2382,8 +2747,8 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
 
-    let (chosen_patches, out_name, do_in_place) =
-        if patches_arg.is_none() && output_arg.is_none() && !in_place {
+    let (chosen_patches, out_name, do_in_place, final_compact_tokens) =
+        if patches_arg.is_none() && output_arg.is_none() && !in_place && compact_arg.is_none() {
             match interactive_wizard(&src_bin, &target_bin, &target_version, &ctx)? {
                 Some(result) => result,
                 None => {
@@ -2392,15 +2757,25 @@ fn run() -> Result<(), String> {
                 }
             }
         } else {
-            let patches = parse_patch_list(patches_arg.as_deref().unwrap_or("all"))?;
+            let mut inline_override = None;
+            let mut patches = parse_patch_list(patches_arg.as_deref().unwrap_or("all"), &mut inline_override)?;
+            let mut resolved_tokens = ctx.compact_tokens;
+            if let Some(v) = inline_override {
+                resolved_tokens = v;
+            }
+            if let Some(v) = compact_arg {
+                resolved_tokens = v;
+                ensure_compact_selected(&mut patches);
+            }
             let default_out = if patches.iter().any(|p| p.id == "batch") {
                 "agy-batch"
             } else {
                 "agy-patched"
             };
             let name = output_arg.unwrap_or_else(|| default_out.to_string());
-            (patches, name, in_place)
+            (patches, name, in_place, resolved_tokens)
         };
+    ctx.compact_tokens = final_compact_tokens;
 
     if do_in_place {
         if !backup_bin.exists() {
@@ -2408,7 +2783,8 @@ fn run() -> Result<(), String> {
             println!("[+] 원본 백업 저장: {}", backup_bin.display());
         }
         let backup_mmap = MmapFile::open(&backup_bin)?;
-        let backup_ctx = BinaryContext::parse(backup_mmap.as_slice())?;
+        let mut backup_ctx = BinaryContext::parse(backup_mmap.as_slice())?;
+        backup_ctx.compact_tokens = final_compact_tokens;
         build_patched_binary(&backup_bin, &backup_ctx, &chosen_patches, &target_bin, None)?;
         println!("[+] 기본 agy 바이너리에 패치 적용 완료: {}", target_bin.display());
         return Ok(());
@@ -2427,5 +2803,83 @@ fn main() {
     if let Err(e) = run() {
         eprintln!("[!] 오류: {e}");
         process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compact_token_parser_supports_suffixes_and_validates_range() {
+        assert_eq!(parse_compact_tokens("180k"), Ok(180_000));
+        assert_eq!(parse_compact_tokens("180_000"), Ok(180_000));
+        assert_eq!(parse_compact_tokens("180,000"), Ok(180_000));
+        assert_eq!(parse_compact_tokens("1m"), Ok(1_000_000));
+        assert_eq!(parse_compact_tokens("32k"), Ok(32_000));
+
+        assert!(parse_compact_tokens("180").is_err());
+        assert!(parse_compact_tokens("2m").is_err());
+        assert!(parse_compact_tokens("").is_err());
+        assert!(parse_compact_tokens("abc").is_err());
+    }
+
+    #[test]
+    fn resolve_compact_patches_and_repatches_idempotently() {
+        let mut buf = vec![0x90u8; 256];
+        let ov_start = 16usize;
+        let ov_end = 48usize;
+        let ov_sig = [0xff, 0xd2, 0x84, 0xc0, 0x75, 0x08, 0x48, 0x8b, 0x44, 0x24];
+        buf[ov_start + 4..ov_start + 4 + ov_sig.len()].copy_from_slice(&ov_sig);
+
+        let gc_start = 80usize;
+        let gc_end = 200usize;
+        let orig = 256_000u32.to_le_bytes();
+        // 상한 비교·대입 슬롯: cmp $0x3e800, %edx; mov $0x3e800, %esi; cmovb %edx, %esi
+        let limit_off = gc_start + 10;
+        buf[limit_off..limit_off + 2].copy_from_slice(&[0x81, 0xfa]);
+        buf[limit_off + 2..limit_off + 6].copy_from_slice(&orig);
+        buf[limit_off + 6] = 0xbe;
+        buf[limit_off + 7..limit_off + 11].copy_from_slice(&orig);
+        buf[limit_off + 11..limit_off + 14].copy_from_slice(&[0x0f, 0x42, 0xf2]);
+
+        // 폴백 슬롯
+        let fb_off = gc_start + 60;
+        buf[fb_off..fb_off + 2].copy_from_slice(&[0x83, 0x7a]);
+        buf[fb_off + 2] = 0x14;
+        buf[fb_off + 3..fb_off + 9].copy_from_slice(&[0x00, 0x7f, 0x07, 0xc7, 0x40, 0x0c]);
+        buf[fb_off + 9..fb_off + 13].copy_from_slice(&orig);
+
+        let apply_edits = |target_buf: &mut [u8], tokens: u32| {
+            let mut funcs = HashMap::new();
+            funcs.insert("config.applyFeatureProviderCheckpointOverrideConfig", (ov_start, ov_end));
+            funcs.insert("utils.GetCheckpointConfig", (gc_start, gc_end));
+            let ctx = BinaryContext {
+                data: target_buf,
+                format: Format::Elf64,
+                arch: Arch::X86_64,
+                funcs,
+                compact_tokens: tokens,
+            };
+            let edits = resolve_compact(&ctx).expect("합성 바이너리에서 compact 매칭이 성공해야 함");
+            assert_eq!(edits.len(), 4);
+            for edit in edits {
+                target_buf[edit.offset..edit.offset + edit.payload.len()]
+                    .copy_from_slice(&edit.payload);
+            }
+        };
+
+        apply_edits(&mut buf, 180_000);
+        assert_eq!(&buf[ov_start + 8..ov_start + 10], &[0x90, 0x90]);
+        assert_eq!(read_u32(&buf, limit_off + 2), 180_000);
+        assert_eq!(read_u32(&buf, limit_off + 7), 180_000);
+        assert_eq!(read_u32(&buf, fb_off + 9), 180_000);
+
+        // 재패치 멱등성 확인 (180k -> 400k)
+        apply_edits(&mut buf, 400_000);
+        assert_eq!(&buf[ov_start + 8..ov_start + 10], &[0x90, 0x90]);
+        assert_eq!(read_u32(&buf, limit_off + 2), 400_000);
+        assert_eq!(read_u32(&buf, limit_off + 7), 400_000);
+        assert_eq!(read_u32(&buf, fb_off + 9), 400_000);
     }
 }
