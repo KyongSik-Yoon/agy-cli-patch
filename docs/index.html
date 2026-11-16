@@ -324,7 +324,7 @@ footer .links{display:flex;flex-wrap:wrap;gap:6px 18px;margin-top:12px}
 
 <div class="topbar" id="topbar">
   <div class="wrap in">
-    <div class="brand">agy-cli-patch <span>v0.2.3</span></div>
+    <div class="brand">agy-cli-patch <span>v0.2.4</span></div>
     <nav>
       <a class="opt" href="#patches">패치</a>
       <a class="opt" href="#how">원리</a>
@@ -404,10 +404,10 @@ footer .links{display:flex;flex-wrap:wrap;gap:6px 18px;margin-top:12px}
       <button class="mini" data-on="0" aria-label="code-theme 패치 전후 보기"><span class="lab"><i></i></span><span class="c ct"><span class="ct-code"><span class="ct-kw">func</span> <span class="ct-id">Do(req *</span><span class="ct-tp">Req</span><span class="ct-id">)</span></span><span class="ct-tag"></span></span></button></div>
     <div class="p glow"><div class="id">compact</div><div><div class="d">내장 자동 컴팩션(CHECKPOINT) 기준(기본 <code>256k</code>)을 <code>32k~1000k</code> 범위에서 조절합니다. <code>180k</code>로 낮춰 <code>200k</code> 단가 할증 전에 조기 요약하거나, <code>500k+</code>로 높여 1M 모델의 원문 맥락을 오래 유지할 수 있습니다.<span class="tag">기본 꺼짐</span></div><div class="sym">utils.GetCheckpointConfig · config.applyFeatureProviderCheckpointOverrideConfig</div></div>
       <button class="mini" data-on="0" aria-label="compact 패치 전후 보기"><span class="lab"><i></i></span><span class="c"><span class="c-before">192k / 256k · 압축 대기</span><span class="c-after">192k ≥ 180k<b> → CHECKPOINT (15k)</b></span></span></button></div>
-    <div class="p glow"><div class="id">banner</div><div><div class="d">상단 <code>Antigravity CLI 1.5.7</code> 옆에 <code>(patch v0.2.3)</code> 형태로 패치 버전을 표시합니다.<span class="tag">Linux ARM64 제외</span></div><div class="sym">render.BannerWithInfo</div></div>
-      <button class="mini" data-on="0" aria-label="banner 패치 전후 보기"><span class="lab"><i></i></span><span class="c">Antigravity CLI 1.5.7<span class="add"> (patch v0.2.3)</span></span></button></div>
+    <div class="p glow"><div class="id">banner</div><div><div class="d">상단 <code>Antigravity CLI 1.5.7</code> 옆에 <code>(patch v0.2.4)</code> 형태로 패치 버전을 표시합니다.<span class="tag">Linux ARM64 제외</span></div><div class="sym">render.BannerWithInfo</div></div>
+      <button class="mini" data-on="0" aria-label="banner 패치 전후 보기"><span class="lab"><i></i></span><span class="c">Antigravity CLI 1.5.7<span class="add"> (patch v0.2.4)</span></span></button></div>
     <div class="p glow"><div class="id">release-notes</div><div><div class="d">로고 아래에 패치 기능 요약과 저장소 정보를 표시합니다. <code>-p all,release-notes</code>처럼 명시해야 적용됩니다.<span class="tag">Linux ARM64 제외</span><span class="tag">기본 꺼짐</span></div><div class="sym">render.BuildHeader</div></div>
-      <button class="mini" data-on="0" aria-label="release-notes 패치 전후 보기"><span class="lab"><i></i></span><span class="c stt">로고 아래</span><span class="rn"><b>What's new in agy-cli-patch v0.2.3:</b><br><u>•</u> <b>code-theme</b>: readable code block theme (vs) …<br><u>•</u> <b>compact</b>: custom auto-compaction token limit …</span></button></div>
+      <button class="mini" data-on="0" aria-label="release-notes 패치 전후 보기"><span class="lab"><i></i></span><span class="c stt">로고 아래</span><span class="rn"><b>What's new in agy-cli-patch v0.2.4:</b><br><u>•</u> <b>code-theme</b>: readable code block theme (vs) …<br><u>•</u> <b>compact</b>: custom auto-compaction token limit …</span></button></div>
   </div>
 </section>
 
@@ -935,7 +935,7 @@ part('wizard', function(){
     {id: 'tilde-strike', t: '단일 물결표(~) 취소선 오작동 방지 (Double-Tilde Strikethrough)', d: "1.5.0~1.5.6 같은 범위 표기용 단일 '~'에 취소선이 그어지지 않도록 '~~'만 허용", s: 'goldmark/extension.(*strikethroughParser).Parse', def: true, off: '0xa1d5015'},
     {id: 'code-theme', t: '터미널 스킴 코드 블록 가독성 개선 (Terminal Code Theme)', d: 'colorScheme: terminal 사용 시 흐린 회색(#d0d0d0)으로 묻히는 코드 블록 테마(native)를 선명한 테마(기본 vs)로 교체', s: 'render.glamourStyleForScheme', def: true, off: '0xa31fe01, 0xa31fe15'},
     {id: 'compact', t: '자동 컴팩션 토큰 임계값 변경 (Auto-Compact Limit)', d: '내장 자동 컴팩션(CHECKPOINT) 발동 기준(기본 256k)을 원하는 토큰 수(기본 180k, 32k~1000k)로 변경 (기본 꺼짐)', s: 'utils.GetCheckpointConfig', def: false, off: '0x86858d8, 0x84f5e04, 0x84f5e09, 0x84f617d'},
-    {id: 'banner', t: '제품명 옆 패치 버전 표시 (Patch Version Tag)', d: "상단 'Antigravity CLI 1.5.7' 옆에 '(patch v0.2.3)' 형태로 패치 버전 표시", s: 'render.BannerWithInfo', def: true, off: '0xa8a4287, 0xa326f90'},
+    {id: 'banner', t: '제품명 옆 패치 버전 표시 (Patch Version Tag)', d: "상단 'Antigravity CLI 1.5.7' 옆에 '(patch v0.2.4)' 형태로 패치 버전 표시", s: 'render.BannerWithInfo', def: true, off: '0xa8a4287, 0xa326f90'},
     {id: 'release-notes', t: '상단 배너 릴리즈 노트 표시 (Release Notes)', d: '로고 아래에 패치 기능 요약 및 GitHub 정보 표시 (기본 꺼짐, -p 로 명시해야 적용)', s: 'render.BuildHeader', def: false, off: '0xa8a42c7, 0xa8a45e0, 0xa318180'}
   ];
   var N = P.length, B = 1, ND = 0, TI = 5, CI = 6;
@@ -1076,7 +1076,7 @@ part('wizard', function(){
   }
   function flashLines(){ return ln('') + (W.flash ? ln(sp(W.flash[0], W.flash[1])) + ln('') : ''); }
   function draw(){
-    var h = '<div class="hdr"><span><span class="ab">agy-cli-patch</span> <span class="dim">v0.2.3</span></span><span class="dim">ELF · x86_64</span></div>';
+    var h = '<div class="hdr"><span><span class="ab">agy-cli-patch</span> <span class="dim">v0.2.4</span></span><span class="dim">ELF · x86_64</span></div>';
     h += ln(sp('dim', '대상') + sp('gr', DIR + '/antigravity') + '<span class="dim" style="flex:none">1.5.7</span>');
     h += ln('');
     var names = ['패치 선택', '출력 방식', '확인'];

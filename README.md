@@ -17,7 +17,7 @@
 | `tilde-strike` | `goldmark/extension.(*strikethroughParser).Parse` | `1.5.0~1.5.6`, `H2~H6` 같은 범위 표기용 단일 물결표(`~`)에 취소선이 그어지는 현상 방지 (`~~` 2개만 취소선으로 인식) |
 | `code-theme` | `render.glamourStyleForScheme` | `colorScheme: terminal` 사용 시 흐린 회색(`#d0d0d0`)으로 묻히는 코드 블록 테마(`native`)를 선명한 테마(기본 `vs`)로 교체 |
 | `compact` | `utils.GetCheckpointConfig`, `config.applyFeatureProviderCheckpointOverrideConfig` | 내장 자동 컴팩션(CHECKPOINT) 발동 임계값(기본 256k)을 `32k~1000k`로 조절 (`180k`로 낮춰 `200k` 단가 할증 전 조기 요약 또는 `500k+`로 높여 1M 모델 원문 맥락 유지, **기본 꺼짐**) |
-| `banner` | `render.BannerWithInfo` | 상단 `Antigravity CLI 1.5.7` 옆에 `(patch v0.2.3)` 형태로 패치 버전 표시 (Linux ARM64 제외) |
+| `banner` | `render.BannerWithInfo` | 상단 `Antigravity CLI 1.5.7` 옆에 `(patch v0.2.4)` 형태로 패치 버전 표시 (Linux ARM64 제외) |
 | `release-notes` | `render.BuildHeader` | 로고 아래에 패치 기능 요약 및 GitHub 저장소 정보 표시 (Linux ARM64 제외, **기본 꺼짐** — `-p all,release-notes`처럼 명시해야 적용) |
 
 ## 설치 및 빌드
