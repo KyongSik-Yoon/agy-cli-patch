@@ -344,6 +344,7 @@ impl<'a> BinaryContext<'a> {
             "config.applyFeatureProviderCheckpointOverrideConfig",
             "render.BuildHeader",
             "render.BannerWithInfo",
+            "runtime.concatstring2",
             "runtime.concatstring3",
         ];
 
@@ -425,6 +426,118 @@ struct PatchSpec {
     symbol: &'static str,
     default_on: bool,
     resolver: fn(&BinaryContext) -> Result<Vec<ByteEdit>, String>,
+}
+
+// --- ARM64 명령어 인코딩/디코딩 (code-theme / compact / banner / release-notes 공용) ---
+
+mod a64 {
+    pub const NOP: u32 = 0xd503201f;
+
+    pub fn rd(w: u32) -> u32 {
+        w & 31
+    }
+    /// movz xRd, #imm16 (hw=0)
+    pub fn is_movz(w: u32) -> bool {
+        w & 0xffe0_0000 == 0xd280_0000
+    }
+    /// movk xRd, #imm16, lsl #(16*hw)
+    pub fn is_movk(w: u32, hw: u32) -> bool {
+        w & 0xffe0_0000 == 0xf280_0000 | (hw << 21)
+    }
+    pub fn imm16(w: u32) -> u32 {
+        (w >> 5) & 0xffff
+    }
+    pub fn movz(rd: u32, imm: u32) -> u32 {
+        0xd280_0000 | ((imm & 0xffff) << 5) | rd
+    }
+    pub fn movk16(rd: u32, imm: u32) -> u32 {
+        0xf2a0_0000 | ((imm & 0xffff) << 5) | rd
+    }
+    pub fn is_adrp(w: u32) -> bool {
+        w & 0x9f00_0000 == 0x9000_0000
+    }
+    /// adrp 가 가리키는 4KB 페이지 주소
+    pub fn adrp_target(w: u32, pc: usize) -> usize {
+        let imm = (((w >> 5) & 0x7ffff) << 2) | ((w >> 29) & 3);
+        let imm = ((imm as i64) << 43) >> 43; // 21비트 부호 확장
+        ((pc as i64 & !0xfff) + (imm << 12)) as usize
+    }
+    pub fn adrp(rd: u32, pc: usize, target: usize) -> Result<u32, String> {
+        let imm = (target as i64 >> 12) - (pc as i64 >> 12);
+        if !(-(1 << 20)..(1 << 20)).contains(&imm) {
+            return Err("ADRP 범위(±4GB) 초과".into());
+        }
+        let imm = imm as u32;
+        Ok(0x9000_0000 | ((imm & 3) << 29) | (((imm >> 2) & 0x7ffff) << 5) | rd)
+    }
+    /// add xRd, xRn, #imm12 (shift 0)
+    pub fn is_add_imm(w: u32) -> bool {
+        w & 0xffc0_0000 == 0x9100_0000
+    }
+    pub fn add_rn(w: u32) -> u32 {
+        (w >> 5) & 31
+    }
+    pub fn add_imm12(w: u32) -> usize {
+        ((w >> 10) & 0xfff) as usize
+    }
+    pub fn add_imm(rd: u32, rn: u32, imm: usize) -> u32 {
+        0x9100_0000 | (((imm & 0xfff) as u32) << 10) | (rn << 5) | rd
+    }
+    fn branch26(op: u32, pc: usize, target: usize) -> Result<u32, String> {
+        let delta = target as i64 - pc as i64;
+        if delta % 4 != 0 || !(-(1 << 27)..(1 << 27)).contains(&delta) {
+            return Err("B/BL 분기 범위(±128MB) 초과".into());
+        }
+        Ok(op | (((delta >> 2) as u32) & 0x03ff_ffff))
+    }
+    pub fn b(pc: usize, target: usize) -> Result<u32, String> {
+        branch26(0x1400_0000, pc, target)
+    }
+    pub fn bl(pc: usize, target: usize) -> Result<u32, String> {
+        branch26(0x9400_0000, pc, target)
+    }
+    pub fn is_b(w: u32) -> bool {
+        w & 0xfc00_0000 == 0x1400_0000
+    }
+    pub fn is_bl(w: u32) -> bool {
+        w & 0xfc00_0000 == 0x9400_0000
+    }
+    pub fn branch26_target(w: u32, pc: usize) -> usize {
+        let imm = (((w & 0x03ff_ffff) as i64) << 38) >> 36;
+        (pc as i64 + imm) as usize
+    }
+    /// b.cond: 조건 코드
+    pub fn bcond(w: u32) -> Option<u32> {
+        (w & 0xff00_0010 == 0x5400_0000).then_some(w & 0xf)
+    }
+    pub fn bcond_target(w: u32, pc: usize) -> usize {
+        let imm = ((((w >> 5) & 0x7ffff) as i64) << 45) >> 43;
+        (pc as i64 + imm) as usize
+    }
+    pub const COND_NE: u32 = 1;
+    pub const COND_LO: u32 = 3;
+    pub const COND_GT: u32 = 12;
+    pub const BR_X16: u32 = 0xd61f_0200;
+    pub const X16: u32 = 16;
+}
+
+fn word(data: &[u8], off: usize) -> u32 {
+    read_u32(data, off)
+}
+
+fn words(insns: &[u32]) -> Vec<u8> {
+    insns.iter().flat_map(|w| w.to_le_bytes()).collect()
+}
+
+/// movz/movk(lsl 16) 쌍을 32비트 값으로 디코드한다 (같은 레지스터일 때만).
+fn a64_mov32_pair(data: &[u8], off: usize) -> Option<(u32, u32)> {
+    let (w0, w1) = (word(data, off), word(data, off + 4));
+    (a64::is_movz(w0) && a64::is_movk(w1, 1) && a64::rd(w0) == a64::rd(w1))
+        .then(|| (a64::rd(w0), a64::imm16(w0) | (a64::imm16(w1) << 16)))
+}
+
+fn a64_mov32_pair_bytes(reg: u32, value: u32) -> Vec<u8> {
+    words(&[a64::movz(reg, value & 0xffff), a64::movk16(reg, value >> 16)])
 }
 
 const X86_CUT_ORIG: &[u8] = &[0x55, 0x48, 0x89, 0xe5];
@@ -807,10 +920,98 @@ struct CodeThemeSite {
     len_imm_off: usize,
 }
 
-fn find_code_theme_site(ctx: &BinaryContext) -> Result<CodeThemeSite, String> {
-    if ctx.arch != Arch::X86_64 {
-        return Err("code-theme 패치는 현재 x86_64 환경에서 우선 지원됩니다.".into());
+/// ARM64: `"terminal"` 비교 직후 `adrp xP; add xP, xP, #lo; (orr|movz) xL, #len; ... stp xP, xL, [..]`
+struct A64CodeThemeSite {
+    adrp_off: usize,
+    ptr_reg: u32,
+    len_off: usize,
+    len_reg: u32,
+}
+
+const A64_ORR_IMM6: u32 = 0xb27f_07e0; // orr xL, xzr, #0x6 (원본 "native" 길이)
+
+fn find_code_theme_site_a64(ctx: &BinaryContext) -> Result<A64CodeThemeSite, String> {
+    let (start, end) = ctx.get_func("render.glamourStyleForScheme")?;
+    let d = ctx.data;
+    // "terminal" = 0x6c61_6e69_6d72_6574 (little-endian 8바이트)
+    let chunks = [0x6574u32, 0x6d72, 0x6e69, 0x6c61];
+    let mut matches = Vec::new();
+    let mut off = start;
+    while off + 12 * 4 <= end {
+        let w = |k: usize| word(d, off + k * 4);
+        let r = a64::rd(w(0));
+        let is_terminal = a64::is_movz(w(0))
+            && a64::imm16(w(0)) == chunks[0]
+            && (1..4).all(|k| a64::is_movk(w(k), k as u32) && a64::rd(w(k)) == r && a64::imm16(w(k)) == chunks[k]);
+        let cmp_ok = w(4) & 0xffe0_fc1f == 0xeb00_001f && (w(4) >> 16) & 31 == r;
+        if !(is_terminal && cmp_ok && a64::bcond(w(5)) == Some(a64::COND_NE)) {
+            off += 4;
+            continue;
+        }
+        let (adrp, add, len) = (w(6), w(7), w(8));
+        let p = a64::rd(adrp);
+        let l = a64::rd(len);
+        let len_ok = (a64::is_movz(len) || len & !31 == A64_ORR_IMM6) && l != p;
+        let stp_ok = (9..12).any(|k| {
+            let s = w(k);
+            s & 0xffc0_0000 == 0xa900_0000 && s & 31 == p && (s >> 10) & 31 == l
+        });
+        if a64::is_adrp(adrp) && a64::is_add_imm(add) && a64::rd(add) == p && a64::add_rn(add) == p && len_ok && stp_ok {
+            matches.push(A64CodeThemeSite {
+                adrp_off: off + 24,
+                ptr_reg: p,
+                len_off: off + 32,
+                len_reg: l,
+            });
+        }
+        off += 4;
     }
+    if matches.len() != 1 {
+        return Err(format!(
+            "glamourStyleForScheme ARM64 terminal 테마 패턴 매칭 실패 (매칭 수: {})",
+            matches.len()
+        ));
+    }
+    Ok(matches.into_iter().next().unwrap())
+}
+
+fn detect_patched_code_theme_a64(ctx: &BinaryContext) -> Option<String> {
+    let site = find_code_theme_site_a64(ctx).ok()?;
+    let d = ctx.data;
+    let pc = ctx.off_to_va(site.adrp_off)?;
+    let str_va = a64::adrp_target(word(d, site.adrp_off), pc) + a64::add_imm12(word(d, site.adrp_off + 4));
+    let len_w = word(d, site.len_off);
+    let len = if a64::is_movz(len_w) { a64::imm16(len_w) as usize } else { 6 };
+    let str_off = ctx.va_to_off(str_va)?;
+    let s = std::str::from_utf8(d.get(str_off..str_off + len)?).ok()?;
+    (s != "native").then(|| s.to_string())
+}
+
+fn resolve_code_theme_a64(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
+    let site = find_code_theme_site_a64(ctx)?;
+    let theme_off = find_chroma_theme_offset(ctx.data, &ctx.code_theme)?;
+    let theme_va = ctx
+        .off_to_va(theme_off)
+        .ok_or_else(|| "테마 문자열 가상주소 변환 실패".to_string())?;
+    let pc = ctx
+        .off_to_va(site.adrp_off)
+        .ok_or_else(|| "ADRP 명령어 가상주소 변환 실패".to_string())?;
+    Ok(vec![
+        ByteEdit {
+            offset: site.adrp_off,
+            payload: words(&[
+                a64::adrp(site.ptr_reg, pc, theme_va)?,
+                a64::add_imm(site.ptr_reg, site.ptr_reg, theme_va & 0xfff),
+            ]),
+        },
+        ByteEdit {
+            offset: site.len_off,
+            payload: words(&[a64::movz(site.len_reg, ctx.code_theme.len() as u32)]),
+        },
+    ])
+}
+
+fn find_code_theme_site(ctx: &BinaryContext) -> Result<CodeThemeSite, String> {
     let (start, end) = ctx.get_func("render.glamourStyleForScheme")?;
     let body = &ctx.data[start..end];
     let mut matches = Vec::new();
@@ -862,6 +1063,9 @@ fn find_code_theme_site(ctx: &BinaryContext) -> Result<CodeThemeSite, String> {
 }
 
 fn detect_patched_code_theme(ctx: &BinaryContext) -> Option<String> {
+    if ctx.arch == Arch::Arm64 {
+        return detect_patched_code_theme_a64(ctx);
+    }
     let site = find_code_theme_site(ctx).ok()?;
     let disp = read_i32(ctx.data, site.lea_disp_off) as i64;
     let len = read_u32(ctx.data, site.len_imm_off) as usize;
@@ -873,6 +1077,9 @@ fn detect_patched_code_theme(ctx: &BinaryContext) -> Option<String> {
 }
 
 fn resolve_code_theme(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
+    if ctx.arch == Arch::Arm64 {
+        return resolve_code_theme_a64(ctx);
+    }
     let site = find_code_theme_site(ctx)?;
     let theme_off = find_chroma_theme_offset(ctx.data, &ctx.code_theme)?;
     let theme_va = ctx
@@ -938,18 +1145,23 @@ fn format_compact_tokens(tokens: u32) -> String {
     }
 }
 
+/// 임계값이 들어 있는 자리. x86_64 는 32비트 즉치(imm32), ARM64 는 movz/movk 쌍(레지스터 유지).
+enum CompactSlot {
+    Imm32(usize),
+    A64Pair { off: usize, reg: u32 },
+}
+
 struct CompactSites {
     override_branch_off: usize,
+    override_patch: Vec<u8>,
     is_override_patched: bool,
-    slot1_off: usize,
-    slot2_off: usize,
-    slot3_off: usize,
+    slots: [CompactSlot; 3],
     current_tokens: u32,
 }
 
 fn find_compact_sites(ctx: &BinaryContext) -> Result<CompactSites, String> {
-    if ctx.arch != Arch::X86_64 {
-        return Err("compact 패치는 현재 x86_64 환경에서 우선 지원됩니다.".into());
+    if ctx.arch == Arch::Arm64 {
+        return find_compact_sites_a64(ctx);
     }
 
     let (ov_start, ov_end) = ctx.get_func("config.applyFeatureProviderCheckpointOverrideConfig")?;
@@ -1013,10 +1225,108 @@ fn find_compact_sites(ctx: &BinaryContext) -> Result<CompactSites, String> {
 
     Ok(CompactSites {
         override_branch_off,
+        override_patch: vec![0x90, 0x90],
         is_override_patched,
-        slot1_off,
-        slot2_off,
-        slot3_off: fallback_matches[0],
+        slots: [
+            CompactSlot::Imm32(slot1_off),
+            CompactSlot::Imm32(slot2_off),
+            CompactSlot::Imm32(fallback_matches[0]),
+        ],
+        current_tokens,
+    })
+}
+
+const A64_TBNZ_W0_BIT0_SKIP2: u32 = 0x3700_0060; // tbnz w0, #0, +12
+
+fn find_compact_sites_a64(ctx: &BinaryContext) -> Result<CompactSites, String> {
+    let d = ctx.data;
+
+    // blr xN; tbnz w0,#0,+12 (패치 후 nop); ldr x0,[sp,#..]; b ..
+    // tbnz 를 지우면 feature provider 의 체크포인트 덮어쓰기를 건너뛰고 로컬 설정을 쓴다 (x86 jne → nop 과 같음).
+    let (ov_start, ov_end) = ctx.get_func("config.applyFeatureProviderCheckpointOverrideConfig")?;
+    let mut ov_matches = Vec::new();
+    let mut off = ov_start;
+    while off + 16 <= ov_end {
+        let (w0, w1, w2, w3) = (word(d, off), word(d, off + 4), word(d, off + 8), word(d, off + 12));
+        if w0 & 0xffff_fc1f == 0xd63f_0000
+            && (w1 == A64_TBNZ_W0_BIT0_SKIP2 || w1 == a64::NOP)
+            && w2 & 0xffc0_03ff == 0xf940_03e0
+            && a64::is_b(w3)
+        {
+            ov_matches.push((off + 4, w1 == a64::NOP));
+        }
+        off += 4;
+    }
+    if ov_matches.len() != 1 {
+        return Err(format!(
+            "applyFeatureProviderCheckpointOverrideConfig ARM64 분기 패턴 매칭 실패 (매칭 수: {})",
+            ov_matches.len()
+        ));
+    }
+    let (override_branch_off, is_override_patched) = ov_matches[0];
+
+    let (gc_start, gc_end) = ctx.get_func("utils.GetCheckpointConfig")?;
+
+    // 상한: movz/movk xR=N; cmp wA, wR; movz/movk xR=N; csel x?, x?, xR, lo
+    let mut limit_matches = Vec::new();
+    let mut off = gc_start;
+    while off + 24 <= gc_end {
+        if let (Some((r1, v1)), Some((r2, v2))) = (a64_mov32_pair(d, off), a64_mov32_pair(d, off + 12)) {
+            let cmp = word(d, off + 8);
+            let csel = word(d, off + 20);
+            if r1 == r2
+                && v1 == v2
+                && (MIN_COMPACT_TOKENS..=MAX_COMPACT_TOKENS).contains(&v1)
+                && cmp & 0xffe0_fc1f == 0x6b00_001f
+                && (cmp >> 16) & 31 == r1
+                && csel & 0xffe0_0c00 == 0x9a80_0000
+                && (csel >> 12) & 0xf == a64::COND_LO
+                && (csel >> 16) & 31 == r1
+            {
+                limit_matches.push((off, off + 12, r1, v1));
+            }
+        }
+        off += 4;
+    }
+    if limit_matches.len() != 1 {
+        return Err(format!(
+            "GetCheckpointConfig ARM64 상한 패턴 매칭 실패 (매칭 수: {})",
+            limit_matches.len()
+        ));
+    }
+    let (slot1_off, slot2_off, limit_reg, current_tokens) = limit_matches[0];
+
+    // 폴백: b.gt +16; movz/movk xR=N; str wR, [x?, #0xc]
+    let mut fallback_matches = Vec::new();
+    let mut off = gc_start + 4;
+    while off + 12 <= gc_end {
+        let prev = word(d, off - 4);
+        let skip_ok = a64::bcond(prev) == Some(a64::COND_GT) && a64::bcond_target(prev, off - 4) == off + 12;
+        if let Some((r, v)) = a64_mov32_pair(d, off) {
+            let st = word(d, off + 8);
+            if skip_ok && v == current_tokens && st & 0xffff_fc00 == 0xb900_0c00 && st & 31 == r {
+                fallback_matches.push((off, r));
+            }
+        }
+        off += 4;
+    }
+    if fallback_matches.len() != 1 {
+        return Err(format!(
+            "GetCheckpointConfig ARM64 fallback 패턴 매칭 실패 (매칭 수: {})",
+            fallback_matches.len()
+        ));
+    }
+    let (slot3_off, fallback_reg) = fallback_matches[0];
+
+    Ok(CompactSites {
+        override_branch_off,
+        override_patch: words(&[a64::NOP]),
+        is_override_patched,
+        slots: [
+            CompactSlot::A64Pair { off: slot1_off, reg: limit_reg },
+            CompactSlot::A64Pair { off: slot2_off, reg: limit_reg },
+            CompactSlot::A64Pair { off: slot3_off, reg: fallback_reg },
+        ],
         current_tokens,
     })
 }
@@ -1028,25 +1338,23 @@ fn detect_patched_compact_tokens(ctx: &BinaryContext) -> Option<u32> {
 
 fn resolve_compact(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
     let sites = find_compact_sites(ctx)?;
-    let imm = ctx.compact_tokens.to_le_bytes().to_vec();
-    Ok(vec![
-        ByteEdit {
-            offset: sites.override_branch_off,
-            payload: vec![0x90, 0x90],
-        },
-        ByteEdit {
-            offset: sites.slot1_off,
-            payload: imm.clone(),
-        },
-        ByteEdit {
-            offset: sites.slot2_off,
-            payload: imm.clone(),
-        },
-        ByteEdit {
-            offset: sites.slot3_off,
-            payload: imm,
-        },
-    ])
+    let mut edits = vec![ByteEdit {
+        offset: sites.override_branch_off,
+        payload: sites.override_patch,
+    }];
+    for slot in &sites.slots {
+        edits.push(match *slot {
+            CompactSlot::Imm32(off) => ByteEdit {
+                offset: off,
+                payload: ctx.compact_tokens.to_le_bytes().to_vec(),
+            },
+            CompactSlot::A64Pair { off, reg } => ByteEdit {
+                offset: off,
+                payload: a64_mov32_pair_bytes(reg, ctx.compact_tokens),
+            },
+        });
+    }
+    Ok(edits)
 }
 
 // banner / release-notes 패치가 공유하는 0xcc 패딩 공간(cave) 배치.
@@ -1061,6 +1369,183 @@ fn find_cave(ctx: &BinaryContext) -> Result<usize, String> {
         .windows(needle.len())
         .position(|w| w == needle)
         .ok_or_else(|| format!("실행 파일 내 0xcc 여유 공간({CAVE_MIN}바이트)을 찾을 수 없습니다."))
+}
+
+/// Mach-O ARM64: `__TEXT` 세그먼트(r-x) 안, 마지막 섹션 뒤의 페이지 정렬 패딩을 동굴로 쓴다.
+/// 섹션 헤더로 위치를 정하므로 패치 후 내용이 바뀌어도 같은 자리를 돌려준다(재패치 가능).
+/// Linux ELF ARM64 는 실행 세그먼트 바로 뒤에 RW 세그먼트가 붙어 있어 쓸 수 있는 패딩이 없다.
+fn find_cave_a64(ctx: &BinaryContext) -> Result<usize, String> {
+    if ctx.format != Format::MachO64 {
+        return Err("ARM64 banner/release-notes 패치는 macOS(Mach-O)에서만 지원됩니다 (Linux ARM64 는 여유 공간 없음).".into());
+    }
+    let d = ctx.data;
+    let ncmds = read_u32(d, 16) as usize;
+    let mut off = 32usize;
+    for _ in 0..ncmds {
+        let cmd = read_u32(d, off);
+        let cmdsize = read_u32(d, off + 4) as usize;
+        let segname = &d[off + 8..off + 24];
+        if cmd == 0x19 && segname.starts_with(b"__TEXT\0") {
+            let seg_fileoff = read_u64(d, off + 40) as usize;
+            let seg_end = seg_fileoff + read_u64(d, off + 48) as usize;
+            let nsects = read_u32(d, off + 64) as usize;
+            let mut last_end = seg_fileoff;
+            for k in 0..nsects {
+                let s = off + 72 + k * 80;
+                let size = read_u64(d, s + 40) as usize;
+                let sect_off = read_u32(d, s + 48) as usize;
+                if sect_off != 0 {
+                    last_end = last_end.max(sect_off + size);
+                }
+            }
+            let cave = (last_end + 15) & !15;
+            if seg_end < cave + CAVE_MIN {
+                return Err(format!("__TEXT 세그먼트 끝 여유 공간이 부족합니다 ({}바이트 필요).", CAVE_MIN));
+            }
+            return Ok(cave);
+        }
+        off += cmdsize;
+    }
+    Err("Mach-O __TEXT 세그먼트를 찾을 수 없습니다.".into())
+}
+
+fn a64_va(ctx: &BinaryContext, off: usize) -> Result<usize, String> {
+    ctx.off_to_va(off).ok_or_else(|| format!("가상주소 변환 실패 (@0x{off:x})"))
+}
+
+/// BannerWithInfo 채널 검사 (원본):
+///   add x27, sp, #0xfff; add x27, x27, #..; ldp xP, xL, [x27]; cbz xL, skip
+///   str x1, [sp, #..]; str x0, [sp, #..]; cmp xL, #6; b.ne fmt   ("stable" 검사)
+/// 패치 후:
+///   (같은 add 두 줄); adrp xP, chan; add xP, xP, #lo; (str 두 줄 유지); movz xL, #len; b fmt
+/// 두 str 는 Sprintf 뒤 concatstring2 가 다시 읽는 제품명 슬롯이므로 반드시 남긴다(x86 과 같은 이유).
+fn resolve_banner_a64(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
+    let (start, end) = ctx.get_func("render.BannerWithInfo")?;
+    let cave = find_cave_a64(ctx)?;
+    let chan = format!("patch v{}", env!("CARGO_PKG_VERSION")).into_bytes();
+    assert!(chan.len() <= CAVE_NOTES_OFF - CAVE_CHAN_OFF);
+    let chan_off = cave + CAVE_CHAN_OFF;
+    let chan_va = a64_va(ctx, chan_off)?;
+
+    let d = ctx.data;
+    let is_str_sp = |w: u32| w & 0xffc0_03e0 == 0xf900_03e0;
+    let mut matches = Vec::new();
+    let mut off = start + 8;
+    while off + 24 <= end {
+        let w = |k: usize| word(d, off + k * 4);
+        let x27_ok = word(d, off - 8) == 0x913f_fffb && word(d, off - 4) & 0xffc0_03ff == 0x9100_037b;
+        if !(x27_ok && is_str_sp(w(2)) && is_str_sp(w(3))) {
+            off += 4;
+            continue;
+        }
+        // 원본 형태
+        let (w0, w1, w4, w5) = (w(0), w(1), w(4), w(5));
+        if w0 & 0xffff_83e0 == 0xa940_0360 && a64::bcond(w5) == Some(a64::COND_NE) {
+            let (p, l) = (w0 & 31, (w0 >> 10) & 31);
+            if w1 & 0xff00_001f == 0xb400_0000 | l && w4 == 0xf100_181f | (l << 5) {
+                matches.push((off, p, l, a64::bcond_target(w5, off + 20)));
+            }
+        }
+        // 이미 패치된 형태
+        if a64::is_adrp(w0) && a64::is_add_imm(w1) && a64::rd(w1) == a64::rd(w0) && a64::add_rn(w1) == a64::rd(w0)
+            && a64::is_movz(w4) && a64::is_b(w5)
+        {
+            let target = a64::branch26_target(w5, a64_va(ctx, off + 20)?);
+            let target = ctx.va_to_off(target).ok_or("분기 대상 변환 실패")?;
+            matches.push((off, a64::rd(w0), a64::rd(w4), target));
+        }
+        off += 4;
+    }
+    if matches.len() != 1 {
+        return Err(format!("BannerWithInfo ARM64 채널 검사 패턴 매칭 실패 (매칭 수: {})", matches.len()));
+    }
+    let (site, p, l, fmt_off) = matches[0];
+    let site_va = a64_va(ctx, site)?;
+    Ok(vec![
+        ByteEdit { offset: chan_off, payload: chan.clone() },
+        ByteEdit {
+            offset: site,
+            payload: words(&[a64::adrp(p, site_va, chan_va)?, a64::add_imm(p, p, chan_va & 0xfff)]),
+        },
+        ByteEdit {
+            offset: site + 16,
+            payload: words(&[
+                a64::movz(l, chan.len() as u32),
+                a64::b(site_va + 20, a64_va(ctx, fmt_off)?)?,
+            ]),
+        },
+    ])
+}
+
+/// BuildHeader 끝의 `"\n" + strings.Join(lines, "\n")` (concatstring2) 호출을
+/// 동굴 트램펄린으로 돌려 세 번째 인자(릴리즈 노트)를 붙인 concatstring3 로 꼬리 분기한다.
+///   tramp: adrp x5, notes; add x5, x5, #lo; movz x6, #len; adrp x16, concatstring3; add x16, x16, #lo; br x16
+/// 동굴에서 concatstring3 까지는 b(±128MB) 범위를 넘으므로 x16(링커 예약 스크래치)으로 간접 분기한다.
+/// bl 이 아닌 br 이라 LR 은 BuildHeader 복귀 주소 그대로이고, BuildHeader 는 이미 concatstring3 를
+/// 직접 호출하므로 7워드 인자 스필 영역도 확보돼 있다.
+fn resolve_release_notes_a64(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
+    let (bh_start, bh_end) = ctx.get_func("render.BuildHeader")?;
+    let (concat2_start, _) = ctx.get_func("runtime.concatstring2")?;
+    let (concat3_start, _) = ctx.get_func("runtime.concatstring3")?;
+    let cave = find_cave_a64(ctx)?;
+
+    let notes = format!("\n\n{}", release_notes_text()).into_bytes();
+    if notes.len() > 0xffff {
+        return Err("릴리즈 노트가 너무 깁니다.".into());
+    }
+    let notes_off = cave + CAVE_NOTES_OFF;
+    let tramp_off = (notes_off + notes.len() + 15) & !15;
+    if tramp_off + 24 > cave + CAVE_MIN {
+        return Err("릴리즈 노트가 여유 공간을 초과합니다.".into());
+    }
+    let notes_va = a64_va(ctx, notes_off)?;
+    let tramp_va = a64_va(ctx, tramp_off)?;
+    let c3_va = a64_va(ctx, concat3_start)?;
+    let tramp = words(&[
+        a64::adrp(5, tramp_va, notes_va)?,
+        a64::add_imm(5, 5, notes_va & 0xfff),
+        a64::movz(6, notes.len() as u32),
+        a64::adrp(a64::X16, tramp_va + 12, c3_va)?,
+        a64::add_imm(a64::X16, a64::X16, c3_va & 0xfff),
+        a64::BR_X16,
+    ]);
+
+    // orr x2, xzr, #1; mov x3, x0; mov x4, x1; mov x0, xzr; adrp x1, "\n"; add x1, x1, #lo; bl concatstring2
+    let d = ctx.data;
+    let concat2_va = a64_va(ctx, concat2_start)?;
+    let mut matches = Vec::new();
+    let mut off = bh_start;
+    while off + 28 <= bh_end {
+        let w = |k: usize| word(d, off + k * 4);
+        if w(0) == 0xb240_03e2
+            && w(1) == 0xaa00_03e3
+            && w(2) == 0xaa01_03e4
+            && w(3) == 0xaa1f_03e0
+            && a64::is_adrp(w(4))
+            && a64::rd(w(4)) == 1
+            && w(5) & 0xffc0_03ff == 0x9100_0021
+            && a64::is_bl(w(6))
+        {
+            let call = off + 24;
+            let target = a64::branch26_target(w(6), a64_va(ctx, call)?);
+            if target == concat2_va || target == tramp_va {
+                matches.push(call);
+            }
+        }
+        off += 4;
+    }
+    if matches.len() != 1 {
+        return Err(format!("BuildHeader ARM64 concatstring2 패턴 매칭 실패 (매칭 수: {})", matches.len()));
+    }
+    let call = matches[0];
+    Ok(vec![
+        ByteEdit { offset: notes_off, payload: notes },
+        ByteEdit { offset: tramp_off, payload: tramp },
+        ByteEdit {
+            offset: call,
+            payload: words(&[a64::bl(a64_va(ctx, call)?, tramp_va)?]),
+        },
+    ])
 }
 
 fn resolve_banner(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
@@ -1127,7 +1612,7 @@ fn resolve_banner(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
             });
             Ok(edits)
         }
-        Arch::Arm64 => Err("banner 패치는 현재 x86_64 환경에서 우선 지원됩니다.".into()),
+        Arch::Arm64 => resolve_banner_a64(ctx),
     }
 }
 
@@ -1242,7 +1727,7 @@ fn resolve_release_notes(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
 
             Ok(edits)
         }
-        Arch::Arm64 => Err("release-notes 패치는 현재 x86_64 환경에서 우선 지원됩니다.".into()),
+        Arch::Arm64 => resolve_release_notes_a64(ctx),
     }
 }
 
@@ -3366,5 +3851,123 @@ mod tests {
                 .as_deref(),
             Some("solarized-light")
         );
+    }
+
+    fn put_words(buf: &mut [u8], off: usize, insns: &[u32]) {
+        buf[off..off + insns.len() * 4].copy_from_slice(&words(insns));
+    }
+
+    fn a64_ctx<'a>(buf: &'a [u8], funcs: &[(&'static str, usize, usize)], tokens: u32, theme: &str) -> BinaryContext<'a> {
+        BinaryContext {
+            data: buf,
+            format: Format::MachO64,
+            arch: Arch::Arm64,
+            segments: Vec::new(),
+            funcs: funcs.iter().map(|&(n, s, e)| (n, (s, e))).collect(),
+            compact_tokens: tokens,
+            code_theme: theme.to_string(),
+        }
+    }
+
+    fn apply(buf: &mut [u8], edits: Vec<ByteEdit>) {
+        for e in edits {
+            buf[e.offset..e.offset + e.payload.len()].copy_from_slice(&e.payload);
+        }
+    }
+
+    #[test]
+    fn a64_encoders_round_trip() {
+        let pc = 0x1_0000_1234usize;
+        let target = 0x1_0903_5678usize;
+        let w = a64::adrp(5, pc, target).unwrap();
+        assert!(a64::is_adrp(w));
+        assert_eq!(a64::rd(w), 5);
+        assert_eq!(a64::adrp_target(w, pc), target & !0xfff);
+        // 아래 방향 페이지
+        let w = a64::adrp(16, target, pc).unwrap();
+        assert_eq!(a64::adrp_target(w, target), pc & !0xfff);
+
+        let add = a64::add_imm(5, 5, target & 0xfff);
+        assert!(a64::is_add_imm(add));
+        assert_eq!(a64::add_imm12(add), 0x678);
+
+        let b = a64::b(0x2000, 0x1000).unwrap();
+        assert!(a64::is_b(b));
+        assert_eq!(a64::branch26_target(b, 0x2000), 0x1000);
+        let bl = a64::bl(0x1000, 0x5000).unwrap();
+        assert!(a64::is_bl(bl));
+        assert_eq!(a64::branch26_target(bl, 0x1000), 0x5000);
+        assert!(a64::b(0, 1 << 28).is_err());
+
+        // 실제 agy 1.5.9 macOS arm64 의 b.gt +16 (0x5400008c)
+        assert_eq!(a64::bcond(0x5400_008c), Some(a64::COND_GT));
+        assert_eq!(a64::bcond_target(0x5400_008c, 0x100), 0x110);
+        assert_eq!(a64_mov32_pair(&words(&[0xd29d_0004, 0xf2a0_0064]), 0), Some((4, 256_000)));
+    }
+
+    #[test]
+    fn a64_compact_patches_and_repatches_idempotently() {
+        // 실제 agy 1.5.9 macOS arm64 명령어 그대로
+        let mut buf = vec![0u8; 512];
+        let (ov_start, ov_end) = (0usize, 64usize);
+        put_words(&mut buf, ov_start + 16, &[0xd63f_00c0, 0x3700_0060, 0xf940_27e0, 0x1400_0012]);
+        let (gc_start, gc_end) = (128usize, 384usize);
+        let limit = gc_start + 16;
+        put_words(&mut buf, limit, &[0xd29d_0004, 0xf2a0_0064, 0x6b04_007f, 0xd29d_0004, 0xf2a0_0064, 0x9a84_3063]);
+        let fb = gc_start + 128;
+        put_words(&mut buf, fb - 8, &[0x7100_007f, 0x5400_008c, 0xd29d_0003, 0xf2a0_0063, 0xb900_0c03]);
+        let funcs = [
+            ("config.applyFeatureProviderCheckpointOverrideConfig", ov_start, ov_end),
+            ("utils.GetCheckpointConfig", gc_start, gc_end),
+        ];
+
+        assert_eq!(detect_patched_compact_tokens(&a64_ctx(&buf, &funcs, 0, "vs")), None);
+        for tokens in [180_000u32, 400_000, 32_000] {
+            let edits = resolve_compact(&a64_ctx(&buf, &funcs, tokens, "vs")).expect("ARM64 compact 매칭");
+            assert_eq!(edits.len(), 4);
+            apply(&mut buf, edits);
+            assert_eq!(word(&buf, ov_start + 20), a64::NOP);
+            assert_eq!(a64_mov32_pair(&buf, limit), Some((4, tokens)));
+            assert_eq!(a64_mov32_pair(&buf, limit + 12), Some((4, tokens)));
+            assert_eq!(a64_mov32_pair(&buf, fb), Some((3, tokens)));
+            assert_eq!(detect_patched_compact_tokens(&a64_ctx(&buf, &funcs, 0, "vs")), Some(tokens));
+        }
+    }
+
+    #[test]
+    fn a64_code_theme_patches_and_repatches_idempotently() {
+        let mut buf = vec![0u8; 0x3000];
+        let mut put_tag = |off: usize, name: &str| {
+            let tag = format!("<style name=\"{name}\">");
+            buf[off..off + tag.len()].copy_from_slice(tag.as_bytes());
+            off + 13
+        };
+        let native = put_tag(0x1800, "native");
+        let vs = put_tag(0x1900, "vs");
+        let sol = put_tag(0x2a10, "solarized-light");
+
+        // 실제 agy 1.5.9 macOS arm64 의 두 번째 "terminal" 비교 + "native" 대입
+        let (fs, fe) = (0x100usize, 0x200usize);
+        let site = fs + 0x20;
+        let adrp = a64::adrp(0, site + 24, native).unwrap();
+        let add = a64::add_imm(0, 0, native & 0xfff);
+        put_words(
+            &mut buf,
+            site,
+            &[0xd28c_ae81, 0xf2ad_ae41, 0xf2cd_cd21, 0xf2ed_8c21, 0xeb01_001f, 0x5400_07e1,
+              adrp, add, 0xb27f_07e1, 0x913f_fffb, 0x9118_c77b, 0xa900_0760],
+        );
+        let funcs = [("render.glamourStyleForScheme", fs, fe)];
+
+        assert_eq!(detect_patched_code_theme(&a64_ctx(&buf, &funcs, 0, "vs")), None);
+        assert!(resolve_code_theme(&a64_ctx(&buf, &funcs, 0, "nonexistent-theme")).is_err());
+        for (theme, off) in [("vs", vs), ("solarized-light", sol)] {
+            let edits = resolve_code_theme(&a64_ctx(&buf, &funcs, 0, theme)).expect("ARM64 code-theme 매칭");
+            apply(&mut buf, edits);
+            let w = word(&buf, site + 24);
+            assert_eq!(a64::adrp_target(w, site + 24) + a64::add_imm12(word(&buf, site + 28)), off);
+            assert_eq!(word(&buf, site + 32), a64::movz(1, theme.len() as u32));
+            assert_eq!(detect_patched_code_theme(&a64_ctx(&buf, &funcs, 0, theme)).as_deref(), Some(theme));
+        }
     }
 }
