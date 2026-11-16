@@ -4,7 +4,7 @@
 
 `agy`(Antigravity CLI — **Linux & macOS**, **x86_64 & ARM64/Apple Silicon**) 바이너리의 스트리밍 출력 방식과 마크다운 렌더링 결함을 동적 심볼/시그니처 탐색으로 패치하는 초고속 모듈형 도구(Rust)입니다.
 
-릴리즈마다 바뀌는 고정 주소에 의존하지 않고, `mmap` 제로카피 매핑으로 **ELF64**(Linux) 및 **Mach-O 64**(macOS)의 텍스트 섹션과 Go `.gopclntab` 심볼 테이블을 파싱하여 대상 함수를 찾고, 아키텍처별(`x86_64` / `ARM64`) 기계어 시그니처를 검증한 뒤 패치합니다(외부 크레이트 의존성 0, Linux `FICLONE` reflink 및 macOS `codesign -f -s -` 자동 서명 지원). 단, `banner`·`release-notes` 패치는 Linux ARM64에서 지원하지 않습니다(실행 세그먼트에 문자열·트램펄린을 넣을 여유 공간이 없음). macOS Apple Silicon에서는 모든 패치를 쓸 수 있습니다. Linux ARM64는 agy 1.5.9 기준 `.text` 앞쪽 C 런타임 코드 때문에 함수 위치 계산이 어긋나 현재 대부분의 패치가 적용되지 않습니다.
+릴리즈마다 바뀌는 고정 주소에 의존하지 않고, `mmap` 제로카피 매핑으로 **ELF64**(Linux) 및 **Mach-O 64**(macOS)의 텍스트 섹션과 Go `.gopclntab` 심볼 테이블을 파싱하여 대상 함수를 찾고, 아키텍처별(`x86_64` / `ARM64`) 기계어 시그니처를 검증한 뒤 패치합니다(외부 크레이트 의존성 0, Linux `FICLONE` reflink 및 macOS `codesign -f -s -` 자동 서명 지원). 단, `banner`·`release-notes` 패치는 Linux ARM64에서 지원하지 않습니다(실행 세그먼트에 문자열·트램펄린을 넣을 여유 공간이 없음). macOS Apple Silicon에서는 모든 패치를 쓸 수 있습니다.
 
 ## 지원하는 패치 목록 (`--list`)
 

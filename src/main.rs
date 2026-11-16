@@ -170,6 +170,40 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
+/// PIE ELF 에서는 pclntab 의 textStart 가 0 으로 남고(읽기 전용이라 재배치되지 않음),
+/// 실제 Go 코드 시작은 runtime.firstmoduledata.text 에 R_*_RELATIVE 재배치의 addend 로만 들어 있다.
+/// moduledata 첫 필드(pcHeader 포인터)가 pclntab 을 가리키는 재배치로 moduledata 를 찾고,
+/// text 필드(+176, Go 1.16+ 레이아웃)의 재배치 addend 를 읽는다.
+/// Linux ARM64 는 .text 앞에 C 런타임 코드가 있어 이 값 없이는 모든 함수 위치가 어긋난다.
+fn elf_go_text_va(data: &[u8], segments: &[(usize, usize, usize)], pcln_off: usize) -> Option<usize> {
+    const MODULEDATA_TEXT: u64 = 176;
+    let pcln_va = segments
+        .iter()
+        .find(|&&(off, _, size)| pcln_off >= off && pcln_off - off < size)
+        .map(|&(off, va, _)| (va + (pcln_off - off)) as u64)?;
+    let e_shoff = read_u64(data, 0x28) as usize;
+    let e_shentsize = read_u16(data, 0x3a) as usize;
+    let e_shnum = read_u16(data, 0x3c) as usize;
+    let relas: Vec<(usize, usize)> = (0..e_shnum)
+        .map(|i| e_shoff + i * e_shentsize)
+        .filter(|&b| b + 40 <= data.len() && read_u32(data, b + 4) == 4) // SHT_RELA
+        .map(|b| (read_u64(data, b + 24) as usize, read_u64(data, b + 32) as usize))
+        .filter(|&(off, size)| off + size <= data.len())
+        .collect();
+    let is_relative = |info: u64| matches!(info & 0xffff_ffff, 8 | 1027); // R_X86_64_RELATIVE, R_AARCH64_RELATIVE
+    let find = |pred: &dyn Fn(u64, u64) -> bool| -> Option<(u64, u64)> {
+        relas.iter().find_map(|&(off, size)| {
+            (0..size / 24).map(|k| off + k * 24).find_map(|e| {
+                let (r_off, info, addend) = (read_u64(data, e), read_u64(data, e + 8), read_u64(data, e + 16));
+                (is_relative(info) && pred(r_off, addend)).then_some((r_off, addend))
+            })
+        })
+    };
+    let (moduledata, _) = find(&|_, addend| addend == pcln_va)?;
+    let (_, text) = find(&|r_off, _| r_off == moduledata + MODULEDATA_TEXT)?;
+    Some(text as usize)
+}
+
 struct BinaryContext<'a> {
     data: &'a [u8],
     format: Format,
@@ -303,8 +337,20 @@ impl<'a> BinaryContext<'a> {
         let funcname_off = read_u64(data, pcln_off + 32) as usize;
         let ftab_off = read_u64(data, pcln_off + 64) as usize;
 
+        let pie_text_off = (text_start == 0 && format == Format::Elf64)
+            .then(|| elf_go_text_va(data, &segments, pcln_off))
+            .flatten()
+            .and_then(|va| {
+                segments
+                    .iter()
+                    .find(|&&(_, s_va, size)| va >= s_va && va - s_va < size)
+                    .map(|&(file_off, s_va, _)| file_off + (va - s_va))
+            });
+
         let go_text_off = if text_start != 0 {
             text_off + (text_start - text_va)
+        } else if let Some(off) = pie_text_off {
+            off
         } else if format == Format::Elf64 && arch == Arch::X86_64 {
             // Linux ELF64 CGO/PIE: .text 앞쪽 glibc CRT 패딩(0xcc) 직후 첫 Go 함수 프롤로그 탐색
             let window = &data[text_off..text_off + 0x1000];
