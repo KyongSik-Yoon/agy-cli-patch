@@ -1527,8 +1527,10 @@ fn resolve_release_notes_a64(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, Strin
             && a64::is_bl(w(6))
         {
             let call = off + 24;
+            // 다른 버전의 패처가 만든 트램펄린(노트 길이가 달라 위치가 다름)도 동굴 안이면 재패치를 허용한다
             let target = a64::branch26_target(w(6), a64_va(ctx, call)?);
-            if target == concat2_va || target == tramp_va {
+            let target_off = ctx.va_to_off(target).unwrap_or(usize::MAX);
+            if target == concat2_va || (cave..cave + CAVE_MIN).contains(&target_off) {
                 matches.push(call);
             }
         }
