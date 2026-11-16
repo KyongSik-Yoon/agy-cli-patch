@@ -174,12 +174,15 @@ struct BinaryContext<'a> {
     data: &'a [u8],
     format: Format,
     arch: Arch,
+    segments: Vec<(usize, usize, usize)>, // (file_off, va, file_size)
     funcs: HashMap<&'a str, (usize, usize)>,
     compact_tokens: u32,
+    code_theme: String,
 }
 
 impl<'a> BinaryContext<'a> {
     fn parse(data: &'a [u8]) -> Result<Self, String> {
+        let mut segments = Vec::new();
         let (format, arch, text_va, text_off) = if &data[..4] == b"\x7fELF" {
             let e_machine = read_u16(data, 0x12);
             let arch = match e_machine {
@@ -187,6 +190,25 @@ impl<'a> BinaryContext<'a> {
                 0xb7 => Arch::Arm64,
                 other => return Err(format!("지원하지 않는 ELF 아키텍처입니다 (e_machine=0x{other:x}).")),
             };
+
+            let e_phoff = read_u64(data, 0x20) as usize;
+            let e_phentsize = read_u16(data, 0x36) as usize;
+            let e_phnum = read_u16(data, 0x38) as usize;
+            if e_phoff > 0 && e_phentsize >= 40 && e_phoff + e_phnum * e_phentsize <= data.len() {
+                for i in 0..e_phnum {
+                    let base = e_phoff + i * e_phentsize;
+                    let p_type = read_u32(data, base);
+                    if p_type == 1 {
+                        // PT_LOAD
+                        let p_offset = read_u64(data, base + 8) as usize;
+                        let p_vaddr = read_u64(data, base + 16) as usize;
+                        let p_filesz = read_u64(data, base + 32) as usize;
+                        if p_filesz > 0 {
+                            segments.push((p_offset, p_vaddr, p_filesz));
+                        }
+                    }
+                }
+            }
 
             let e_shoff = read_u64(data, 0x28) as usize;
             let e_shentsize = read_u16(data, 0x3a) as usize;
@@ -239,6 +261,13 @@ impl<'a> BinaryContext<'a> {
                 let cmdsize = read_u32(data, off + 4) as usize;
                 if cmd == 0x19 {
                     // LC_SEGMENT_64
+                    let vmaddr = read_u64(data, off + 24) as usize;
+                    let fileoff = read_u64(data, off + 40) as usize;
+                    let filesize = read_u64(data, off + 48) as usize;
+                    if filesize > 0 {
+                        segments.push((fileoff, vmaddr, filesize));
+                    }
+
                     let nsects = read_u32(data, off + 64) as usize;
                     let mut sect_off = off + 72;
                     for _ in 0..nsects {
@@ -347,9 +376,31 @@ impl<'a> BinaryContext<'a> {
             data,
             format,
             arch,
+            segments,
             funcs,
             compact_tokens: DEFAULT_COMPACT_TOKENS,
+            code_theme: DEFAULT_CODE_THEME.to_string(),
         })
+    }
+
+    fn off_to_va(&self, off: usize) -> Option<usize> {
+        if self.segments.is_empty() {
+            return Some(off);
+        }
+        self.segments
+            .iter()
+            .find(|&&(file_off, _, size)| off >= file_off && off - file_off < size)
+            .and_then(|&(file_off, va, _)| va.checked_add(off - file_off))
+    }
+
+    fn va_to_off(&self, addr: usize) -> Option<usize> {
+        if self.segments.is_empty() {
+            return Some(addr);
+        }
+        self.segments
+            .iter()
+            .find(|&&(_, va, size)| addr >= va && addr - va < size)
+            .and_then(|&(file_off, va, _)| file_off.checked_add(addr - va))
     }
 
     fn get_func(&self, name: &str) -> Result<(usize, usize), String> {
@@ -700,6 +751,150 @@ fn resolve_tilde_strike(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
     }
 }
 
+const DEFAULT_CODE_THEME: &str = "vs";
+const CODE_THEME_PRESETS: &[&str] = &[
+    "vs",
+    "solarized-light",
+    "bw",
+    "github",
+    "catppuccin-latte",
+    "xcode",
+];
+
+fn parse_code_theme(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim().to_ascii_lowercase();
+    let valid = !trimmed.is_empty()
+        && trimmed.len() <= 32
+        && trimmed
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_');
+    if !valid {
+        return Err(format!(
+            "유효하지 않은 코드 테마 이름입니다: '{raw}' (영문 소문자·숫자·하이픈·밑줄, 예: vs, solarized-light, bw)"
+        ));
+    }
+    Ok(trimmed)
+}
+
+fn find_chroma_theme_offset(data: &[u8], theme: &str) -> Result<usize, String> {
+    let prefix = b"<style name=\"";
+    let needle = format!("<style name=\"{theme}\"");
+    let nb = needle.as_bytes();
+    if data.len() >= nb.len() {
+        let limit = data.len() - nb.len();
+        let mut i = 0usize;
+        while i <= limit {
+            if let Some(rel) = data[i..=limit].iter().position(|&b| b == nb[0]) {
+                let pos = i + rel;
+                if &data[pos..pos + nb.len()] == nb {
+                    return Ok(pos + prefix.len());
+                }
+                i = pos + 1;
+            } else {
+                break;
+            }
+        }
+    }
+    Err(format!(
+        "바이너리 내장 Chroma 스타일에서 '{theme}' 테마를 찾을 수 없습니다 (추천: {})",
+        CODE_THEME_PRESETS.join(", ")
+    ))
+}
+
+struct CodeThemeSite {
+    lea_disp_off: usize,
+    lea_next_off: usize,
+    len_imm_off: usize,
+}
+
+fn find_code_theme_site(ctx: &BinaryContext) -> Result<CodeThemeSite, String> {
+    if ctx.arch != Arch::X86_64 {
+        return Err("code-theme 패치는 현재 x86_64 환경에서 우선 지원됩니다.".into());
+    }
+    let (start, end) = ctx.get_func("render.glamourStyleForScheme")?;
+    let body = &ctx.data[start..end];
+    let mut matches = Vec::new();
+    for i in 0..body.len().saturating_sub(42) {
+        if body[i] != 0x48
+            || !(0xb8..=0xbf).contains(&body[i + 1])
+            || &body[i + 2..i + 10] != b"terminal"
+            || body[i + 10] != 0x48
+            || body[i + 11] != 0x39
+        {
+            continue;
+        }
+        let lea_rel = if body[i + 13] == 0x0f && body[i + 14] == 0x85 {
+            i + 19
+        } else if body[i + 13] == 0x75 {
+            i + 15
+        } else {
+            continue;
+        };
+        if lea_rel + 27 > body.len() {
+            continue;
+        }
+        let mov_ptr = lea_rel + 7;
+        let mov_len = lea_rel + 15;
+        if &body[lea_rel..lea_rel + 3] != &[0x48, 0x8d, 0x05]
+            || &body[mov_ptr..mov_ptr + 4] != &[0x48, 0x89, 0x84, 0x24]
+            || &body[mov_len..mov_len + 4] != &[0x48, 0xc7, 0x84, 0x24]
+        {
+            continue;
+        }
+        let sp_ptr = read_u32(body, mov_ptr + 4);
+        let sp_len = read_u32(body, mov_len + 4);
+        let cur_len = read_u32(body, mov_len + 8);
+        if sp_ptr.saturating_add(8) == sp_len && (1..=64).contains(&cur_len) {
+            matches.push(CodeThemeSite {
+                lea_disp_off: start + lea_rel + 3,
+                lea_next_off: start + lea_rel + 7,
+                len_imm_off: start + mov_len + 8,
+            });
+        }
+    }
+    if matches.len() != 1 {
+        return Err(format!(
+            "glamourStyleForScheme terminal 테마 패턴 매칭 실패 (매칭 수: {})",
+            matches.len()
+        ));
+    }
+    Ok(matches.into_iter().next().unwrap())
+}
+
+fn detect_patched_code_theme(ctx: &BinaryContext) -> Option<String> {
+    let site = find_code_theme_site(ctx).ok()?;
+    let disp = read_i32(ctx.data, site.lea_disp_off) as i64;
+    let len = read_u32(ctx.data, site.len_imm_off) as usize;
+    let pc_va = ctx.off_to_va(site.lea_next_off)? as i64;
+    let str_va = usize::try_from(pc_va + disp).ok()?;
+    let str_off = ctx.va_to_off(str_va)?;
+    let s = std::str::from_utf8(ctx.data.get(str_off..str_off + len)?).ok()?;
+    (s != "native").then(|| s.to_string())
+}
+
+fn resolve_code_theme(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
+    let site = find_code_theme_site(ctx)?;
+    let theme_off = find_chroma_theme_offset(ctx.data, &ctx.code_theme)?;
+    let theme_va = ctx
+        .off_to_va(theme_off)
+        .ok_or_else(|| "테마 문자열 가상주소 변환 실패".to_string())?;
+    let pc_va = ctx
+        .off_to_va(site.lea_next_off)
+        .ok_or_else(|| "LEA 명령어 가상주소 변환 실패".to_string())?;
+    let disp = i32::try_from((theme_va as i64) - (pc_va as i64))
+        .map_err(|_| "RIP 상대 변위 범위 초과".to_string())?;
+    Ok(vec![
+        ByteEdit {
+            offset: site.lea_disp_off,
+            payload: disp.to_le_bytes().to_vec(),
+        },
+        ByteEdit {
+            offset: site.len_imm_off,
+            payload: (ctx.code_theme.len() as u32).to_le_bytes().to_vec(),
+        },
+    ])
+}
+
 const DEFAULT_COMPACT_TOKENS: u32 = 180_000;
 const MIN_COMPACT_TOKENS: u32 = 32_000;
 const MAX_COMPACT_TOKENS: u32 = 1_000_000;
@@ -874,7 +1069,7 @@ fn resolve_banner(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
             let (bwi_start, bwi_end) = ctx.get_func("render.BannerWithInfo")?;
             let cave_offset = find_cave(ctx)?;
 
-            // 제품명 옆 괄호 안에 표시: "Antigravity CLI 1.5.7 (patch v0.2.2)"
+            // 제품명 옆 괄호 안에 표시: "Antigravity CLI 1.5.7 (patch v0.2.3)"
             let chan = format!("patch v{}", env!("CARGO_PKG_VERSION")).into_bytes();
             assert!(chan.len() <= CAVE_NOTES_OFF - CAVE_CHAN_OFF);
             let chan_va = cave_offset + CAVE_CHAN_OFF;
@@ -944,6 +1139,7 @@ fn release_notes_text() -> String {
         ("heading", "'##' prefixes hidden on H2-H6"),
         ("cjk-bold", "**bold** kept before Korean particles"),
         ("tilde-strike", "only '~~' strikes through, single '~' stays"),
+        ("code-theme", "readable code block theme for terminal colorScheme (--code-theme vs)"),
         ("compact", "custom auto-compaction token limit (--compact 180k)"),
         ("banner", "patch version shown next to the product name"),
     ];
@@ -1092,6 +1288,14 @@ const PATCH_REGISTRY: &[PatchSpec] = &[
         resolver: resolve_tilde_strike,
     },
     PatchSpec {
+        id: "code-theme",
+        title: "터미널 스킴 코드 블록 가독성 개선 (Terminal Code Theme)",
+        description: "colorScheme: terminal 사용 시 흐린 회색(#d0d0d0)으로 묻히는 코드 블록 테마(native)를 선명한 테마(기본 vs)로 교체",
+        symbol: "render.glamourStyleForScheme",
+        default_on: true,
+        resolver: resolve_code_theme,
+    },
+    PatchSpec {
         id: "compact",
         title: "자동 컴팩션 토큰 임계값 변경 (Auto-Compact Limit)",
         description: "내장 자동 컴팩션(CHECKPOINT) 발동 기준(기본 256k)을 원하는 토큰 수(기본 180k, 32k~1000k)로 변경 (기본 꺼짐)",
@@ -1102,7 +1306,7 @@ const PATCH_REGISTRY: &[PatchSpec] = &[
     PatchSpec {
         id: "banner",
         title: "제품명 옆 패치 버전 표시 (Patch Version Tag)",
-        description: "상단 'Antigravity CLI 1.5.7' 옆에 '(patch v0.2.2)' 형태로 패치 버전 표시",
+        description: "상단 'Antigravity CLI 1.5.7' 옆에 '(patch v0.2.3)' 형태로 패치 버전 표시",
         symbol: "render.BannerWithInfo",
         default_on: true,
         resolver: resolve_banner,
@@ -1749,13 +1953,14 @@ fn plan_output(bin_dir: &Path, target_bin: &Path, src_bin: &Path, name: &str) ->
     Ok(OutputPlan { dst, link_name, link, notes })
 }
 
-/// 대화형 설정의 결과: (적용할 패치, 출력 이름, in-place 여부, 컴팩션 토큰 한도)
-type WizardResult = (Vec<&'static PatchSpec>, String, bool, u32);
+/// 대화형 설정의 결과: (적용할 패치, 출력 이름, in-place 여부, 컴팩션 토큰 한도, 코드 블록 테마)
+type WizardResult = (Vec<&'static PatchSpec>, String, bool, u32, String);
 
 struct Wizard<'a> {
     src_bin: &'a Path,
     target_bin: &'a Path,
     bin_dir: &'a Path,
+    raw_data: &'a [u8],
     version: &'a str,
     platform: String,
     color: bool,
@@ -1776,14 +1981,66 @@ struct Wizard<'a> {
     editing_compact: bool,
     compact_buf: Vec<char>,
     compact_pos: usize,
+    code_theme: String,
+    editing_theme: bool,
+    theme_buf: Vec<char>,
+    theme_pos: usize,
 }
 
 fn patch_index(id: &str) -> Option<usize> {
     PATCH_REGISTRY.iter().position(|p| p.id == id)
 }
 
+fn edit_inline_buffer(buf: &mut Vec<char>, pos: &mut usize, max_len: usize, key: &Key) -> Option<bool> {
+    match key {
+        Key::Esc => return Some(false),
+        Key::Enter => return Some(true),
+        Key::Left => *pos = pos.saturating_sub(1),
+        Key::Right => *pos = (*pos + 1).min(buf.len()),
+        Key::Home => *pos = 0,
+        Key::End => *pos = buf.len(),
+        Key::Backspace if *pos > 0 => {
+            *pos -= 1;
+            buf.remove(*pos);
+        }
+        Key::Delete if *pos < buf.len() => {
+            buf.remove(*pos);
+        }
+        Key::Char(c) if !c.is_control() => {
+            if buf.len() < max_len {
+                buf.insert(*pos, *c);
+                *pos += 1;
+            }
+        }
+        _ => {}
+    }
+    None
+}
+
+fn append_inline_param(
+    line: Line,
+    editing: bool,
+    buf: &[char],
+    pos: usize,
+    value: &str,
+    selected: bool,
+) -> Line {
+    if editing {
+        let before: String = buf[..pos].iter().collect();
+        let at = buf.get(pos).map_or(" ".to_string(), |c| c.to_string());
+        let after: String = buf.get(pos + 1..).map_or(String::new(), |s| s.iter().collect());
+        line.s(S_DIM, "  [")
+            .s(S_ACCENT_B, before)
+            .s(S_CARET, at)
+            .s(S_ACCENT_B, after)
+            .s(S_DIM, "]")
+    } else {
+        line.s(if selected { S_ACCENT } else { S_DIM }, format!("  [{value}]"))
+    }
+}
+
 impl<'a> Wizard<'a> {
-    fn new(src_bin: &'a Path, target_bin: &'a Path, bin_dir: &'a Path, version: &'a str, ctx: &BinaryContext) -> Self {
+    fn new(src_bin: &'a Path, target_bin: &'a Path, bin_dir: &'a Path, version: &'a str, ctx: &'a BinaryContext) -> Self {
         let avail: Vec<Result<(), String>> = PATCH_REGISTRY.iter().map(|p| (p.resolver)(ctx).map(|_| ())).collect();
         let selected = PATCH_REGISTRY
             .iter()
@@ -1803,6 +2060,7 @@ impl<'a> Wizard<'a> {
             src_bin,
             target_bin,
             bin_dir,
+            raw_data: ctx.data,
             version,
             platform: format!("{format} · {arch}"),
             color,
@@ -1821,6 +2079,10 @@ impl<'a> Wizard<'a> {
             editing_compact: false,
             compact_buf: Vec::new(),
             compact_pos: 0,
+            code_theme: detect_patched_code_theme(ctx).unwrap_or_else(|| ctx.code_theme.clone()),
+            editing_theme: false,
+            theme_buf: Vec::new(),
+            theme_pos: 0,
         }
     }
 
@@ -1904,6 +2166,29 @@ impl<'a> Wizard<'a> {
         ));
     }
 
+    fn adjust_code_theme(&mut self, delta: isize) {
+        let Some(ti) = patch_index("code-theme") else {
+            return;
+        };
+        if self.avail[ti].is_err() {
+            self.flash = Some((S_WARN, "'code-theme' 패치는 이 바이너리에 적용할 수 없습니다.".into()));
+            return;
+        }
+        let len = CODE_THEME_PRESETS.len() as isize;
+        let cur_idx = CODE_THEME_PRESETS
+            .iter()
+            .position(|&p| p == self.code_theme)
+            .map(|i| i as isize);
+        let next_idx = match cur_idx {
+            Some(i) => (i + delta).rem_euclid(len) as usize,
+            None => if delta < 0 { CODE_THEME_PRESETS.len() - 1 } else { 0 },
+        };
+        let next = CODE_THEME_PRESETS[next_idx];
+        self.code_theme = next.to_string();
+        self.selected[ti] = true;
+        self.flash = Some((S_ACCENT, format!("코드 블록 테마: {next}")));
+    }
+
     fn handle_key(&mut self, key: Key) -> Action {
         if key == Key::CtrlC {
             return Action::Cancel;
@@ -1913,9 +2198,9 @@ impl<'a> Wizard<'a> {
         match self.step {
             Step::Patches => {
                 if self.editing_compact {
-                    match key {
-                        Key::Esc => self.editing_compact = false,
-                        Key::Enter => {
+                    match edit_inline_buffer(&mut self.compact_buf, &mut self.compact_pos, 16, &key) {
+                        Some(false) => self.editing_compact = false,
+                        Some(true) => {
                             let raw: String = self.compact_buf.iter().collect();
                             match parse_compact_tokens(&raw) {
                                 Ok(tokens) => {
@@ -1935,34 +2220,46 @@ impl<'a> Wizard<'a> {
                                         ),
                                     ));
                                 }
-                                Err(err) => {
-                                    self.flash = Some((S_ERR, err));
+                                Err(err) => self.flash = Some((S_ERR, err)),
+                            }
+                        }
+                        None => {}
+                    }
+                    return Action::Continue;
+                }
+                if self.editing_theme {
+                    match edit_inline_buffer(&mut self.theme_buf, &mut self.theme_pos, 32, &key) {
+                        Some(false) => self.editing_theme = false,
+                        Some(true) => {
+                            let raw: String = self.theme_buf.iter().collect();
+                            let parsed = parse_code_theme(&raw).and_then(|theme| {
+                                find_chroma_theme_offset(self.raw_data, &theme)?;
+                                Ok(theme)
+                            });
+                            match parsed {
+                                Ok(theme) => {
+                                    self.code_theme = theme.clone();
+                                    self.editing_theme = false;
+                                    if let Some(ti) = patch_index("code-theme") {
+                                        if self.avail[ti].is_ok() {
+                                            self.selected[ti] = true;
+                                        }
+                                    }
+                                    self.flash = Some((
+                                        S_OK,
+                                        format!("코드 블록 테마가 '{theme}'(으)로 설정되었습니다."),
+                                    ));
                                 }
+                                Err(err) => self.flash = Some((S_ERR, err)),
                             }
                         }
-                        Key::Left => self.compact_pos = self.compact_pos.saturating_sub(1),
-                        Key::Right => self.compact_pos = (self.compact_pos + 1).min(self.compact_buf.len()),
-                        Key::Home => self.compact_pos = 0,
-                        Key::End => self.compact_pos = self.compact_buf.len(),
-                        Key::Backspace if self.compact_pos > 0 => {
-                            self.compact_pos -= 1;
-                            self.compact_buf.remove(self.compact_pos);
-                        }
-                        Key::Delete if self.compact_pos < self.compact_buf.len() => {
-                            self.compact_buf.remove(self.compact_pos);
-                        }
-                        Key::Char(c) if !c.is_control() => {
-                            if self.compact_buf.len() < 16 {
-                                self.compact_buf.insert(self.compact_pos, c);
-                                self.compact_pos += 1;
-                            }
-                        }
-                        _ => {}
+                        None => {}
                     }
                     return Action::Continue;
                 }
 
                 let on_compact = PATCH_REGISTRY.get(self.cursor).is_some_and(|p| p.id == "compact");
+                let on_theme = PATCH_REGISTRY.get(self.cursor).is_some_and(|p| p.id == "code-theme");
                 match key {
                     Key::Esc | Key::Char('q') | Key::Char('Q') => return Action::Cancel,
                     Key::Up | Key::Char('k') => self.cursor = (self.cursor + n - 1) % n,
@@ -1986,6 +2283,22 @@ impl<'a> Wizard<'a> {
                                 format_compact_tokens(self.compact_tokens).chars().collect();
                             self.compact_pos = self.compact_buf.len();
                             self.editing_compact = true;
+                        }
+                    }
+                    Key::Char('-') | Key::Char('[') if on_theme => self.adjust_code_theme(-1),
+                    Key::Char('+') | Key::Char('=') | Key::Char(']') if on_theme => {
+                        self.adjust_code_theme(1)
+                    }
+                    Key::Char('e') | Key::Char('E') if on_theme => {
+                        if self.avail[self.cursor].is_err() {
+                            self.flash = Some((
+                                S_WARN,
+                                "'code-theme' 패치는 이 바이너리에 적용할 수 없습니다.".into(),
+                            ));
+                        } else {
+                            self.theme_buf = self.code_theme.chars().collect();
+                            self.theme_pos = self.theme_buf.len();
+                            self.editing_theme = true;
                         }
                     }
                     Key::Char(c) if c.is_ascii_digit() => {
@@ -2174,28 +2487,23 @@ impl<'a> Wizard<'a> {
                 .s(id_style, format!("{}{pad}", p.id))
                 .s(title_style, p.title);
             if p.id == "compact" && ok {
-                if self.editing_compact {
-                    let before: String = self.compact_buf[..self.compact_pos].iter().collect();
-                    let at = self
-                        .compact_buf
-                        .get(self.compact_pos)
-                        .map_or(" ".to_string(), |c| c.to_string());
-                    let after: String = self
-                        .compact_buf
-                        .get(self.compact_pos + 1..)
-                        .map_or(String::new(), |s| s.iter().collect());
-                    line = line
-                        .s(S_DIM, "  [")
-                        .s(S_ACCENT_B, before)
-                        .s(S_CARET, at)
-                        .s(S_ACCENT_B, after)
-                        .s(S_DIM, "]");
-                } else {
-                    line = line.s(
-                        if self.selected[i] { S_ACCENT } else { S_DIM },
-                        format!("  [{}]", format_compact_tokens(self.compact_tokens)),
-                    );
-                }
+                line = append_inline_param(
+                    line,
+                    self.editing_compact,
+                    &self.compact_buf,
+                    self.compact_pos,
+                    &format_compact_tokens(self.compact_tokens),
+                    self.selected[i],
+                );
+            } else if p.id == "code-theme" && ok {
+                line = append_inline_param(
+                    line,
+                    self.editing_theme,
+                    &self.theme_buf,
+                    self.theme_pos,
+                    &self.code_theme,
+                    self.selected[i],
+                );
             }
             if !ok {
                 line = line.s(S_DIM, "  (사용 불가)");
@@ -2209,7 +2517,8 @@ impl<'a> Wizard<'a> {
         }
         lines.extend(bottom);
         let on_compact = PATCH_REGISTRY.get(self.cursor).is_some_and(|p| p.id == "compact");
-        let footer = if self.editing_compact {
+        let on_theme = PATCH_REGISTRY.get(self.cursor).is_some_and(|p| p.id == "code-theme");
+        let footer = if self.editing_compact || self.editing_theme {
             vec![key_hints(&[
                 ("←→", "커서"),
                 ("enter", "확정"),
@@ -2221,6 +2530,15 @@ impl<'a> Wizard<'a> {
                 ("space", "선택"),
                 ("-/+", "±10k"),
                 ("e", "수치"),
+                ("enter", "다음"),
+                ("q", "종료"),
+            ])]
+        } else if on_theme {
+            vec![key_hints(&[
+                ("↑↓", "이동"),
+                ("space", "선택"),
+                ("-/+", "테마"),
+                ("e", "직접입력"),
                 ("enter", "다음"),
                 ("q", "종료"),
             ])]
@@ -2334,6 +2652,8 @@ impl<'a> Wizard<'a> {
                     S_ACCENT,
                     format!("  [{}]", format_compact_tokens(self.compact_tokens)),
                 );
+            } else if p.id == "code-theme" {
+                l = l.s(S_ACCENT, format!("  [{}]", self.code_theme));
             }
             lines.push(l);
         }
@@ -2378,7 +2698,7 @@ impl<'a> Wizard<'a> {
     fn render(&mut self, w: usize, h: usize) -> Vec<String> {
         // 마지막 열에 쓰면 일부 터미널에서 줄이 넘어가므로 한 칸 여유를 둔다
         let w = w.saturating_sub(1).max(20);
-        self.compact = h < 26;
+        self.compact = h < 27;
         let header = self.header(w);
         let room = h.saturating_sub(header.len() + 1);
         let (body, footer) = match self.step {
@@ -2430,9 +2750,9 @@ fn interactive_wizard(
                         chosen.insert(0, &PATCH_REGISTRY[0]);
                     }
                     return Ok(Some(if wiz.out_choice == 1 {
-                        (chosen, String::new(), true, wiz.compact_tokens)
+                        (chosen, String::new(), true, wiz.compact_tokens, wiz.code_theme)
                     } else {
-                        (chosen, wiz.name_str(), false, wiz.compact_tokens)
+                        (chosen, wiz.name_str(), false, wiz.compact_tokens, wiz.code_theme)
                     }));
                 }
             }
@@ -2440,19 +2760,34 @@ fn interactive_wizard(
     }
 }
 
-fn parse_patch_list(spec_str: &str, compact_override: &mut Option<u32>) -> Result<Vec<&'static PatchSpec>, String> {
+fn apply_inline_patch_arg(
+    id: &str,
+    val: Option<&str>,
+    compact_override: &mut Option<u32>,
+    code_theme_override: &mut Option<String>,
+) -> Result<(), String> {
+    if let Some(raw_val) = val {
+        match id {
+            "compact" => *compact_override = Some(parse_compact_tokens(raw_val)?),
+            "code-theme" => *code_theme_override = Some(parse_code_theme(raw_val)?),
+            _ => return Err(format!("'{id}' 패치는 '=값' 인자를 지원하지 않습니다.")),
+        }
+    }
+    Ok(())
+}
+
+fn parse_patch_list(
+    spec_str: &str,
+    compact_override: &mut Option<u32>,
+    code_theme_override: &mut Option<String>,
+) -> Result<Vec<&'static PatchSpec>, String> {
     let items: Vec<&str> = spec_str.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
     if items.is_empty() || items.contains(&"all") {
         // 'all' 은 기본 활성(default_on) 패치 전체. 기본 꺼짐 패치는 'all,release-notes' 나 'all,compact=180k' 처럼 명시한다.
         let mut v: Vec<&'static PatchSpec> = PATCH_REGISTRY.iter().filter(|p| p.default_on).collect();
         for item in &items {
             let (id, val) = item.split_once('=').map_or((*item, None), |(k, rhs)| (k.trim(), Some(rhs.trim())));
-            if let Some(raw_val) = val {
-                if id != "compact" {
-                    return Err(format!("'{id}' 패치는 '=값' 인자를 지원하지 않습니다."));
-                }
-                *compact_override = Some(parse_compact_tokens(raw_val)?);
-            }
+            apply_inline_patch_arg(id, val, compact_override, code_theme_override)?;
             if let Some(spec) = PATCH_REGISTRY.iter().find(|p| p.id == id && !p.default_on) {
                 if !v.iter().any(|p| p.id == spec.id) {
                     v.push(spec);
@@ -2464,12 +2799,7 @@ fn parse_patch_list(spec_str: &str, compact_override: &mut Option<u32>) -> Resul
     let mut out = Vec::new();
     for item in items {
         let (id, val) = item.split_once('=').map_or((item, None), |(k, rhs)| (k.trim(), Some(rhs.trim())));
-        if let Some(raw_val) = val {
-            if id != "compact" {
-                return Err(format!("'{id}' 패치는 '=값' 인자를 지원하지 않습니다."));
-            }
-            *compact_override = Some(parse_compact_tokens(raw_val)?);
-        }
+        apply_inline_patch_arg(id, val, compact_override, code_theme_override)?;
         let Some(spec) = PATCH_REGISTRY.iter().find(|p| p.id == id) else {
             let valid: Vec<&str> = PATCH_REGISTRY.iter().map(|p| p.id).collect();
             return Err(format!("알 수 없는 패치 ID: '{id}' (사용 가능: all, {})", valid.join(", ")));
@@ -2536,6 +2866,14 @@ fn build_patched_binary(
                 ctx.compact_tokens,
                 offs.join(", ")
             );
+        } else if spec.id == "code-theme" {
+            println!(
+                "    - [{}] {} [theme = {}] ({})",
+                spec.id,
+                spec.title,
+                ctx.code_theme,
+                offs.join(", ")
+            );
         } else {
             println!("    - [{}] {} ({})", spec.id, spec.title, offs.join(", "));
         }
@@ -2589,6 +2927,7 @@ fn print_help() {
   agy-cli-patch --list                    사용 가능한 패치 ID 및 상세 설명 출력
   agy-cli-patch -p <목록> -o <파일명>     원하는 패치만 골라 지정한 이름으로 바이너리 생성
   agy-cli-patch -p all --compact 180k -o agy-batch  자동 컴팩션 임계값을 180k 토큰으로 변경
+  agy-cli-patch -p all --code-theme solarized-light -o agy-batch  코드 블록 테마 변경
   agy-cli-patch --preset                  기본 프리셋 2종(agy-batch, agy-nodrip) 일괄 생성
   agy-cli-patch -p all --in-place         원본 백업(antigravity.orig) 후 기본 agy에 직접 적용
   agy-cli-patch --restore                 antigravity.orig 백업에서 원본 복구
@@ -2598,6 +2937,7 @@ fn print_help() {
   --bin <경로>              원본 antigravity 바이너리 경로 직접 지정 (미지정 시 자동 탐색)
   -p, --patches <ID>        쉼표로 구분된 패치 ID 또는 'all' (예: nodrip,batch,compact=180k)
   --compact <토큰>          자동 컴팩션 토큰 임계값 지정 (32k~1000k, 예: 180k, 180000; 지정 시 compact 자동 활성화)
+  --code-theme <테마>       terminal 스킴 코드 블록 Chroma 테마 지정 (기본: vs, 예: vs, solarized-light, bw)
   -o, --output <이름>       생성할 실행 파일 이름 또는 경로
   --preset                  프롬프트 없이 agy-batch와 agy-nodrip 생성
   --in-place                원본 백업 후 기본 바이너리 덮어쓰기
@@ -2607,9 +2947,9 @@ fn print_help() {
     );
 }
 
-fn ensure_compact_selected(patches: &mut Vec<&'static PatchSpec>) {
-    if let Some(spec) = PATCH_REGISTRY.iter().find(|p| p.id == "compact") {
-        if !patches.iter().any(|p| p.id == "compact") {
+fn ensure_patch_selected(patches: &mut Vec<&'static PatchSpec>, id: &str) {
+    if let Some(spec) = PATCH_REGISTRY.iter().find(|p| p.id == id) {
+        if !patches.iter().any(|p| p.id == id) {
             patches.push(spec);
         }
     }
@@ -2621,6 +2961,7 @@ fn run() -> Result<(), String> {
     let mut patches_arg: Option<String> = None;
     let mut output_arg: Option<String> = None;
     let mut compact_arg: Option<u32> = None;
+    let mut code_theme_arg: Option<String> = None;
     let mut preset_mode = false;
     let mut in_place = false;
     let mut restore_mode = false;
@@ -2651,6 +2992,10 @@ fn run() -> Result<(), String> {
             "--compact" | "--compact-tokens" => {
                 let raw = args.next().ok_or("--compact 옵션에 토큰 수치(예: 180k)가 필요합니다.")?;
                 compact_arg = Some(parse_compact_tokens(&raw)?);
+            }
+            "--code-theme" => {
+                let raw = args.next().ok_or("--code-theme 옵션에 테마 이름(예: vs, solarized-light, bw)이 필요합니다.")?;
+                code_theme_arg = Some(parse_code_theme(&raw)?);
             }
             "-o" | "--output" => {
                 output_arg = Some(args.next().ok_or("-o/--output 옵션에 파일명이 필요합니다.")?);
@@ -2721,18 +3066,30 @@ fn run() -> Result<(), String> {
     if let Some(tokens) = compact_arg {
         ctx.compact_tokens = tokens;
     }
+    if let Some(ref theme) = code_theme_arg {
+        ctx.code_theme = theme.clone();
+    }
 
     let is_tty = unsafe { isatty(0) == 1 };
     if preset_mode
-        || (!is_tty && patches_arg.is_none() && output_arg.is_none() && !in_place && compact_arg.is_none())
+        || (!is_tty
+            && patches_arg.is_none()
+            && output_arg.is_none()
+            && !in_place
+            && compact_arg.is_none()
+            && code_theme_arg.is_none())
     {
         let mut nodrip_patches: Vec<&'static PatchSpec> =
             PATCH_REGISTRY.iter().filter(|p| p.default_on && p.id != "batch").collect();
         let mut batch_patches: Vec<&'static PatchSpec> =
             PATCH_REGISTRY.iter().filter(|p| p.default_on).collect();
         if compact_arg.is_some() {
-            ensure_compact_selected(&mut nodrip_patches);
-            ensure_compact_selected(&mut batch_patches);
+            ensure_patch_selected(&mut nodrip_patches, "compact");
+            ensure_patch_selected(&mut batch_patches, "compact");
+        }
+        if code_theme_arg.is_some() {
+            ensure_patch_selected(&mut nodrip_patches, "code-theme");
+            ensure_patch_selected(&mut batch_patches, "code-theme");
         }
         let jobs = [("agy-nodrip", nodrip_patches), ("agy-batch", batch_patches)];
         // 둘 다 먼저 검사해서 하나만 만들어진 채로 멈추는 일이 없게 한다
@@ -2747,8 +3104,13 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
 
-    let (chosen_patches, out_name, do_in_place, final_compact_tokens) =
-        if patches_arg.is_none() && output_arg.is_none() && !in_place && compact_arg.is_none() {
+    let (chosen_patches, out_name, do_in_place, final_compact_tokens, final_code_theme) =
+        if patches_arg.is_none()
+            && output_arg.is_none()
+            && !in_place
+            && compact_arg.is_none()
+            && code_theme_arg.is_none()
+        {
             match interactive_wizard(&src_bin, &target_bin, &target_version, &ctx)? {
                 Some(result) => result,
                 None => {
@@ -2758,14 +3120,27 @@ fn run() -> Result<(), String> {
             }
         } else {
             let mut inline_override = None;
-            let mut patches = parse_patch_list(patches_arg.as_deref().unwrap_or("all"), &mut inline_override)?;
+            let mut inline_theme_override = None;
+            let mut patches = parse_patch_list(
+                patches_arg.as_deref().unwrap_or("all"),
+                &mut inline_override,
+                &mut inline_theme_override,
+            )?;
             let mut resolved_tokens = ctx.compact_tokens;
             if let Some(v) = inline_override {
                 resolved_tokens = v;
             }
             if let Some(v) = compact_arg {
                 resolved_tokens = v;
-                ensure_compact_selected(&mut patches);
+                ensure_patch_selected(&mut patches, "compact");
+            }
+            let mut resolved_theme = ctx.code_theme.clone();
+            if let Some(t) = inline_theme_override {
+                resolved_theme = t;
+            }
+            if let Some(t) = code_theme_arg {
+                resolved_theme = t;
+                ensure_patch_selected(&mut patches, "code-theme");
             }
             let default_out = if patches.iter().any(|p| p.id == "batch") {
                 "agy-batch"
@@ -2773,9 +3148,10 @@ fn run() -> Result<(), String> {
                 "agy-patched"
             };
             let name = output_arg.unwrap_or_else(|| default_out.to_string());
-            (patches, name, in_place, resolved_tokens)
+            (patches, name, in_place, resolved_tokens, resolved_theme)
         };
     ctx.compact_tokens = final_compact_tokens;
+    ctx.code_theme = final_code_theme.clone();
 
     if do_in_place {
         if !backup_bin.exists() {
@@ -2785,6 +3161,7 @@ fn run() -> Result<(), String> {
         let backup_mmap = MmapFile::open(&backup_bin)?;
         let mut backup_ctx = BinaryContext::parse(backup_mmap.as_slice())?;
         backup_ctx.compact_tokens = final_compact_tokens;
+        backup_ctx.code_theme = final_code_theme;
         build_patched_binary(&backup_bin, &backup_ctx, &chosen_patches, &target_bin, None)?;
         println!("[+] 기본 agy 바이너리에 패치 적용 완료: {}", target_bin.display());
         return Ok(());
@@ -2858,8 +3235,10 @@ mod tests {
                 data: target_buf,
                 format: Format::Elf64,
                 arch: Arch::X86_64,
+                segments: Vec::new(),
                 funcs,
                 compact_tokens: tokens,
+                code_theme: DEFAULT_CODE_THEME.to_string(),
             };
             let edits = resolve_compact(&ctx).expect("합성 바이너리에서 compact 매칭이 성공해야 함");
             assert_eq!(edits.len(), 4);
@@ -2881,5 +3260,111 @@ mod tests {
         assert_eq!(read_u32(&buf, limit_off + 2), 400_000);
         assert_eq!(read_u32(&buf, limit_off + 7), 400_000);
         assert_eq!(read_u32(&buf, fb_off + 9), 400_000);
+    }
+
+    #[test]
+    fn code_theme_parser_validates_names() {
+        assert_eq!(parse_code_theme("vs"), Ok("vs".to_string()));
+        assert_eq!(
+            parse_code_theme("  Solarized-Light "),
+            Ok("solarized-light".to_string())
+        );
+        assert_eq!(
+            parse_code_theme("catppuccin_latte"),
+            Ok("catppuccin_latte".to_string())
+        );
+
+        assert!(parse_code_theme("").is_err());
+        assert!(parse_code_theme("   ").is_err());
+        assert!(parse_code_theme("bad name").is_err());
+        assert!(parse_code_theme("vs!").is_err());
+        assert!(parse_code_theme(&"a".repeat(33)).is_err());
+    }
+
+    #[test]
+    fn resolve_code_theme_patches_and_repatches_idempotently() {
+        let mut buf = vec![0x90u8; 512];
+        let mut ro_cursor = 16usize;
+        let mut write_tag = |tag: &[u8]| -> usize {
+            let off = ro_cursor;
+            buf[off..off + tag.len()].copy_from_slice(tag);
+            ro_cursor += tag.len() + 8;
+            off + 13 // <style name=" 뒤 문자열 시작 오프셋
+        };
+        let native_off = write_tag(b"<style name=\"native\">");
+        let vs_off = write_tag(b"<style name=\"vs\">");
+        let sol_off = write_tag(b"<style name=\"solarized-light\">");
+
+        let fn_start = 160usize;
+        let fn_end = 300usize;
+        let site = fn_start + 12;
+        buf[site..site + 2].copy_from_slice(&[0x48, 0xb8]);
+        buf[site + 2..site + 10].copy_from_slice(b"terminal");
+        buf[site + 10..site + 13].copy_from_slice(&[0x48, 0x39, 0x02]);
+        buf[site + 13..site + 19].copy_from_slice(&[0x0f, 0x85, 0x50, 0x00, 0x00, 0x00]);
+        let lea_off = site + 19;
+        let lea_next = lea_off + 7;
+        let disp_native = (native_off as i64 - lea_next as i64) as i32;
+        buf[lea_off..lea_off + 3].copy_from_slice(&[0x48, 0x8d, 0x05]);
+        buf[lea_off + 3..lea_next].copy_from_slice(&disp_native.to_le_bytes());
+        buf[lea_next..lea_next + 8].copy_from_slice(&[0x48, 0x89, 0x84, 0x24, 0x18, 0x16, 0x00, 0x00]);
+        let mov_len_off = lea_next + 8;
+        buf[mov_len_off..mov_len_off + 8]
+            .copy_from_slice(&[0x48, 0xc7, 0x84, 0x24, 0x20, 0x16, 0x00, 0x00]);
+        buf[mov_len_off + 8..mov_len_off + 12].copy_from_slice(&6u32.to_le_bytes());
+
+        fn make_ctx<'a>(
+            target_buf: &'a [u8],
+            theme: &str,
+            fn_start: usize,
+            fn_end: usize,
+        ) -> BinaryContext<'a> {
+            let mut funcs = HashMap::new();
+            funcs.insert("render.glamourStyleForScheme", (fn_start, fn_end));
+            BinaryContext {
+                data: target_buf,
+                format: Format::Elf64,
+                arch: Arch::X86_64,
+                segments: Vec::new(),
+                funcs,
+                compact_tokens: DEFAULT_COMPACT_TOKENS,
+                code_theme: theme.to_string(),
+            }
+        }
+
+        assert_eq!(detect_patched_code_theme(&make_ctx(&buf, "vs", fn_start, fn_end)), None);
+
+        let bad = resolve_code_theme(&make_ctx(&buf, "nonexistent-theme", fn_start, fn_end));
+        assert!(bad.is_err());
+
+        let apply = |target_buf: &mut [u8], theme: &str| {
+            let edits = {
+                let ctx = make_ctx(target_buf, theme, fn_start, fn_end);
+                resolve_code_theme(&ctx).expect("합성 바이너리에서 code-theme 매칭이 성공해야 함")
+            };
+            assert_eq!(edits.len(), 2);
+            for edit in edits {
+                target_buf[edit.offset..edit.offset + edit.payload.len()]
+                    .copy_from_slice(&edit.payload);
+            }
+        };
+
+        apply(&mut buf, "vs");
+        assert_eq!(read_i32(&buf, lea_off + 3), (vs_off as i64 - lea_next as i64) as i32);
+        assert_eq!(read_u32(&buf, mov_len_off + 8), 2);
+        assert_eq!(
+            detect_patched_code_theme(&make_ctx(&buf, "vs", fn_start, fn_end)).as_deref(),
+            Some("vs")
+        );
+
+        // 재패치 멱등성 확인 (vs -> solarized-light)
+        apply(&mut buf, "solarized-light");
+        assert_eq!(read_i32(&buf, lea_off + 3), (sol_off as i64 - lea_next as i64) as i32);
+        assert_eq!(read_u32(&buf, mov_len_off + 8), 15);
+        assert_eq!(
+            detect_patched_code_theme(&make_ctx(&buf, "solarized-light", fn_start, fn_end))
+                .as_deref(),
+            Some("solarized-light")
+        );
     }
 }

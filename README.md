@@ -4,7 +4,7 @@
 
 `agy`(Antigravity CLI — **Linux & macOS**, **x86_64 & ARM64/Apple Silicon**) 바이너리의 스트리밍 출력 방식과 마크다운 렌더링 결함을 동적 심볼/시그니처 탐색으로 패치하는 초고속 모듈형 도구(Rust)입니다.
 
-릴리즈마다 바뀌는 고정 주소에 의존하지 않고, `mmap` 제로카피 매핑으로 **ELF64**(Linux) 및 **Mach-O 64**(macOS)의 텍스트 섹션과 Go `.gopclntab` 심볼 테이블을 파싱하여 대상 함수를 찾고, 아키텍처별(`x86_64` / `ARM64`) 기계어 시그니처를 검증한 뒤 패치합니다(외부 크레이트 의존성 0, Linux `FICLONE` reflink 및 macOS `codesign -f -s -` 자동 서명 지원). 단, `compact`·`banner`·`release-notes` 패치는 현재 `x86_64`에서만 지원합니다.
+릴리즈마다 바뀌는 고정 주소에 의존하지 않고, `mmap` 제로카피 매핑으로 **ELF64**(Linux) 및 **Mach-O 64**(macOS)의 텍스트 섹션과 Go `.gopclntab` 심볼 테이블을 파싱하여 대상 함수를 찾고, 아키텍처별(`x86_64` / `ARM64`) 기계어 시그니처를 검증한 뒤 패치합니다(외부 크레이트 의존성 0, Linux `FICLONE` reflink 및 macOS `codesign -f -s -` 자동 서명 지원). 단, `code-theme`·`compact`·`banner`·`release-notes` 패치는 현재 `x86_64`에서만 지원합니다.
 
 ## 지원하는 패치 목록 (`--list`)
 
@@ -15,8 +15,9 @@
 | `heading` | `render.glamourStyleForScheme` | 마크다운 헤딩(`H2`~`H6`) 앞에 붙는 `## `~`###### ` 프리픽스를 숨기고 색상·볼드만 유지 |
 | `cjk-bold` | `goldmark/parser.ScanDelimiter` | `` **"문구"**라는 ``, `` **용어(`code`)**는 ``처럼 닫는 `**` 앞 구두점과 뒤 한글 조사가 결합될 때 볼드가 풀리는 현상 수정 |
 | `tilde-strike` | `goldmark/extension.(*strikethroughParser).Parse` | `1.5.0~1.5.6`, `H2~H6` 같은 범위 표기용 단일 물결표(`~`)에 취소선이 그어지는 현상 방지 (`~~` 2개만 취소선으로 인식) |
+| `code-theme` | `render.glamourStyleForScheme` | `colorScheme: terminal` 사용 시 흐린 회색(`#d0d0d0`)으로 묻히는 코드 블록 테마(`native`)를 선명한 테마(기본 `vs`)로 교체 (`x86_64`) |
 | `compact` | `utils.GetCheckpointConfig`, `config.applyFeatureProviderCheckpointOverrideConfig` | 내장 자동 컴팩션(CHECKPOINT) 발동 임계값(기본 256k)을 `32k~1000k`로 조절 (`180k`로 낮춰 `200k` 단가 할증 전 조기 요약 또는 `500k+`로 높여 1M 모델 원문 맥락 유지, `x86_64` · **기본 꺼짐**) |
-| `banner` | `render.BannerWithInfo` | 상단 `Antigravity CLI 1.5.7` 옆에 `(patch v0.2.2)` 형태로 패치 버전 표시 (`x86_64`) |
+| `banner` | `render.BannerWithInfo` | 상단 `Antigravity CLI 1.5.7` 옆에 `(patch v0.2.3)` 형태로 패치 버전 표시 (`x86_64`) |
 | `release-notes` | `render.BuildHeader` | 로고 아래에 패치 기능 요약 및 GitHub 저장소 정보 표시 (`x86_64`, **기본 꺼짐** — `-p all,release-notes`처럼 명시해야 적용) |
 
 ## 설치 및 빌드
@@ -52,7 +53,7 @@ cd agy-cli-patch
 agy-cli-patch
 ```
 
-- **패치 선택**: `↑↓`(또는 `j`/`k`)로 이동, `space`나 숫자키로 선택, `a`로 전체 선택/해제. `compact` 줄에서는 `-`/`+`로 ±10k씩 증감하거나 `e`를 눌러 `180k`·`160000`처럼 임의 토큰 임계값을 직접 입력합니다. 커서가 가리키는 패치의 설명과 대상 심볼이 하단에 표시됩니다. 실행 전에 각 패치를 대상 바이너리에 미리 대조하므로, 적용할 수 없는 패치(예: ARM64의 `banner`)는 `✕`와 사유가 표시되고 선택되지 않습니다. `batch`를 켜면 `nodrip`도 함께 켜집니다.
+- **패치 선택**: `↑↓`(또는 `j`/`k`)로 이동, `space`나 숫자키로 선택, `a`로 전체 선택/해제. `code-theme` 줄에서는 `-`/`+`로 추천 테마(`vs`, `solarized-light`, `bw`, `github`, `catppuccin-latte`, `xcode`)를 순환하거나 `e`로 바이너리에 내장된 Chroma 테마 이름을 직접 입력합니다. `compact` 줄에서는 `-`/`+`로 ±10k씩 증감하거나 `e`를 눌러 `180k`·`160000`처럼 임의 토큰 임계값을 직접 입력합니다. 커서가 가리키는 패치의 설명과 대상 심볼이 하단에 표시됩니다. 실행 전에 각 패치를 대상 바이너리에 미리 대조하므로, 적용할 수 없는 패치(예: ARM64의 `banner`)는 `✕`와 사유가 표시되고 선택되지 않습니다. `batch`를 켜면 `nodrip`도 함께 켜집니다.
 - **출력 방식**: 새 실행 파일(이름을 바로 편집, 생성 경로와 `~/.local/bin` 링크를 미리 보여줌) 또는 기본 agy에 직접 덮어쓰기(in-place) 중에서 고릅니다. 원본과 같은 경로나 존재하지 않는 디렉토리는 막고, 기존 링크가 다른 파일을 가리키면 교체된다고 경고합니다.
 - **확인**: 적용할 패치와 출력 경로를 확인한 뒤 `enter`로 실행합니다. `esc`로 이전 단계, `q`나 `ctrl+c`로 종료합니다(터미널 상태는 항상 복구됩니다).
 
@@ -76,7 +77,11 @@ agy-cli-patch -p all,release-notes -o agy-batch
 agy-cli-patch --notes
 
 # 일괄 출력(batch)만 빼고 나머지 패치를 적용해 agy-nodrip 생성
-agy-cli-patch -p nodrip,heading,cjk-bold,tilde-strike,banner -o agy-nodrip
+agy-cli-patch -p nodrip,heading,cjk-bold,tilde-strike,code-theme,banner -o agy-nodrip
+
+# 터미널 스킴 코드 블록 테마 변경 (colorScheme: terminal 가독성 개선, 기본 vs)
+agy-cli-patch -p all --code-theme bw -o agy-batch
+agy-cli-patch -p all,code-theme=solarized-light -o agy-batch
 
 # 자동 컴팩션 앞당기기 (200k 초과 할증·핸드오프 프리필 방지) / 늦추기 (1M 모델 원문 맥락 유지)
 agy-cli-patch -p all --compact 180k -o agy-batch
