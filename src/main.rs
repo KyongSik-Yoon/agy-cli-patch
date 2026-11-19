@@ -700,76 +700,6 @@ fn resolve_batch(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
     Ok(edits)
 }
 
-fn resolve_heading(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
-    let (start, end) = ctx.get_func("render.glamourStyleForScheme")?;
-    let body = &ctx.data[start..end];
-
-    match ctx.arch {
-        Arch::X86_64 => {
-            let mut matches = Vec::new();
-            'outer: for i in 0..body.len().saturating_sub(27 * 5) {
-                for k in 0..5 {
-                    let chunk = &body[i + k * 27..i + (k + 1) * 27];
-                    let expected_len = (k + 3) as u8;
-                    if &chunk[0..3] != &[0x48, 0x8d, 0x0d]
-                        || &chunk[7..11] != &[0x48, 0x89, 0x8c, 0x24]
-                        || &chunk[15..19] != &[0x48, 0xc7, 0x84, 0x24]
-                        || (chunk[23] != expected_len && chunk[23] != 0)
-                        || &chunk[24..27] != &[0x00, 0x00, 0x00]
-                    {
-                        continue 'outer;
-                    }
-                }
-                matches.push(start + i);
-            }
-            if matches.len() != 1 {
-                return Err(format!(
-                    "glamourStyleForScheme x86_64 헤딩 패턴 매칭 실패 (매칭 수: {})",
-                    matches.len()
-                ));
-            }
-            let base = matches[0];
-            Ok((0..5)
-                .map(|k| ByteEdit {
-                    offset: base + k * 27 + 23,
-                    payload: vec![0x00],
-                })
-                .collect())
-        }
-        Arch::Arm64 => {
-            // H1..H6 (총 6개)가 sp + base + k*0xd0 (k=0..5) 간격으로 연속 배치됨.
-            // 각 항목은 `add x27, sp, #imm12` 직후 `stp x1, xN, [x27]` (또는 패치된 `stp xzr, xzr, [x27]`).
-            let mut stp_map = Vec::new();
-            for off in (0..body.len().saturating_sub(8)).step_by(4) {
-                let i0 = read_u32(body, off);
-                let i1 = read_u32(body, off + 4);
-                if (i0 & 0xffc0_03ff) == 0x9100_03fb
-                    && ((i1 & 0xffe0_83ff) == 0xa900_0361 || i1 == 0xa900_7f7f)
-                {
-                    let imm12 = (i0 >> 10) & 0xfff;
-                    stp_map.push((imm12, start + off + 4));
-                }
-            }
-            let map: HashMap<u32, usize> = stp_map.iter().copied().collect();
-            let mut found_h2_to_h6 = None;
-            for &(imm, _) in &stp_map {
-                if (0..6).all(|k| map.contains_key(&(imm + k * 0xd0))) {
-                    found_h2_to_h6 = Some(
-                        (1..6)
-                            .map(|k| ByteEdit {
-                                offset: map[&(imm + k * 0xd0)],
-                                payload: 0xa900_7f7fu32.to_le_bytes().to_vec(), // stp xzr, xzr, [x27]
-                            })
-                            .collect::<Vec<_>>(),
-                    );
-                    break;
-                }
-            }
-            found_h2_to_h6.ok_or_else(|| "glamourStyleForScheme ARM64 헤딩 패턴 매칭 실패".into())
-        }
-    }
-}
-
 fn resolve_cjk_bold(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
     let (start, end) = ctx.get_func("parser.ScanDelimiter")?;
     let body = &ctx.data[start..end];
@@ -1057,6 +987,36 @@ fn resolve_code_theme_a64(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> 
     ])
 }
 
+/// x86_64 분기/경계 정렬용 NOP 패딩(`0x90`, `66 90`, `0f 1f ...`)을 건너뛴다.
+fn skip_x86_nops(body: &[u8], mut pos: usize) -> usize {
+    loop {
+        let rest = &body[pos..];
+        let step = if rest.first() == Some(&0x90) {
+            1
+        } else if rest.starts_with(&[0x66, 0x90]) {
+            2
+        } else if rest.starts_with(&[0x0f, 0x1f, 0x00]) {
+            3
+        } else if rest.starts_with(&[0x0f, 0x1f, 0x40, 0x00]) {
+            4
+        } else if rest.starts_with(&[0x0f, 0x1f, 0x44, 0x00, 0x00]) {
+            5
+        } else if rest.starts_with(&[0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00]) {
+            6
+        } else if rest.starts_with(&[0x0f, 0x1f, 0x80, 0x00, 0x00, 0x00, 0x00]) {
+            7
+        } else if rest.starts_with(&[0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00]) {
+            8
+        } else if rest.starts_with(&[0x66, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00]) {
+            9
+        } else {
+            break;
+        };
+        pos += step;
+    }
+    pos
+}
+
 fn find_code_theme_site(ctx: &BinaryContext) -> Result<CodeThemeSite, String> {
     let (start, end) = ctx.get_func("render.glamourStyleForScheme")?;
     let body = &ctx.data[start..end];
@@ -1065,18 +1025,23 @@ fn find_code_theme_site(ctx: &BinaryContext) -> Result<CodeThemeSite, String> {
         if body[i] != 0x48
             || !(0xb8..=0xbf).contains(&body[i + 1])
             || &body[i + 2..i + 10] != b"terminal"
-            || body[i + 10] != 0x48
-            || body[i + 11] != 0x39
         {
             continue;
         }
-        let lea_rel = if body[i + 13] == 0x0f && body[i + 14] == 0x85 {
-            i + 19
-        } else if body[i + 13] == 0x75 {
-            i + 15
+        // Go 어셈블러가 Intel JCC Erratum 완화를 위해 cmp/jne 경계에 정렬용 NOP을 삽입할 수 있다.
+        let cmp_rel = skip_x86_nops(body, i + 10);
+        if cmp_rel + 3 >= body.len() || body[cmp_rel] != 0x48 || body[cmp_rel + 1] != 0x39 {
+            continue;
+        }
+        let jne_rel = skip_x86_nops(body, cmp_rel + 3);
+        let after_jne = if jne_rel + 6 <= body.len() && body[jne_rel] == 0x0f && body[jne_rel + 1] == 0x85 {
+            jne_rel + 6
+        } else if jne_rel + 2 <= body.len() && body[jne_rel] == 0x75 {
+            jne_rel + 2
         } else {
             continue;
         };
+        let lea_rel = skip_x86_nops(body, after_jne);
         if lea_rel + 27 > body.len() {
             continue;
         }
@@ -1602,7 +1567,7 @@ fn resolve_banner(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
             let (bwi_start, bwi_end) = ctx.get_func("render.BannerWithInfo")?;
             let cave_offset = find_cave(ctx)?;
 
-            // 제품명 옆 괄호 안에 표시: "Antigravity CLI 1.5.7 (patch v0.2.4)"
+            // 제품명 옆 괄호 안에 표시: "Antigravity CLI 1.5.7 (patch v0.2.5)"
             let chan = format!("patch v{}", env!("CARGO_PKG_VERSION")).into_bytes();
             assert!(chan.len() <= CAVE_NOTES_OFF - CAVE_CHAN_OFF);
             let chan_va = cave_offset + CAVE_CHAN_OFF;
@@ -1669,7 +1634,6 @@ fn release_notes_text() -> String {
     const ITEMS: &[(&str, &str)] = &[
         ("nodrip", "instant streaming (16ms typewriter drip removed)"),
         ("batch", "full answer rendered at once on completion"),
-        ("heading", "'##' prefixes hidden on H2-H6"),
         ("cjk-bold", "**bold** kept before Korean particles"),
         ("tilde-strike", "only '~~' strikes through, single '~' stays"),
         ("code-theme", "readable code block theme for terminal colorScheme (--code-theme vs)"),
@@ -1797,14 +1761,6 @@ const PATCH_REGISTRY: &[PatchSpec] = &[
         resolver: resolve_batch,
     },
     PatchSpec {
-        id: "heading",
-        title: "마크다운 헤딩 '##' 기호 숨김 (Clean Headings)",
-        description: "H2~H6 제목 앞에 붙는 '## '~'###### ' 프리픽스를 제거하고 스타일만 유지",
-        symbol: "render.glamourStyleForScheme",
-        default_on: true,
-        resolver: resolve_heading,
-    },
-    PatchSpec {
         id: "cjk-bold",
         title: "구두점 뒤 한글 조사 볼드(**) 깨짐 수정 (CJK Bold Fix)",
         description: "**\"문구\"**라는, **용어(`code`)**는 처럼 뒤에 한글 조사가 붙어도 볼드 유지",
@@ -1839,7 +1795,7 @@ const PATCH_REGISTRY: &[PatchSpec] = &[
     PatchSpec {
         id: "banner",
         title: "제품명 옆 패치 버전 표시 (Patch Version Tag)",
-        description: "상단 'Antigravity CLI 1.5.7' 옆에 '(patch v0.2.4)' 형태로 패치 버전 표시",
+        description: "상단 'Antigravity CLI 1.5.7' 옆에 '(patch v0.2.5)' 형태로 패치 버전 표시",
         symbol: "render.BannerWithInfo",
         default_on: true,
         resolver: resolve_banner,
@@ -3899,6 +3855,55 @@ mod tests {
                 .as_deref(),
             Some("solarized-light")
         );
+    }
+
+    #[test]
+    fn resolve_code_theme_skips_x86_alignment_nops() {
+        let mut buf = vec![0x90u8; 512];
+        let native_tag = b"<style name=\"native\">";
+        let vs_tag = b"<style name=\"vs\">";
+        buf[16..16 + native_tag.len()].copy_from_slice(native_tag);
+        let native_off = 16 + 13;
+        buf[64..64 + vs_tag.len()].copy_from_slice(vs_tag);
+        let vs_off = 64 + 13;
+
+        let fn_start = 160usize;
+        let fn_end = 320usize;
+        let site = fn_start + 12;
+        buf[site..site + 2].copy_from_slice(&[0x48, 0xb8]);
+        buf[site + 2..site + 10].copy_from_slice(b"terminal");
+        // agy 1.5.12 에서 관측된 JCC 정렬용 1바이트 nop(0x90) 및 다중바이트 nop 삽입
+        buf[site + 10] = 0x90;
+        buf[site + 11..site + 14].copy_from_slice(&[0x48, 0x39, 0x02]);
+        buf[site + 14..site + 18].copy_from_slice(&[0x0f, 0x1f, 0x40, 0x00]);
+        buf[site + 18..site + 24].copy_from_slice(&[0x0f, 0x85, 0x50, 0x00, 0x00, 0x00]);
+        let lea_off = site + 24;
+        let lea_next = lea_off + 7;
+        let disp_native = (native_off as i64 - lea_next as i64) as i32;
+        buf[lea_off..lea_off + 3].copy_from_slice(&[0x48, 0x8d, 0x05]);
+        buf[lea_off + 3..lea_next].copy_from_slice(&disp_native.to_le_bytes());
+        buf[lea_next..lea_next + 8].copy_from_slice(&[0x48, 0x89, 0x84, 0x24, 0x20, 0x16, 0x00, 0x00]);
+        let mov_len_off = lea_next + 8;
+        buf[mov_len_off..mov_len_off + 8]
+            .copy_from_slice(&[0x48, 0xc7, 0x84, 0x24, 0x28, 0x16, 0x00, 0x00]);
+        buf[mov_len_off + 8..mov_len_off + 12].copy_from_slice(&6u32.to_le_bytes());
+
+        let mut funcs = HashMap::new();
+        funcs.insert("render.glamourStyleForScheme", (fn_start, fn_end));
+        let ctx = BinaryContext {
+            data: &buf,
+            format: Format::Elf64,
+            arch: Arch::X86_64,
+            segments: Vec::new(),
+            funcs,
+            compact_tokens: DEFAULT_COMPACT_TOKENS,
+            code_theme: "vs".to_string(),
+        };
+        let edits = resolve_code_theme(&ctx).expect("정렬용 NOP이 있어도 code-theme 매칭이 성공해야 함");
+        assert_eq!(edits.len(), 2);
+        apply(&mut buf, edits);
+        assert_eq!(read_i32(&buf, lea_off + 3), (vs_off as i64 - lea_next as i64) as i32);
+        assert_eq!(read_u32(&buf, mov_len_off + 8), 2);
     }
 
     fn put_words(buf: &mut [u8], off: usize, insns: &[u32]) {

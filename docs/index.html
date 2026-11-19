@@ -324,7 +324,7 @@ footer .links{display:flex;flex-wrap:wrap;gap:6px 18px;margin-top:12px}
 
 <div class="topbar" id="topbar">
   <div class="wrap in">
-    <div class="brand">agy-cli-patch <span>v0.2.4</span></div>
+    <div class="brand">agy-cli-patch <span>v0.2.5</span></div>
     <nav>
       <a class="opt" href="#patches">패치</a>
       <a class="opt" href="#how">원리</a>
@@ -363,10 +363,9 @@ footer .links{display:flex;flex-wrap:wrap;gap:6px 18px;margin-top:12px}
     <div class="win">
       <div class="bar"><i></i><i></i><i></i><b>agy-cli-patch</b></div>
       <div class="sw" id="sw">
-        <div class="hd">적용할 패치를 고르세요 <span id="cnt">0/6 선택</span></div>
+        <div class="hd">적용할 패치를 고르세요 <span id="cnt">0/5 선택</span></div>
         <button class="row" role="switch" aria-checked="false" data-k="nodrip"><span class="pt">❯</span><span class="ck">○</span><span class="id">nodrip</span><span class="ds">16ms마다 12바이트씩 끊어 찍는 타자기 효과를 끄고 수신 즉시 반영</span></button>
         <button class="row" role="switch" aria-checked="false" data-k="batch"><span class="pt">❯</span><span class="ck">○</span><span class="id">batch</span><span class="ds">생성 중에는 본문을 숨겼다가 완료(DONE)되면 한 번에 출력</span></button>
-        <button class="row" role="switch" aria-checked="false" data-k="heading"><span class="pt">❯</span><span class="ck">○</span><span class="id">heading</span><span class="ds">제목 앞의 '## ' 기호를 숨기고 색·볼드만 유지</span></button>
         <button class="row" role="switch" aria-checked="false" data-k="cjk"><span class="pt">❯</span><span class="ck">○</span><span class="id">cjk-bold</span><span class="ds">구두점 뒤에 한글 조사가 붙어도 볼드 유지</span></button>
         <button class="row" role="switch" aria-checked="false" data-k="tilde"><span class="pt">❯</span><span class="ck">○</span><span class="id">tilde-strike</span><span class="ds">'~' 하나는 그대로 두고 '~~'만 취소선</span></button>
         <button class="row" role="switch" aria-checked="false" data-k="compact"><span class="pt">❯</span><span class="ck">○</span><span class="idrow"><span class="id">compact</span><span class="subtok" id="herotok">[180k]</span><span class="tokctl"><span role="button" tabindex="0" class="tokbtn" data-set="180000" aria-label="180k로 낮추기">180k</span><span role="button" tabindex="0" class="tokbtn" data-set="500000" aria-label="500k로 높이기">500k</span><span role="button" tabindex="0" class="tokbtn" data-d="-10000" aria-label="10k 감소">−</span><span role="button" tabindex="0" class="tokbtn" data-d="10000" aria-label="10k 증가">+</span></span></span><span class="ds">자동 컴팩션(256k)을 낮춰 비용을 아끼거나 높여 원문 맥락을 유지</span></button>
@@ -387,15 +386,13 @@ footer .links{display:flex;flex-wrap:wrap;gap:6px 18px;margin-top:12px}
 <div class="wrap">
 <section id="patches">
   <div class="kicker rv">--list</div>
-  <h2 class="rv">패치 아홉 가지, 골라서 적용</h2>
+  <h2 class="rv">패치 여덟 가지, 골라서 적용</h2>
   <p class="sub rv">필요한 것만 조합해 새 실행 파일로 만들거나, 기본 agy에 바로 덮어씁니다. 오른쪽 칸은 패치 전후를 번갈아 보여 주고, 누르면 그 상태로 멈춥니다.</p>
   <div class="plist rv">
     <div class="p glow"><div class="id">nodrip</div><div><div class="d">16ms마다 12바이트씩 끊어 찍는 타자기 딜레이를 없애고 수신 즉시 반영합니다.</div><div class="sym">store.cutAtRuneBoundary</div></div>
       <button class="mini" data-on="0" aria-label="nodrip 패치 전후 보기"><span class="lab"><i></i></span><span class="c"><span class="dr">받은 글을 그대로 화면에 올립니다</span></span></button></div>
     <div class="p glow"><div class="id">batch</div><div><div class="d">응답 생성 중에는 본문 출력을 보류하고, 완료되면 완성된 마크다운 전체를 한 번에 출력합니다.</div><div class="sym">render.renderPlannerBody</div></div>
       <button class="mini" data-on="0" aria-label="batch 패치 전후 보기"><span class="lab"><i></i></span><span class="c"><span class="dr ba">완성된 답변을 한 번에 보여 줍니다</span></span></button></div>
-    <div class="p glow"><div class="id">heading</div><div><div class="d">H2~H6 제목 앞에 붙는 <code>## </code>~<code>###### </code> 프리픽스를 숨기고 색상·볼드만 남깁니다.</div><div class="sym">render.glamourStyleForScheme</div></div>
-      <button class="mini" data-on="0" aria-label="heading 패치 전후 보기"><span class="lab"><i></i></span><span class="c hx"><span class="px">## </span>설치 방법</span></button></div>
     <div class="p glow"><div class="id">cjk-bold</div><div><div class="d"><code>**"문구"**라는</code>, <code>**용어(`code`)**는</code>처럼 닫는 <code>**</code> 앞 구두점과 뒤 한글 조사가 만날 때 볼드가 풀리는 현상을 고칩니다.</div><div class="sym">goldmark/parser.ScanDelimiter</div></div>
       <button class="mini" data-on="0" aria-label="cjk-bold 패치 전후 보기"><span class="lab"><i></i></span><span class="c"><span class="px">**</span><span class="bd">"문구"</span><span class="px">**</span>라는 표현</span></button></div>
     <div class="p glow"><div class="id">tilde-strike</div><div><div class="d"><code>1.5.0~1.5.6</code>, <code>H2~H6</code> 같은 범위 표기의 물결표 하나에 취소선이 그어지지 않게 합니다. <code>~~</code> 두 개만 취소선입니다.</div><div class="sym">goldmark/extension.(*strikethroughParser).Parse</div></div>
@@ -404,10 +401,10 @@ footer .links{display:flex;flex-wrap:wrap;gap:6px 18px;margin-top:12px}
       <button class="mini" data-on="0" aria-label="code-theme 패치 전후 보기"><span class="lab"><i></i></span><span class="c ct"><span class="ct-code"><span class="ct-kw">func</span> <span class="ct-id">Do(req *</span><span class="ct-tp">Req</span><span class="ct-id">)</span></span><span class="ct-tag"></span></span></button></div>
     <div class="p glow"><div class="id">compact</div><div><div class="d">내장 자동 컴팩션(CHECKPOINT) 기준(기본 <code>256k</code>)을 <code>32k~1000k</code> 범위에서 조절합니다. <code>180k</code>로 낮춰 <code>200k</code> 단가 할증 전에 조기 요약하거나, <code>500k+</code>로 높여 1M 모델의 원문 맥락을 오래 유지할 수 있습니다.<span class="tag">기본 꺼짐</span></div><div class="sym">utils.GetCheckpointConfig · config.applyFeatureProviderCheckpointOverrideConfig</div></div>
       <button class="mini" data-on="0" aria-label="compact 패치 전후 보기"><span class="lab"><i></i></span><span class="c"><span class="c-before">192k / 256k · 압축 대기</span><span class="c-after">192k ≥ 180k<b> → CHECKPOINT (15k)</b></span></span></button></div>
-    <div class="p glow"><div class="id">banner</div><div><div class="d">상단 <code>Antigravity CLI 1.5.7</code> 옆에 <code>(patch v0.2.4)</code> 형태로 패치 버전을 표시합니다.<span class="tag">Linux ARM64 제외</span></div><div class="sym">render.BannerWithInfo</div></div>
-      <button class="mini" data-on="0" aria-label="banner 패치 전후 보기"><span class="lab"><i></i></span><span class="c">Antigravity CLI 1.5.7<span class="add"> (patch v0.2.4)</span></span></button></div>
+    <div class="p glow"><div class="id">banner</div><div><div class="d">상단 <code>Antigravity CLI 1.5.7</code> 옆에 <code>(patch v0.2.5)</code> 형태로 패치 버전을 표시합니다.<span class="tag">Linux ARM64 제외</span></div><div class="sym">render.BannerWithInfo</div></div>
+      <button class="mini" data-on="0" aria-label="banner 패치 전후 보기"><span class="lab"><i></i></span><span class="c">Antigravity CLI 1.5.7<span class="add"> (patch v0.2.5)</span></span></button></div>
     <div class="p glow"><div class="id">release-notes</div><div><div class="d">로고 아래에 패치 기능 요약과 저장소 정보를 표시합니다. <code>-p all,release-notes</code>처럼 명시해야 적용됩니다.<span class="tag">Linux ARM64 제외</span><span class="tag">기본 꺼짐</span></div><div class="sym">render.BuildHeader</div></div>
-      <button class="mini" data-on="0" aria-label="release-notes 패치 전후 보기"><span class="lab"><i></i></span><span class="c stt">로고 아래</span><span class="rn"><b>What's new in agy-cli-patch v0.2.4:</b><br><u>•</u> <b>code-theme</b>: readable code block theme (vs) …<br><u>•</u> <b>compact</b>: custom auto-compaction token limit …</span></button></div>
+      <button class="mini" data-on="0" aria-label="release-notes 패치 전후 보기"><span class="lab"><i></i></span><span class="c stt">로고 아래</span><span class="rn"><b>What's new in agy-cli-patch v0.2.5:</b><br><u>•</u> <b>code-theme</b>: readable code block theme (vs) …<br><u>•</u> <b>compact</b>: custom auto-compaction token limit …</span></button></div>
   </div>
 </section>
 
@@ -501,8 +498,8 @@ agy-cli-patch -p all --compact 500k -o agy-long
 agy-cli-patch -p all,compact=160k -o agy-batch
 agy-cli-patch --preset --compact 180k
 
-<span class="c"># 마크다운 패치 3종만 적용해 agy-md 생성</span>
-agy-cli-patch -p heading,cjk-bold,tilde-strike -o agy-md</pre></div>
+<span class="c"># 마크다운 패치 2종만 적용해 agy-md 생성</span>
+agy-cli-patch -p cjk-bold,tilde-strike -o agy-md</pre></div>
   <p class="note">설치 출력은 Linux x86_64에서 실제로 찍힌 줄이며 홈 경로만 예시로 바꿨습니다. 전체 옵션은 <a href="https://github.com/KyongSik-Yoon/agy-cli-patch#사용법">README의 사용법</a>을 보세요.</p>
 </section>
 </div>
@@ -602,7 +599,7 @@ part('hero', function(){
     '### 지원 범위',
     '버전은 1.5.0~1.5.6, 헤딩은 H2~H6까지입니다. ~~지워진 글~~만 취소선이어야 합니다.'
   ].join('\n');
-  var FXLINE = {heading: [0, 3], cjk: [1], tilde: [4]};
+  var FXLINE = {cjk: [1], tilde: [4]};
   var enc = new TextEncoder();
   // 글자 경계별 누적 바이트 수 (cutAtRuneBoundary 처럼 글자 중간에서 자르지 않는다)
   var chars = Array.from(SRC), cum = [0];
@@ -610,8 +607,8 @@ part('hero', function(){
   var TOTAL = cum[cum.length - 1];
   function cut(bytes){ var i = 0; while (i < chars.length && cum[i + 1] <= bytes) i++; return {text: chars.slice(0, i).join(''), bytes: cum[i]}; }
 
-  var KEYS = ['nodrip', 'batch', 'heading', 'cjk', 'tilde', 'compact'];
-  var on = {nodrip: false, batch: false, heading: false, cjk: false, tilde: false, compact: false};
+  var KEYS = ['nodrip', 'batch', 'cjk', 'tilde', 'compact'];
+  var on = {nodrip: false, batch: false, cjk: false, tilde: false, compact: false};
   var CTX_RAW = 192000, CTX_COMPACT = 15000, compactTok = 180000;
   function fmtK(t){ return t % 1000 === 0 ? (t / 1000) + 'k' : String(t); }
   var term = $('term'), rows = Array.prototype.slice.call(document.querySelectorAll('#sw button.row'));
@@ -662,7 +659,7 @@ part('hero', function(){
       var last = idx === lines.length - 1, c = (last && caret) ? '<span class="caret"></span>' : '';
       var f = hl.indexOf(idx) >= 0 ? ' fx' : '';
       var m = /^(#{2,6}) (.*)$/.exec(l);
-      if (m) html += '<div class="h"><span class="' + f.trim() + '">' + (on.heading ? '' : '<span class="px">' + m[1] + ' </span>') + inline(m[2]) + '</span>' + c + '</div>';
+      if (m) html += '<div class="h"><span class="' + f.trim() + '">' + inline(m[2]) + '</span>' + c + '</div>';
       else if (l === '') html += '<div class="sp">' + c + '</div>';
       else html += '<div><span class="' + f.trim() + '">' + inline(l) + '</span>' + c + '</div>';
     });
@@ -767,7 +764,7 @@ part('hero', function(){
     stopAuto(); var tok = autoTok, live = function(){ return tok === autoTok; };
     $('auto').textContent = '자동 시연 중'; $('auto').setAttribute('aria-pressed', 'true');
     KEYS.forEach(function(k){ on[k] = false; }); compactTok = 180000; $('flash').textContent = ''; sync(); play();
-    var seq = ['heading', 'cjk', 'tilde', 'compact', 'nodrip', 'batch'], p = until(function(){ return finished || !live(); });
+    var seq = ['cjk', 'tilde', 'compact', 'nodrip', 'batch'], p = until(function(){ return finished || !live(); });
     seq.forEach(function(k){
       p = p.then(function(){ return live() && sleep(1000); })
         .then(function(){ if (live()) rowOf(k).classList.add('cur'); return live() && sleep(700); })
@@ -930,15 +927,14 @@ part('wizard', function(){
   var P = [
     {id: 'nodrip', t: '타자기 딜레이 제거 (No Drip)', d: '16ms마다 12바이트씩 끊어 찍는 타자기 효과를 끄고 수신 즉시 반영', s: 'store.cutAtRuneBoundary', def: true, off: '0xa4720c0'},
     {id: 'batch', t: '응답 완료 시 한 번에 일괄 출력 (Batch Render)', d: '생성 중에는 본문을 숨겼다가 답변이 완료(DONE)되면 전체를 한 번에 출력', s: 'render.renderPlannerBody', def: true, off: '0xa3268f3'},
-    {id: 'heading', t: "마크다운 헤딩 '##' 기호 숨김 (Clean Headings)", d: "H2~H6 제목 앞에 붙는 '## '~'###### ' 프리픽스를 제거하고 스타일만 유지", s: 'render.glamourStyleForScheme', def: true, off: '0xa31fbf6, 0xa31fc11, 0xa31fc2c, 0xa31fc47, 0xa31fc62'},
     {id: 'cjk-bold', t: '구두점 뒤 한글 조사 볼드(**) 깨짐 수정 (CJK Bold Fix)', d: '**"문구"**라는, **용어(`code`)**는 처럼 뒤에 한글 조사가 붙어도 볼드 유지', s: 'goldmark/parser.ScanDelimiter', def: true, off: '0xa1b9c91, 0xa1b9cc3'},
     {id: 'tilde-strike', t: '단일 물결표(~) 취소선 오작동 방지 (Double-Tilde Strikethrough)', d: "1.5.0~1.5.6 같은 범위 표기용 단일 '~'에 취소선이 그어지지 않도록 '~~'만 허용", s: 'goldmark/extension.(*strikethroughParser).Parse', def: true, off: '0xa1d5015'},
     {id: 'code-theme', t: '터미널 스킴 코드 블록 가독성 개선 (Terminal Code Theme)', d: 'colorScheme: terminal 사용 시 흐린 회색(#d0d0d0)으로 묻히는 코드 블록 테마(native)를 선명한 테마(기본 vs)로 교체', s: 'render.glamourStyleForScheme', def: true, off: '0xa31fe01, 0xa31fe15'},
     {id: 'compact', t: '자동 컴팩션 토큰 임계값 변경 (Auto-Compact Limit)', d: '내장 자동 컴팩션(CHECKPOINT) 발동 기준(기본 256k)을 원하는 토큰 수(기본 180k, 32k~1000k)로 변경 (기본 꺼짐)', s: 'utils.GetCheckpointConfig', def: false, off: '0x86858d8, 0x84f5e04, 0x84f5e09, 0x84f617d'},
-    {id: 'banner', t: '제품명 옆 패치 버전 표시 (Patch Version Tag)', d: "상단 'Antigravity CLI 1.5.7' 옆에 '(patch v0.2.4)' 형태로 패치 버전 표시", s: 'render.BannerWithInfo', def: true, off: '0xa8a4287, 0xa326f90'},
+    {id: 'banner', t: '제품명 옆 패치 버전 표시 (Patch Version Tag)', d: "상단 'Antigravity CLI 1.5.7' 옆에 '(patch v0.2.5)' 형태로 패치 버전 표시", s: 'render.BannerWithInfo', def: true, off: '0xa8a4287, 0xa326f90'},
     {id: 'release-notes', t: '상단 배너 릴리즈 노트 표시 (Release Notes)', d: '로고 아래에 패치 기능 요약 및 GitHub 정보 표시 (기본 꺼짐, -p 로 명시해야 적용)', s: 'render.BuildHeader', def: false, off: '0xa8a42c7, 0xa8a45e0, 0xa318180'}
   ];
-  var N = P.length, B = 1, ND = 0, TI = 5, CI = 6;
+  var N = P.length, B = 1, ND = 0, TI = 4, CI = 5;
   var THEME_PRESETS = ['vs', 'solarized-light', 'bw', 'github', 'catppuccin-latte', 'xcode'];
   var DIR = '~/.local/share/mise/installs/agy/1.5.7', ADIR = '/home/user/.local/share/mise/installs/agy/1.5.7', ABIN = '/home/user/.local/bin';
   var wz = $('wz'), tui = $('tui'), W, logTok = 0;
@@ -1076,7 +1072,7 @@ part('wizard', function(){
   }
   function flashLines(){ return ln('') + (W.flash ? ln(sp(W.flash[0], W.flash[1])) + ln('') : ''); }
   function draw(){
-    var h = '<div class="hdr"><span><span class="ab">agy-cli-patch</span> <span class="dim">v0.2.4</span></span><span class="dim">ELF · x86_64</span></div>';
+    var h = '<div class="hdr"><span><span class="ab">agy-cli-patch</span> <span class="dim">v0.2.5</span></span><span class="dim">ELF · x86_64</span></div>';
     h += ln(sp('dim', '대상') + sp('gr', DIR + '/antigravity') + '<span class="dim" style="flex:none">1.5.7</span>');
     h += ln('');
     var names = ['패치 선택', '출력 방식', '확인'];
