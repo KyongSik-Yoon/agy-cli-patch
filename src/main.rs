@@ -633,25 +633,64 @@ fn resolve_batch(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
 
     match ctx.arch {
         Arch::X86_64 => {
-            for i in 0..body.len().saturating_sub(21) {
-                if body[i] == 0x83
-                    && (0xf8..=0xff).contains(&body[i + 1])
-                    && body[i + 2] == 0x01
-                    && body[i + 3] == 0x76
-                    && body[i + 4] == 0x0e
-                    && body[i + 5] == 0x83
-                    && (0xf8..=0xff).contains(&body[i + 6])
-                    && body[i + 7] == 0x08
-                    && body[i + 8] == 0x74
-                    && body[i + 9] == 0x09
-                    && body[i + 10] == 0x83
-                    && (0xf8..=0xff).contains(&body[i + 11])
-                    && body[i + 12] == 0x0b
-                    && body[i + 13] == 0x0f
-                    && body[i + 14] == 0x85
+            for i in 0..body.len().saturating_sub(19) {
+                if body[i] != 0x83 || !(0xf8..=0xff).contains(&body[i + 1]) || body[i + 2] != 0x01 {
+                    continue;
+                }
+                // Go 어셈블러가 Intel JCC Erratum 완화를 위해 cmp/jcc 경계에 정렬용 NOP을 삽입할 수 있다.
+                let jbe = skip_x86_nops(body, i + 3);
+                if jbe + 2 > body.len() || body[jbe] != 0x76 {
+                    continue;
+                }
+                let jbe_disp = body[jbe + 1] as i8;
+                if jbe_disp <= 0 {
+                    continue;
+                }
+                let jbe_target = jbe + 2 + jbe_disp as usize;
+
+                let cmp8 = skip_x86_nops(body, jbe + 2);
+                if cmp8 + 3 > body.len()
+                    || body[cmp8] != 0x83
+                    || !(0xf8..=0xff).contains(&body[cmp8 + 1])
+                    || body[cmp8 + 2] != 0x08
+                {
+                    continue;
+                }
+                let je = skip_x86_nops(body, cmp8 + 3);
+                if je + 2 > body.len() || body[je] != 0x74 {
+                    continue;
+                }
+                let je_disp = body[je + 1] as i8;
+                if je_disp <= 0 {
+                    continue;
+                }
+                let je_target = je + 2 + je_disp as usize;
+                if je_target != jbe_target {
+                    continue;
+                }
+
+                let cmp11 = skip_x86_nops(body, je + 2);
+                if cmp11 + 3 > body.len()
+                    || body[cmp11] != 0x83
+                    || !(0xf8..=0xff).contains(&body[cmp11 + 1])
+                    || body[cmp11 + 2] != 0x0b
+                {
+                    continue;
+                }
+                let jne = skip_x86_nops(body, cmp11 + 3);
+                let after_jne = if jne + 6 <= body.len() && body[jne] == 0x0f && body[jne + 1] == 0x85 {
+                    jne + 6
+                } else if jne + 2 <= body.len() && body[jne] == 0x75 {
+                    jne + 2
+                } else {
+                    continue;
+                };
+
+                if (jbe_target == after_jne || jbe_target == skip_x86_nops(body, after_jne))
+                    && jbe_target + 8 <= body.len()
                 {
                     edits.push(ByteEdit {
-                        offset: start + i + 19,
+                        offset: start + jbe_target,
                         payload: vec![0x31, 0xc0, 0x31, 0xdb, 0x31, 0xc9, 0xc9, 0xc3],
                     });
                 }
@@ -1567,7 +1606,7 @@ fn resolve_banner(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
             let (bwi_start, bwi_end) = ctx.get_func("render.BannerWithInfo")?;
             let cave_offset = find_cave(ctx)?;
 
-            // 제품명 옆 괄호 안에 표시: "Antigravity CLI 1.5.7 (patch v0.2.5)"
+            // 제품명 옆 괄호 안에 표시: "Antigravity CLI 1.5.7 (patch v0.2.6)"
             let chan = format!("patch v{}", env!("CARGO_PKG_VERSION")).into_bytes();
             assert!(chan.len() <= CAVE_NOTES_OFF - CAVE_CHAN_OFF);
             let chan_va = cave_offset + CAVE_CHAN_OFF;
@@ -1795,7 +1834,7 @@ const PATCH_REGISTRY: &[PatchSpec] = &[
     PatchSpec {
         id: "banner",
         title: "제품명 옆 패치 버전 표시 (Patch Version Tag)",
-        description: "상단 'Antigravity CLI 1.5.7' 옆에 '(patch v0.2.5)' 형태로 패치 버전 표시",
+        description: "상단 'Antigravity CLI 1.5.7' 옆에 '(patch v0.2.6)' 형태로 패치 버전 표시",
         symbol: "render.BannerWithInfo",
         default_on: true,
         resolver: resolve_banner,
@@ -3904,6 +3943,42 @@ mod tests {
         apply(&mut buf, edits);
         assert_eq!(read_i32(&buf, lea_off + 3), (vs_off as i64 - lea_next as i64) as i32);
         assert_eq!(read_u32(&buf, mov_len_off + 8), 2);
+    }
+
+    #[test]
+    fn resolve_batch_skips_x86_alignment_nops() {
+        // agy 1.5.13 에서 관측된 `cmp edx, 0xb` 직전 2바이트 NOP(`66 90`) 삽입 케이스
+        let mut buf = vec![0x90u8; 256];
+        let fn_start = 32usize;
+        let fn_end = 160usize;
+        let site = fn_start + 16;
+        let seq: &[u8] = &[
+            0x83, 0xfe, 0x01, // cmp esi, 1
+            0x76, 0x10, // jbe +0x10
+            0x83, 0xfa, 0x08, // cmp edx, 8
+            0x74, 0x0b, // je +0x0b
+            0x66, 0x90, // xchg ax, ax (정렬용 2바이트 NOP)
+            0x83, 0xfa, 0x0b, // cmp edx, 0xb
+            0x0f, 0x85, 0x0b, 0x01, 0x00, 0x00, // jne +0x10b
+            0x48, 0x8b, 0x84, 0x24, 0x90, 0x00, 0x00, 0x00, // mov rax, [rsp+0x90]
+        ];
+        buf[site..site + seq.len()].copy_from_slice(seq);
+
+        let mut funcs = HashMap::new();
+        funcs.insert("render.renderPlannerBody", (fn_start, fn_end));
+        let ctx = BinaryContext {
+            data: &buf,
+            format: Format::Elf64,
+            arch: Arch::X86_64,
+            segments: Vec::new(),
+            funcs,
+            compact_tokens: DEFAULT_COMPACT_TOKENS,
+            code_theme: "vs".to_string(),
+        };
+        let edits = resolve_batch(&ctx).expect("정렬용 NOP이 있어도 batch 매칭이 성공해야 함");
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].offset, site + 21);
+        assert_eq!(edits[0].payload, vec![0x31, 0xc0, 0x31, 0xdb, 0x31, 0xc9, 0xc9, 0xc3]);
     }
 
     fn put_words(buf: &mut [u8], off: usize, insns: &[u32]) {
