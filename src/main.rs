@@ -1573,8 +1573,9 @@ fn banner_cave_x86(ctx: &BinaryContext) -> Result<Option<usize>, String> {
         return Ok(None);
     };
     x86_rel32_target(ctx.data, site + 19, site + 23)
-        .filter(|&p| p >= CAVE_CHAN_OFF && ctx.data.get(p..).is_some_and(|s| s.starts_with(b"patch v")))
-        .map(|p| Some(p - CAVE_CHAN_OFF))
+        .filter(|&p| ctx.data.get(p..).is_some_and(|s| s.starts_with(b"patch v")))
+        .and_then(|p| p.checked_sub(CAVE_CHAN_OFF))
+        .map(Some)
         .ok_or_else(|| "BannerWithInfo 기존 패치가 가리키는 채널 문자열(\"patch v…\")을 찾을 수 없습니다.".into())
 }
 
