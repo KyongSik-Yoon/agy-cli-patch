@@ -212,6 +212,8 @@ struct BinaryContext<'a> {
     funcs: HashMap<&'a str, (usize, usize)>,
     compact_tokens: u32,
     code_theme: String,
+    /// TIERS 순서 (pro, flash, flash_lite)
+    tier_models: [String; 3],
 }
 
 impl<'a> BinaryContext<'a> {
@@ -388,6 +390,7 @@ impl<'a> BinaryContext<'a> {
             "extension.(*strikethroughParser).Parse",
             "utils.GetCheckpointConfig",
             "config.applyFeatureProviderCheckpointOverrideConfig",
+            "modelutils.modelIDForTier",
             "render.BuildHeader",
             "render.BannerWithInfo",
             "runtime.concatstring2",
@@ -427,6 +430,7 @@ impl<'a> BinaryContext<'a> {
             funcs,
             compact_tokens: DEFAULT_COMPACT_TOKENS,
             code_theme: DEFAULT_CODE_THEME.to_string(),
+            tier_models: default_tier_models(),
         })
     }
 
@@ -1407,6 +1411,252 @@ fn resolve_compact(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
     Ok(edits)
 }
 
+// --- pro-tier / flash-tier / flash-lite-tier: 서브에이전트 모델 티어 고정 ---
+//
+// invoke_subagent·사용자 정의 에이전트(model: pro)·훅 등은 모델을 티어(inherit/flash_lite/flash/pro)로만 받고,
+// modelutils.modelIDForTier 가 서버가 계정별로 내려주는 TieredModelConfig 의 티어별 모델 목록 첫 항목을 고른다.
+// 로컬에서 이 목록을 덮는 설정(admin_settings.json models.tiers, AGY_LLM_GATEWAY_TIER_*)은 LLM 게이트웨이
+// 모드에서만 읽히므로(gateway.applyConfiguredModelTiers 가 유일한 사용처, 정적 분석 기준), 티어 분기가 지정한
+// 모델 ID 를 바로 돌려주게 바꾼다. agy 유틸리티 모델은 flash_lite, 없으면 flash 티어를 쓰므로 그 두 티어를
+// 고정하면 유틸리티 작업도 같은 모델을 쓴다.
+
+/// 고정할 수 있는 티어. `tier` 는 exa.cortex_pb.ModelTier 값.
+struct TierSpec {
+    id: &'static str,
+    flag: &'static str,
+    /// 대화형 화면 알림 문구 ("pro 티어 모델: …", "pro 티어 모델이 '…'(으)로 …")
+    label: &'static str,
+    subject: &'static str,
+    tier: u8,
+    default_model: &'static str,
+}
+
+/// BinaryContext::tier_models·PatchArgs::tiers 와 같은 순서
+const TIERS: [TierSpec; 3] = [
+    TierSpec {
+        id: "pro-tier",
+        flag: "--pro-tier",
+        label: "pro 티어 모델",
+        subject: "pro 티어 모델이",
+        tier: 4,
+        default_model: "gemini-4-carbon-high",
+    },
+    TierSpec {
+        id: "flash-tier",
+        flag: "--flash-tier",
+        label: "flash 티어 모델",
+        subject: "flash 티어 모델이",
+        tier: 3,
+        default_model: "gemini-4-neon-medium",
+    },
+    TierSpec {
+        id: "flash-lite-tier",
+        flag: "--flash-lite-tier",
+        label: "flash_lite 티어 모델",
+        subject: "flash_lite 티어 모델이",
+        tier: 2,
+        default_model: "gemini-4-hydrogen-low",
+    },
+];
+
+fn tier_index(id: &str) -> Option<usize> {
+    TIERS.iter().position(|t| t.id == id)
+}
+
+fn default_tier_models() -> [String; 3] {
+    TIERS.map(|t| t.default_model.to_string())
+}
+/// 대화형 화면에서 -/+ 로 고르는 후보 (`agy models` 기준, 오케스트레이터 전용 모델 제외).
+/// invoke_subagent 에는 effort 인자가 없어 사고 수준은 ID 끝(-low/-medium/-high/-xhigh)으로 정해진다.
+/// 시작할 때 이 바이너리에 문자열로 들어 있는 것만 남긴다. 여기 없는 새 모델은 e 로 직접 입력한다.
+const KNOWN_MODEL_IDS: &[&str] = &[
+    "gemini-4-carbon-high",
+    "gemini-4-carbon-medium",
+    "gemini-4-carbon-low",
+    "gemini-4-hydrogen-xhigh",
+    "gemini-4-hydrogen-high",
+    "gemini-4-hydrogen-medium",
+    "gemini-4-hydrogen-low",
+    "gemini-4-neon-xhigh",
+    "gemini-4-neon-high",
+    "gemini-4-neon-medium",
+    "gemini-4-neon-low",
+    "gemini-4-argon-high",
+    "gemini-4-argon-medium",
+    "gemini-4-argon-low",
+    "claude-opus-5-5-high",
+    "claude-opus-5-5-medium",
+    "claude-opus-5-5-low",
+    "claude-sonnet-5-5-high",
+    "claude-sonnet-5-5-medium",
+    "claude-sonnet-5-5-low",
+    "gemini-3.8-flash-high",
+    "gemini-3.8-flash-medium",
+    "gemini-3.8-flash-low",
+];
+const MODEL_ID_EXAMPLES: &str = "gemini-4-carbon-high, gemini-4-neon-medium, gemini-4-hydrogen-low";
+
+fn parse_model_id(raw: &str) -> Result<String, String> {
+    let id = raw.trim().to_ascii_lowercase();
+    let valid = !id.is_empty()
+        && id.len() <= 64
+        && id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '.' | '_'));
+    if !valid {
+        return Err(format!(
+            "유효하지 않은 모델 ID 입니다: '{raw}' (영문 소문자·숫자·'-'·'.'·'_', 예: {MODEL_ID_EXAMPLES})"
+        ));
+    }
+    Ok(id)
+}
+
+/// 모델 ID 를 찾을 범위. 패치한 코드가 가리킬 것이므로 modelIDForTier 와 같은 (실행) 세그먼트로 한정한다.
+fn model_id_search_range(ctx: &BinaryContext) -> Result<(usize, usize), String> {
+    let (func, _) = ctx.get_func("modelutils.modelIDForTier")?;
+    Ok(ctx
+        .segments
+        .iter()
+        .find(|&&(off, _, size)| func >= off && func - off < size)
+        .map_or((0, ctx.data.len()), |&(off, _, size)| (off, off + size)))
+}
+
+/// `needle` 이 나오는 모든 위치. 첫 바이트로 건너뛰므로 수백 MB 에서도 windows() 비교보다 훨씬 빠르다.
+fn find_all<'a>(haystack: &'a [u8], needle: &'a [u8]) -> impl Iterator<Item = usize> + 'a {
+    let first = needle.first().copied();
+    let mut i = 0;
+    std::iter::from_fn(move || {
+        let first = first?;
+        while i + needle.len() <= haystack.len() {
+            let at = i + haystack[i..].iter().position(|&b| b == first)?;
+            i = at + 1;
+            if haystack[at..].starts_with(needle) {
+                return Some(at);
+            }
+        }
+        None
+    })
+}
+
+/// 모델 ID 문자열이 들어 있는 위치.
+/// Go 문자열은 길이를 따로 들고 다니므로 다른 문자열 사이에 붙어 있어도 된다.
+fn find_model_id_offset(ctx: &BinaryContext, model: &str) -> Result<usize, String> {
+    let (lo, hi) = model_id_search_range(ctx)?;
+    find_all(&ctx.data[lo..hi], model.as_bytes())
+        .next()
+        .map(|p| lo + p)
+        .ok_or_else(|| format!("바이너리에 '{model}' 모델 ID 문자열이 없어 쓸 수 없습니다 (예: {MODEL_ID_EXAMPLES})"))
+}
+
+/// KNOWN_MODEL_IDS 중 이 바이너리에 들어 있는 것 (순서 유지). 접두어마다 한 번만 훑는다.
+fn available_model_ids(ctx: &BinaryContext) -> Vec<&'static str> {
+    let Ok((lo, hi)) = model_id_search_range(ctx) else {
+        return Vec::new();
+    };
+    let hay = &ctx.data[lo..hi];
+    let mut found = vec![false; KNOWN_MODEL_IDS.len()];
+    for prefix in ["gemini-", "claude-"] {
+        for at in find_all(hay, prefix.as_bytes()) {
+            for (k, id) in KNOWN_MODEL_IDS.iter().enumerate() {
+                if !found[k] && id.starts_with(prefix) && hay[at..].starts_with(id.as_bytes()) {
+                    found[k] = true;
+                }
+            }
+        }
+    }
+    KNOWN_MODEL_IDS.iter().zip(found).filter_map(|(id, ok)| ok.then_some(*id)).collect()
+}
+
+/// modelIDForTier 의 티어 분기 본문 (`cmp $tier,%ebx; jne ..` 바로 뒤). 분기 모양은 두 가지다.
+///   PRO(맨 끝 티어, 24바이트): test %rax,%rax; je ..; mov X(%rax),%rdx; mov X+8(%rax),%rsi; jmp ..;
+///                            xor %esi,%esi; xor %edx,%edx; test %rsi,%rsi; jne ok   — 뒤따르는 공용 빈 반환 블록은 다른 티어도 쓴다
+///   그 밖(37바이트):          위와 같되 je empty; mov (%rdx),%rax; mov 8(%rdx),%rbx; xor %ecx,%ecx; xor %edi,%edi; leave; ret
+///   패치 후(같은 길이):       lea model(%rip),%rax; mov $len,%ebx; xor %ecx,%ecx; xor %edi,%edi; leave; ret; int3...
+/// 반환값: (본문 시작, 본문 길이, 이미 패치됐는지)
+fn find_tier_site_x86(ctx: &BinaryContext, tier: u8) -> Result<(usize, usize, bool), String> {
+    const HEAD: [u8; 5] = [0x48, 0x85, 0xc0, 0x74, 0x0a];
+    const MID: [u8; 9] = [0xeb, 0x04, 0x31, 0xf6, 0x31, 0xd2, 0x48, 0x85, 0xf6]; // jmp; xor; xor; test %rsi,%rsi
+    const LOAD: [u8; 7] = [0x48, 0x8b, 0x02, 0x48, 0x8b, 0x5a, 0x08]; // mov (%rdx),%rax; mov 8(%rdx),%rbx
+    const RET: [u8; 6] = [0x31, 0xc9, 0x31, 0xff, 0xc9, 0xc3]; // error = nil; leave; ret
+    let (start, end) = ctx.get_func("modelutils.modelIDForTier")?;
+    let body = &ctx.data[start..end];
+    let mut matches = Vec::new();
+    for i in 0..body.len().saturating_sub(5 + 24) {
+        if body[i..i + 4] != [0x83, 0xfb, tier, 0x75] {
+            continue;
+        }
+        let b = i + 5;
+        let w = &body[b..];
+        let loads = w[0..5] == HEAD
+            && w[5..8] == [0x48, 0x8b, 0x50]
+            && w[9..12] == [0x48, 0x8b, 0x70]
+            && w[8].wrapping_add(8) == w[12]
+            && w[13..22] == MID;
+        let found = if loads && w[22..24] == [0x75, 0x0a] && w.get(34..41) == Some(&LOAD[..]) {
+            Some((24, false))
+        } else if loads && w[22] == 0x74 && w.get(24..31) == Some(&LOAD[..]) && w.get(31..37) == Some(&RET[..]) {
+            Some((37, false))
+        } else if w[0..3] == [0x48, 0x8d, 0x05] && w[7] == 0xbb && w[12..18] == RET {
+            // 이미 패치됨: 원래 본문 길이는 뒤따르는 int3 개수로 되찾는다
+            let n = 18 + w[18..].iter().take_while(|&&c| c == 0xcc).count();
+            matches!(n, 24 | 37).then_some((n, true))
+        } else {
+            None
+        };
+        if let Some((n, patched)) = found {
+            matches.push((start + b, n, patched));
+        }
+    }
+    if matches.len() != 1 {
+        return Err(format!("modelIDForTier 티어 {tier} 분기 패턴 매칭 실패 (매칭 수: {})", matches.len()));
+    }
+    Ok(matches[0])
+}
+
+/// 이미 티어 고정 패치가 돼 있으면 고정된 모델 ID
+fn detect_patched_tier(ctx: &BinaryContext, ti: usize) -> Option<String> {
+    if ctx.arch != Arch::X86_64 {
+        return None;
+    }
+    let (site, _, true) = find_tier_site_x86(ctx, TIERS[ti].tier).ok()? else {
+        return None;
+    };
+    let pc = ctx.off_to_va(site + 7)? as i64;
+    let str_off = ctx.va_to_off(usize::try_from(pc + read_i32(ctx.data, site + 3) as i64).ok()?)?;
+    let len = read_u32(ctx.data, site + 8) as usize;
+    std::str::from_utf8(ctx.data.get(str_off..str_off + len)?).ok().map(str::to_string)
+}
+
+fn resolve_tier(ctx: &BinaryContext, ti: usize) -> Result<Vec<ByteEdit>, String> {
+    let spec = &TIERS[ti];
+    if ctx.arch != Arch::X86_64 {
+        return Err(format!("{} 패치는 아직 x86_64 만 지원합니다.", spec.id));
+    }
+    let (site, len, _) = find_tier_site_x86(ctx, spec.tier)?;
+    let model = &ctx.tier_models[ti];
+    let model_off = find_model_id_offset(ctx, model)?;
+    let model_va = ctx.off_to_va(model_off).ok_or("모델 ID 문자열 가상주소 변환 실패")?;
+    let pc = ctx.off_to_va(site + 7).ok_or("LEA 명령어 가상주소 변환 실패")?;
+    let disp = i32::try_from(model_va as i64 - pc as i64).map_err(|_| "RIP 상대 변위 범위 초과".to_string())?;
+    let mut code = vec![0x48, 0x8d, 0x05]; // lea model(%rip),%rax
+    code.extend_from_slice(&disp.to_le_bytes());
+    code.push(0xbb); // mov $len,%ebx
+    code.extend_from_slice(&(model.len() as u32).to_le_bytes());
+    code.extend_from_slice(&[0x31, 0xc9, 0x31, 0xff, 0xc9, 0xc3]); // error = nil; leave; ret
+    code.resize(len, 0xcc);
+    Ok(vec![ByteEdit { offset: site, payload: code }])
+}
+
+fn resolve_pro_tier(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
+    resolve_tier(ctx, 0)
+}
+
+fn resolve_flash_tier(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
+    resolve_tier(ctx, 1)
+}
+
+fn resolve_flash_lite_tier(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
+    resolve_tier(ctx, 2)
+}
+
 // banner / release-notes 패치가 공유하는 0xcc 패딩 공간(cave) 배치.
 // 두 패치를 따로 적용해도 겹치지 않도록 고정 오프셋을 쓴다.
 const CAVE_MIN: usize = 1024;
@@ -1462,8 +1712,9 @@ fn banner_cave_x86(ctx: &BinaryContext) -> Result<Option<usize>, String> {
         return Ok(None);
     };
     x86_rel32_target(ctx.data, site + 19, site + 23)
-        .filter(|&p| p >= CAVE_CHAN_OFF && ctx.data.get(p..).is_some_and(|s| s.starts_with(b"patch v")))
-        .map(|p| Some(p - CAVE_CHAN_OFF))
+        .filter(|&p| ctx.data.get(p..).is_some_and(|s| s.starts_with(b"patch v")))
+        .and_then(|p| p.checked_sub(CAVE_CHAN_OFF))
+        .map(Some)
         .ok_or_else(|| "BannerWithInfo 기존 패치가 가리키는 채널 문자열(\"patch v…\")을 찾을 수 없습니다.".into())
 }
 
@@ -1720,7 +1971,7 @@ fn resolve_release_notes_a64(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, Strin
 fn resolve_banner(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
     match ctx.arch {
         Arch::X86_64 => {
-            // 제품명 옆 괄호 안에 표시: "Antigravity CLI 1.5.7 (patch v0.2.7)"
+            // 제품명 옆 괄호 안에 표시: "Antigravity CLI 1.5.7 (patch v0.2.8)"
             let chan = format!("patch v{}", env!("CARGO_PKG_VERSION")).into_bytes();
             assert!(chan.len() <= CAVE_NOTES_OFF - CAVE_CHAN_OFF);
 
@@ -1782,6 +2033,7 @@ fn release_notes_text() -> String {
         ("tilde-strike", "only '~~' strikes through, single '~' stays"),
         ("code-theme", "readable code block theme for terminal colorScheme (--code-theme vs)"),
         ("compact", "custom auto-compaction token limit (--compact 180k)"),
+        ("*-tier", "subagent tiers pinned: pro→carbon, flash→neon, flash_lite→hydrogen"),
         ("banner", "patch version shown next to the product name"),
     ];
     let mut out = format!(
@@ -1920,9 +2172,33 @@ const PATCH_REGISTRY: &[PatchSpec] = &[
         resolver: resolve_compact,
     },
     PatchSpec {
+        id: "pro-tier",
+        title: "서브에이전트 pro 티어 모델 고정 (Pro Tier Model)",
+        description: "invoke_subagent 등에서 'pro' 티어가 서버 지정 모델 대신 고른 모델(기본 gemini-4-carbon-high)로 실행되도록 고정 (기본 꺼짐, x86_64 전용)",
+        symbol: "modelutils.modelIDForTier",
+        default_on: false,
+        resolver: resolve_pro_tier,
+    },
+    PatchSpec {
+        id: "flash-tier",
+        title: "서브에이전트 flash 티어 모델 고정 (Flash Tier Model)",
+        description: "'flash' 티어를 고른 모델(기본 gemini-4-neon-medium)로 고정. flash_lite 가 없을 때 agy 유틸리티 작업도 이 티어를 씀 (기본 꺼짐, x86_64 전용)",
+        symbol: "modelutils.modelIDForTier",
+        default_on: false,
+        resolver: resolve_flash_tier,
+    },
+    PatchSpec {
+        id: "flash-lite-tier",
+        title: "서브에이전트 flash_lite 티어 모델 고정 (Flash-Lite Tier Model)",
+        description: "'flash_lite' 티어를 고른 모델(기본 gemini-4-hydrogen-low)로 고정. agy 유틸리티 작업도 이 티어를 먼저 씀 (기본 꺼짐, x86_64 전용)",
+        symbol: "modelutils.modelIDForTier",
+        default_on: false,
+        resolver: resolve_flash_lite_tier,
+    },
+    PatchSpec {
         id: "banner",
         title: "제품명 옆 패치 버전 표시 (Patch Version Tag)",
-        description: "상단 'Antigravity CLI 1.5.7' 옆에 '(patch v0.2.7)' 형태로 패치 버전 표시",
+        description: "상단 'Antigravity CLI 1.5.7' 옆에 '(patch v0.2.8)' 형태로 패치 버전 표시",
         symbol: "render.BannerWithInfo",
         default_on: true,
         resolver: resolve_banner,
@@ -2583,14 +2859,49 @@ fn plan_output(bin_dir: &Path, target_bin: &Path, src_bin: &Path, name: &str) ->
     Ok(OutputPlan { dst, link_name, link, notes })
 }
 
-/// 대화형 설정의 결과: (적용할 패치, 출력 이름, in-place 여부, 컴팩션 토큰 한도, 코드 블록 테마)
-type WizardResult = (Vec<&'static PatchSpec>, String, bool, u32, String);
+/// 대화형 설정의 결과
+struct WizardResult {
+    patches: Vec<&'static PatchSpec>,
+    out_name: String,
+    in_place: bool,
+    args: PatchArgs,
+}
+
+/// 대화형 화면에서 -/+ 로 추천값을 고르거나 e 로 직접 입력하는 문자열 값 (code-theme 테마, *-tier 모델 ID)
+struct TextParam {
+    id: &'static str,
+    /// 알림 문구에 쓰는 이름 ("코드 블록 테마: vs", "코드 블록 테마가 'vs'(으)로 …")
+    label: &'static str,
+    subject: &'static str,
+    /// 하단 키 안내에서 -/+ 의 설명
+    hint: &'static str,
+    presets: Vec<&'static str>,
+    max_len: usize,
+    /// 입력값을 정규화하고 바이너리에 해당 문자열이 있는지까지 확인한다
+    validate: fn(&BinaryContext, &str) -> Result<String, String>,
+    value: String,
+    editing: bool,
+    buf: Vec<char>,
+    pos: usize,
+}
+
+fn validate_code_theme(ctx: &BinaryContext, raw: &str) -> Result<String, String> {
+    let theme = parse_code_theme(raw)?;
+    find_chroma_theme_offset(ctx.data, &theme)?;
+    Ok(theme)
+}
+
+fn validate_model_id(ctx: &BinaryContext, raw: &str) -> Result<String, String> {
+    let model = parse_model_id(raw)?;
+    find_model_id_offset(ctx, &model)?;
+    Ok(model)
+}
 
 struct Wizard<'a> {
     src_bin: &'a Path,
     target_bin: &'a Path,
     bin_dir: &'a Path,
-    raw_data: &'a [u8],
+    ctx: &'a BinaryContext<'a>,
     version: &'a str,
     platform: String,
     color: bool,
@@ -2611,10 +2922,7 @@ struct Wizard<'a> {
     editing_compact: bool,
     compact_buf: Vec<char>,
     compact_pos: usize,
-    code_theme: String,
-    editing_theme: bool,
-    theme_buf: Vec<char>,
-    theme_pos: usize,
+    texts: Vec<TextParam>,
 }
 
 fn patch_index(id: &str) -> Option<usize> {
@@ -2670,8 +2978,27 @@ fn append_inline_param(
 }
 
 impl<'a> Wizard<'a> {
-    fn new(src_bin: &'a Path, target_bin: &'a Path, bin_dir: &'a Path, version: &'a str, ctx: &'a BinaryContext) -> Self {
-        let avail: Vec<Result<(), String>> = PATCH_REGISTRY.iter().map(|p| (p.resolver)(ctx).map(|_| ())).collect();
+    fn new(src_bin: &'a Path, target_bin: &'a Path, bin_dir: &'a Path, version: &'a str, ctx: &'a BinaryContext<'a>) -> Self {
+        // 티어 고정 패치에 고를 모델 ID. 쓸 수 없는 바이너리(ARM64 등)에서는 수백 MB 를 훑지 않는다
+        let model_presets = if ctx.arch == Arch::X86_64 { available_model_ids(ctx) } else { Vec::new() };
+        let avail: Vec<Result<(), String>> = PATCH_REGISTRY
+            .iter()
+            .map(|p| {
+                let r = (p.resolver)(ctx).map(|_| ());
+                match tier_index(p.id) {
+                    // 기본 모델이 이 바이너리에 없어도 고를 모델이 있으면 줄은 쓸 수 있다 (켤 때 값을 검사한다)
+                    Some(ti)
+                        if r.is_err()
+                            && ctx.arch == Arch::X86_64
+                            && !model_presets.is_empty()
+                            && find_tier_site_x86(ctx, TIERS[ti].tier).is_ok() =>
+                    {
+                        Ok(())
+                    }
+                    _ => r,
+                }
+            })
+            .collect();
         let selected = PATCH_REGISTRY
             .iter()
             .zip(&avail)
@@ -2690,7 +3017,7 @@ impl<'a> Wizard<'a> {
             src_bin,
             target_bin,
             bin_dir,
-            raw_data: ctx.data,
+            ctx,
             version,
             platform: format!("{format} · {arch}"),
             color,
@@ -2709,11 +3036,55 @@ impl<'a> Wizard<'a> {
             editing_compact: false,
             compact_buf: Vec::new(),
             compact_pos: 0,
-            code_theme: detect_patched_code_theme(ctx).unwrap_or_else(|| ctx.code_theme.clone()),
-            editing_theme: false,
-            theme_buf: Vec::new(),
-            theme_pos: 0,
+            texts: std::iter::once(TextParam {
+                    id: "code-theme",
+                    label: "코드 블록 테마",
+                    subject: "코드 블록 테마가",
+                    hint: "테마",
+                    presets: CODE_THEME_PRESETS.to_vec(),
+                    max_len: 32,
+                    validate: validate_code_theme,
+                    value: detect_patched_code_theme(ctx).unwrap_or_else(|| ctx.code_theme.clone()),
+                    editing: false,
+                    buf: Vec::new(),
+                    pos: 0,
+                })
+            .chain(TIERS.iter().enumerate().map(|(ti, t)| TextParam {
+                id: t.id,
+                label: t.label,
+                subject: t.subject,
+                hint: "모델",
+                presets: model_presets.clone(),
+                max_len: 64,
+                validate: validate_model_id,
+                value: detect_patched_tier(ctx, ti).unwrap_or_else(|| ctx.tier_models[ti].clone()),
+                editing: false,
+                buf: Vec::new(),
+                pos: 0,
+            }))
+            .collect(),
         }
+    }
+
+    /// 티어 고정 줄은 고른 모델 ID 가 이 바이너리에 있어야 켤 수 있다 (기본 모델이 없는 옛 버전 대비)
+    fn tier_ready(&self, i: usize) -> Result<(), String> {
+        let Some(t) = self.text_param(PATCH_REGISTRY[i].id).filter(|t| tier_index(t.id).is_some()) else {
+            return Ok(());
+        };
+        if t.presets.contains(&t.value.as_str()) {
+            return Ok(());
+        }
+        (t.validate)(self.ctx, &t.value)
+            .map(|_| ())
+            .map_err(|e| format!("{e}. -/+ 로 고르거나 e 로 입력하세요."))
+    }
+
+    fn text_param(&self, id: &str) -> Option<&TextParam> {
+        self.texts.iter().find(|t| t.id == id)
+    }
+
+    fn text_value(&self, id: &str) -> Option<String> {
+        self.text_param(id).map(|t| t.value.clone())
     }
 
     fn chosen(&self) -> Vec<&'static PatchSpec> {
@@ -2747,6 +3118,12 @@ impl<'a> Wizard<'a> {
             self.flash = Some((S_WARN, format!("'{}' 패치는 이 바이너리에 적용할 수 없어 선택할 수 없습니다.", PATCH_REGISTRY[i].id)));
             return;
         }
+        if !self.selected[i] {
+            if let Err(e) = self.tier_ready(i) {
+                self.flash = Some((S_WARN, e));
+                return;
+            }
+        }
         self.selected[i] = !self.selected[i];
 
         // batch 는 nodrip 과 함께 동작해야 하므로 두 패치를 연동한다.
@@ -2763,7 +3140,9 @@ impl<'a> Wizard<'a> {
     }
 
     fn toggle_all(&mut self) {
-        let avail_idx: Vec<usize> = (0..PATCH_REGISTRY.len()).filter(|&i| self.avail[i].is_ok()).collect();
+        let avail_idx: Vec<usize> = (0..PATCH_REGISTRY.len())
+            .filter(|&i| self.avail[i].is_ok() && (self.selected[i] || self.tier_ready(i).is_ok()))
+            .collect();
         let all_on = avail_idx.iter().all(|&i| self.selected[i]);
         for i in avail_idx {
             self.selected[i] = !all_on;
@@ -2796,27 +3175,38 @@ impl<'a> Wizard<'a> {
         ));
     }
 
-    fn adjust_code_theme(&mut self, delta: isize) {
-        let Some(ti) = patch_index("code-theme") else {
+    fn adjust_text(&mut self, ti: usize, delta: isize) {
+        let t = &mut self.texts[ti];
+        let Some(pi) = patch_index(t.id) else {
             return;
         };
-        if self.avail[ti].is_err() {
-            self.flash = Some((S_WARN, "'code-theme' 패치는 이 바이너리에 적용할 수 없습니다.".into()));
+        if self.avail[pi].is_err() {
+            self.flash = Some((S_WARN, format!("'{}' 패치는 이 바이너리에 적용할 수 없습니다.", t.id)));
             return;
         }
-        let len = CODE_THEME_PRESETS.len() as isize;
-        let cur_idx = CODE_THEME_PRESETS
-            .iter()
-            .position(|&p| p == self.code_theme)
-            .map(|i| i as isize);
+        if t.presets.is_empty() {
+            return;
+        }
+        let len = t.presets.len() as isize;
+        let cur_idx = t.presets.iter().position(|&p| p == t.value).map(|i| i as isize);
         let next_idx = match cur_idx {
             Some(i) => (i + delta).rem_euclid(len) as usize,
-            None => if delta < 0 { CODE_THEME_PRESETS.len() - 1 } else { 0 },
+            None => if delta < 0 { t.presets.len() - 1 } else { 0 },
         };
-        let next = CODE_THEME_PRESETS[next_idx];
-        self.code_theme = next.to_string();
-        self.selected[ti] = true;
-        self.flash = Some((S_ACCENT, format!("코드 블록 테마: {next}")));
+        t.value = t.presets[next_idx].to_string();
+        self.selected[pi] = true;
+        self.flash = Some((S_ACCENT, format!("{}: {}", t.label, t.value)));
+    }
+
+    fn start_text_edit(&mut self, ti: usize) {
+        if self.avail[self.cursor].is_err() {
+            self.flash = Some((S_WARN, format!("'{}' 패치는 이 바이너리에 적용할 수 없습니다.", self.texts[ti].id)));
+            return;
+        }
+        let t = &mut self.texts[ti];
+        t.buf = t.value.chars().collect();
+        t.pos = t.buf.len();
+        t.editing = true;
     }
 
     fn handle_key(&mut self, key: Key) -> Action {
@@ -2857,28 +3247,23 @@ impl<'a> Wizard<'a> {
                     }
                     return Action::Continue;
                 }
-                if self.editing_theme {
-                    match edit_inline_buffer(&mut self.theme_buf, &mut self.theme_pos, 32, &key) {
-                        Some(false) => self.editing_theme = false,
+                if let Some(ti) = self.texts.iter().position(|t| t.editing) {
+                    let ctx = self.ctx;
+                    let t = &mut self.texts[ti];
+                    match edit_inline_buffer(&mut t.buf, &mut t.pos, t.max_len, &key) {
+                        Some(false) => t.editing = false,
                         Some(true) => {
-                            let raw: String = self.theme_buf.iter().collect();
-                            let parsed = parse_code_theme(&raw).and_then(|theme| {
-                                find_chroma_theme_offset(self.raw_data, &theme)?;
-                                Ok(theme)
-                            });
-                            match parsed {
-                                Ok(theme) => {
-                                    self.code_theme = theme.clone();
-                                    self.editing_theme = false;
-                                    if let Some(ti) = patch_index("code-theme") {
-                                        if self.avail[ti].is_ok() {
-                                            self.selected[ti] = true;
+                            let raw: String = t.buf.iter().collect();
+                            match (t.validate)(ctx, &raw) {
+                                Ok(value) => {
+                                    t.editing = false;
+                                    self.flash = Some((S_OK, format!("{} '{value}'(으)로 설정되었습니다.", t.subject)));
+                                    t.value = value;
+                                    if let Some(pi) = patch_index(t.id) {
+                                        if self.avail[pi].is_ok() {
+                                            self.selected[pi] = true;
                                         }
                                     }
-                                    self.flash = Some((
-                                        S_OK,
-                                        format!("코드 블록 테마가 '{theme}'(으)로 설정되었습니다."),
-                                    ));
                                 }
                                 Err(err) => self.flash = Some((S_ERR, err)),
                             }
@@ -2889,7 +3274,9 @@ impl<'a> Wizard<'a> {
                 }
 
                 let on_compact = PATCH_REGISTRY.get(self.cursor).is_some_and(|p| p.id == "compact");
-                let on_theme = PATCH_REGISTRY.get(self.cursor).is_some_and(|p| p.id == "code-theme");
+                let on_text = PATCH_REGISTRY
+                    .get(self.cursor)
+                    .and_then(|p| self.texts.iter().position(|t| t.id == p.id));
                 match key {
                     Key::Esc | Key::Char('q') | Key::Char('Q') => return Action::Cancel,
                     Key::Up | Key::Char('k') => self.cursor = (self.cursor + n - 1) % n,
@@ -2915,22 +3302,11 @@ impl<'a> Wizard<'a> {
                             self.editing_compact = true;
                         }
                     }
-                    Key::Char('-') | Key::Char('[') if on_theme => self.adjust_code_theme(-1),
-                    Key::Char('+') | Key::Char('=') | Key::Char(']') if on_theme => {
-                        self.adjust_code_theme(1)
+                    Key::Char('-') | Key::Char('[') if on_text.is_some() => self.adjust_text(on_text.unwrap_or(0), -1),
+                    Key::Char('+') | Key::Char('=') | Key::Char(']') if on_text.is_some() => {
+                        self.adjust_text(on_text.unwrap_or(0), 1)
                     }
-                    Key::Char('e') | Key::Char('E') if on_theme => {
-                        if self.avail[self.cursor].is_err() {
-                            self.flash = Some((
-                                S_WARN,
-                                "'code-theme' 패치는 이 바이너리에 적용할 수 없습니다.".into(),
-                            ));
-                        } else {
-                            self.theme_buf = self.code_theme.chars().collect();
-                            self.theme_pos = self.theme_buf.len();
-                            self.editing_theme = true;
-                        }
-                    }
+                    Key::Char('e') | Key::Char('E') if on_text.is_some() => self.start_text_edit(on_text.unwrap_or(0)),
                     Key::Char(c) if c.is_ascii_digit() => {
                         let idx = (c as u8 - b'0') as usize;
                         if (1..=n).contains(&idx) {
@@ -3125,15 +3501,8 @@ impl<'a> Wizard<'a> {
                     &format_compact_tokens(self.compact_tokens),
                     self.selected[i],
                 );
-            } else if p.id == "code-theme" && ok {
-                line = append_inline_param(
-                    line,
-                    self.editing_theme,
-                    &self.theme_buf,
-                    self.theme_pos,
-                    &self.code_theme,
-                    self.selected[i],
-                );
+            } else if let Some(t) = self.text_param(p.id).filter(|_| ok) {
+                line = append_inline_param(line, t.editing, &t.buf, t.pos, &t.value, self.selected[i]);
             }
             if !ok {
                 line = line.s(S_DIM, "  (사용 불가)");
@@ -3147,8 +3516,8 @@ impl<'a> Wizard<'a> {
         }
         lines.extend(bottom);
         let on_compact = PATCH_REGISTRY.get(self.cursor).is_some_and(|p| p.id == "compact");
-        let on_theme = PATCH_REGISTRY.get(self.cursor).is_some_and(|p| p.id == "code-theme");
-        let footer = if self.editing_compact || self.editing_theme {
+        let on_text = PATCH_REGISTRY.get(self.cursor).and_then(|p| self.text_param(p.id));
+        let footer = if self.editing_compact || self.texts.iter().any(|t| t.editing) {
             vec![key_hints(&[
                 ("←→", "커서"),
                 ("enter", "확정"),
@@ -3163,11 +3532,11 @@ impl<'a> Wizard<'a> {
                 ("enter", "다음"),
                 ("q", "종료"),
             ])]
-        } else if on_theme {
+        } else if let Some(t) = on_text {
             vec![key_hints(&[
                 ("↑↓", "이동"),
                 ("space", "선택"),
-                ("-/+", "테마"),
+                ("-/+", t.hint),
                 ("e", "직접입력"),
                 ("enter", "다음"),
                 ("q", "종료"),
@@ -3282,8 +3651,8 @@ impl<'a> Wizard<'a> {
                     S_ACCENT,
                     format!("  [{}]", format_compact_tokens(self.compact_tokens)),
                 );
-            } else if p.id == "code-theme" {
-                l = l.s(S_ACCENT, format!("  [{}]", self.code_theme));
+            } else if let Some(t) = self.text_param(p.id) {
+                l = l.s(S_ACCENT, format!("  [{}]", t.value));
             }
             lines.push(l);
         }
@@ -3379,10 +3748,16 @@ fn interactive_wizard(
                     if chosen.iter().any(|p| p.id == "batch") && !chosen.iter().any(|p| p.id == "nodrip") {
                         chosen.insert(0, &PATCH_REGISTRY[0]);
                     }
-                    return Ok(Some(if wiz.out_choice == 1 {
-                        (chosen, String::new(), true, wiz.compact_tokens, wiz.code_theme)
-                    } else {
-                        (chosen, wiz.name_str(), false, wiz.compact_tokens, wiz.code_theme)
+                    let in_place = wiz.out_choice == 1;
+                    return Ok(Some(WizardResult {
+                        patches: chosen,
+                        out_name: if in_place { String::new() } else { wiz.name_str() },
+                        in_place,
+                        args: PatchArgs {
+                            compact: Some(wiz.compact_tokens),
+                            code_theme: wiz.text_value("code-theme"),
+                            tiers: TIERS.map(|t| wiz.text_value(t.id)),
+                        },
                     }));
                 }
             }
@@ -3390,27 +3765,76 @@ fn interactive_wizard(
     }
 }
 
-fn apply_inline_patch_arg(
-    id: &str,
-    val: Option<&str>,
-    compact_override: &mut Option<u32>,
-    code_theme_override: &mut Option<String>,
-) -> Result<(), String> {
+/// 값을 받는 패치(compact / code-theme / *-tier)에 줄 값. 비어 있으면 기본값을 쓴다.
+#[derive(Default, Clone, Debug, PartialEq)]
+struct PatchArgs {
+    compact: Option<u32>,
+    code_theme: Option<String>,
+    /// TIERS 순서 (pro, flash, flash_lite)
+    tiers: [Option<String>; 3],
+}
+
+impl PatchArgs {
+    fn is_empty(&self) -> bool {
+        self.compact.is_none() && self.code_theme.is_none() && self.tiers.iter().all(Option::is_none)
+    }
+
+    /// 값을 준 패치를 선택 목록에 넣는다 (`--compact 180k` 만 줘도 compact 가 적용되도록)
+    fn ensure_selected(&self, patches: &mut Vec<&'static PatchSpec>) {
+        let tiers = TIERS.iter().zip(&self.tiers).map(|(t, v)| (t.id, v.is_some()));
+        for (id, given) in [("compact", self.compact.is_some()), ("code-theme", self.code_theme.is_some())]
+            .into_iter()
+            .chain(tiers)
+        {
+            if given {
+                ensure_patch_selected(patches, id);
+            }
+        }
+    }
+
+    /// `other` 에 있는 값이 우선한다
+    fn overlay(&mut self, other: &PatchArgs) {
+        if other.compact.is_some() {
+            self.compact = other.compact;
+        }
+        if other.code_theme.is_some() {
+            self.code_theme.clone_from(&other.code_theme);
+        }
+        for (mine, theirs) in self.tiers.iter_mut().zip(&other.tiers) {
+            if theirs.is_some() {
+                mine.clone_from(theirs);
+            }
+        }
+    }
+
+    fn apply_to(&self, ctx: &mut BinaryContext) {
+        if let Some(tokens) = self.compact {
+            ctx.compact_tokens = tokens;
+        }
+        if let Some(theme) = &self.code_theme {
+            ctx.code_theme.clone_from(theme);
+        }
+        for (slot, model) in ctx.tier_models.iter_mut().zip(&self.tiers) {
+            if let Some(model) = model {
+                slot.clone_from(model);
+            }
+        }
+    }
+}
+
+fn apply_inline_patch_arg(id: &str, val: Option<&str>, args: &mut PatchArgs) -> Result<(), String> {
     if let Some(raw_val) = val {
         match id {
-            "compact" => *compact_override = Some(parse_compact_tokens(raw_val)?),
-            "code-theme" => *code_theme_override = Some(parse_code_theme(raw_val)?),
+            "compact" => args.compact = Some(parse_compact_tokens(raw_val)?),
+            "code-theme" => args.code_theme = Some(parse_code_theme(raw_val)?),
+            _ if tier_index(id).is_some() => args.tiers[tier_index(id).unwrap_or(0)] = Some(parse_model_id(raw_val)?),
             _ => return Err(format!("'{id}' 패치는 '=값' 인자를 지원하지 않습니다.")),
         }
     }
     Ok(())
 }
 
-fn parse_patch_list(
-    spec_str: &str,
-    compact_override: &mut Option<u32>,
-    code_theme_override: &mut Option<String>,
-) -> Result<Vec<&'static PatchSpec>, String> {
+fn parse_patch_list(spec_str: &str, args: &mut PatchArgs) -> Result<Vec<&'static PatchSpec>, String> {
     let items: Vec<&str> = spec_str.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
     let mut out: Vec<&'static PatchSpec> = Vec::new();
     if items.is_empty() || items.contains(&"all") {
@@ -3420,7 +3844,7 @@ fn parse_patch_list(
     // 'all' 과 함께 준 ID 도 하나하나 검사한다 ('all,nodirp' 같은 오타를 조용히 무시하지 않도록)
     for item in items {
         let (id, val) = item.split_once('=').map_or((item, None), |(k, rhs)| (k.trim(), Some(rhs.trim())));
-        apply_inline_patch_arg(id, val, compact_override, code_theme_override)?;
+        apply_inline_patch_arg(id, val, args)?;
         if id == "all" {
             continue;
         }
@@ -3498,6 +3922,14 @@ fn build_patched_binary(
                 ctx.code_theme,
                 offs.join(", ")
             );
+        } else if let Some(ti) = tier_index(spec.id) {
+            println!(
+                "    - [{}] {} [model = {}] ({})",
+                spec.id,
+                spec.title,
+                ctx.tier_models[ti],
+                offs.join(", ")
+            );
         } else {
             println!("    - [{}] {} ({})", spec.id, spec.title, offs.join(", "));
         }
@@ -3552,6 +3984,7 @@ fn print_help() {
   agy-cli-patch -p <목록> -o <파일명>     원하는 패치만 골라 지정한 이름으로 바이너리 생성
   agy-cli-patch -p all --compact 180k -o agy-batch  자동 컴팩션 임계값을 180k 토큰으로 변경
   agy-cli-patch -p all --code-theme solarized-light -o agy-batch  코드 블록 테마 변경
+  agy-cli-patch -p all,pro-tier,flash-tier,flash-lite-tier -o agy-batch  서브에이전트 티어 고정 (pro→carbon, flash→neon, flash_lite→hydrogen)
   agy-cli-patch --preset                  기본 프리셋 2종(agy-batch, agy-nodrip) 일괄 생성
   agy-cli-patch -p all --in-place         원본 백업(antigravity.orig) 후 기본 agy에 직접 적용
   agy-cli-patch --restore                 antigravity.orig 백업에서 원본 복구
@@ -3562,6 +3995,9 @@ fn print_help() {
   -p, --patches <ID>        쉼표로 구분된 패치 ID 또는 'all' (예: nodrip,batch,compact=180k)
   --compact <토큰>          자동 컴팩션 토큰 임계값 지정 (32k~1000k, 예: 180k, 180000; 지정 시 compact 자동 활성화)
   --code-theme <테마>       terminal 스킴 코드 블록 Chroma 테마 지정 (기본: vs, 예: vs, solarized-light, bw)
+  --pro-tier <모델 ID>      'pro' 티어(invoke_subagent 등)에 쓸 모델 (기본: gemini-4-carbon-high; 지정 시 pro-tier 자동 활성화)
+  --flash-tier <모델 ID>    'flash' 티어에 쓸 모델 (기본: gemini-4-neon-medium; 지정 시 flash-tier 자동 활성화)
+  --flash-lite-tier <모델 ID> 'flash_lite' 티어에 쓸 모델 (기본: gemini-4-hydrogen-low; 지정 시 flash-lite-tier 자동 활성화)
   -o, --output <이름>       생성할 실행 파일 이름 또는 경로
   --preset                  프롬프트 없이 agy-batch와 agy-nodrip 생성
   --in-place                원본 백업 후 기본 바이너리 덮어쓰기
@@ -3584,8 +4020,7 @@ fn run() -> Result<(), String> {
     let mut list_mode = false;
     let mut patches_arg: Option<String> = None;
     let mut output_arg: Option<String> = None;
-    let mut compact_arg: Option<u32> = None;
-    let mut code_theme_arg: Option<String> = None;
+    let mut cli_args = PatchArgs::default();
     let mut preset_mode = false;
     let mut in_place = false;
     let mut restore_mode = false;
@@ -3615,11 +4050,18 @@ fn run() -> Result<(), String> {
             }
             "--compact" | "--compact-tokens" => {
                 let raw = args.next().ok_or("--compact 옵션에 토큰 수치(예: 180k)가 필요합니다.")?;
-                compact_arg = Some(parse_compact_tokens(&raw)?);
+                cli_args.compact = Some(parse_compact_tokens(&raw)?);
             }
             "--code-theme" => {
                 let raw = args.next().ok_or("--code-theme 옵션에 테마 이름(예: vs, solarized-light, bw)이 필요합니다.")?;
-                code_theme_arg = Some(parse_code_theme(&raw)?);
+                cli_args.code_theme = Some(parse_code_theme(&raw)?);
+            }
+            flag if TIERS.iter().any(|t| t.flag == flag) => {
+                let ti = TIERS.iter().position(|t| t.flag == flag).unwrap_or(0);
+                let raw = args
+                    .next()
+                    .ok_or_else(|| format!("{flag} 옵션에 모델 ID(예: {})가 필요합니다.", TIERS[ti].default_model))?;
+                cli_args.tiers[ti] = Some(parse_model_id(&raw)?);
             }
             "-o" | "--output" => {
                 output_arg = Some(args.next().ok_or("-o/--output 옵션에 파일명이 필요합니다.")?);
@@ -3687,12 +4129,7 @@ fn run() -> Result<(), String> {
 
     let mmap = MmapFile::open(&src_bin)?;
     let mut ctx = BinaryContext::parse(mmap.as_slice())?;
-    if let Some(tokens) = compact_arg {
-        ctx.compact_tokens = tokens;
-    }
-    if let Some(ref theme) = code_theme_arg {
-        ctx.code_theme = theme.clone();
-    }
+    cli_args.apply_to(&mut ctx);
 
     let is_tty = unsafe { isatty(0) == 1 };
     if preset_mode
@@ -3700,21 +4137,14 @@ fn run() -> Result<(), String> {
             && patches_arg.is_none()
             && output_arg.is_none()
             && !in_place
-            && compact_arg.is_none()
-            && code_theme_arg.is_none())
+            && cli_args.is_empty())
     {
         let mut nodrip_patches: Vec<&'static PatchSpec> =
             PATCH_REGISTRY.iter().filter(|p| p.default_on && p.id != "batch").collect();
         let mut batch_patches: Vec<&'static PatchSpec> =
             PATCH_REGISTRY.iter().filter(|p| p.default_on).collect();
-        if compact_arg.is_some() {
-            ensure_patch_selected(&mut nodrip_patches, "compact");
-            ensure_patch_selected(&mut batch_patches, "compact");
-        }
-        if code_theme_arg.is_some() {
-            ensure_patch_selected(&mut nodrip_patches, "code-theme");
-            ensure_patch_selected(&mut batch_patches, "code-theme");
-        }
+        cli_args.ensure_selected(&mut nodrip_patches);
+        cli_args.ensure_selected(&mut batch_patches);
         let jobs = [("agy-nodrip", nodrip_patches), ("agy-batch", batch_patches)];
         // 둘 다 먼저 검사해서 하나만 만들어진 채로 멈추는 일이 없게 한다
         let plans = jobs
@@ -3728,54 +4158,30 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
 
-    let (chosen_patches, out_name, do_in_place, final_compact_tokens, final_code_theme) =
-        if patches_arg.is_none()
-            && output_arg.is_none()
-            && !in_place
-            && compact_arg.is_none()
-            && code_theme_arg.is_none()
-        {
+    let (chosen_patches, out_name, do_in_place, final_args) =
+        if patches_arg.is_none() && output_arg.is_none() && !in_place && cli_args.is_empty() {
             match interactive_wizard(&src_bin, &target_bin, &target_version, &ctx)? {
-                Some(result) => result,
+                Some(result) => (result.patches, result.out_name, result.in_place, result.args),
                 None => {
                     println!("취소되었습니다.");
                     return Ok(());
                 }
             }
         } else {
-            let mut inline_override = None;
-            let mut inline_theme_override = None;
-            let mut patches = parse_patch_list(
-                patches_arg.as_deref().unwrap_or("all"),
-                &mut inline_override,
-                &mut inline_theme_override,
-            )?;
-            let mut resolved_tokens = ctx.compact_tokens;
-            if let Some(v) = inline_override {
-                resolved_tokens = v;
-            }
-            if let Some(v) = compact_arg {
-                resolved_tokens = v;
-                ensure_patch_selected(&mut patches, "compact");
-            }
-            let mut resolved_theme = ctx.code_theme.clone();
-            if let Some(t) = inline_theme_override {
-                resolved_theme = t;
-            }
-            if let Some(t) = code_theme_arg {
-                resolved_theme = t;
-                ensure_patch_selected(&mut patches, "code-theme");
-            }
+            // -p 의 '=값' 보다 --compact / --code-theme / --*-tier 가 우선한다
+            let mut args = PatchArgs::default();
+            let mut patches = parse_patch_list(patches_arg.as_deref().unwrap_or("all"), &mut args)?;
+            cli_args.ensure_selected(&mut patches);
+            args.overlay(&cli_args);
             let default_out = if patches.iter().any(|p| p.id == "batch") {
                 "agy-batch"
             } else {
                 "agy-patched"
             };
             let name = output_arg.unwrap_or_else(|| default_out.to_string());
-            (patches, name, in_place, resolved_tokens, resolved_theme)
+            (patches, name, in_place, args)
         };
-    ctx.compact_tokens = final_compact_tokens;
-    ctx.code_theme = final_code_theme.clone();
+    final_args.apply_to(&mut ctx);
 
     if do_in_place {
         if !backup_bin.exists() {
@@ -3784,8 +4190,7 @@ fn run() -> Result<(), String> {
         }
         let backup_mmap = MmapFile::open(&backup_bin)?;
         let mut backup_ctx = BinaryContext::parse(backup_mmap.as_slice())?;
-        backup_ctx.compact_tokens = final_compact_tokens;
-        backup_ctx.code_theme = final_code_theme;
+        final_args.apply_to(&mut backup_ctx);
         build_patched_binary(&backup_bin, &backup_ctx, &chosen_patches, &target_bin, None)?;
         println!("[+] 기본 agy 바이너리에 패치 적용 완료: {}", target_bin.display());
         return Ok(());
@@ -3827,9 +4232,9 @@ mod tests {
     #[test]
     fn patch_list_parser_validates_ids_alongside_all() {
         let parse = |s: &str| {
-            let (mut tokens, mut theme) = (None, None);
-            parse_patch_list(s, &mut tokens, &mut theme)
-                .map(|v| (v.iter().map(|p| p.id).collect::<Vec<_>>(), tokens, theme))
+            let mut args = PatchArgs::default();
+            parse_patch_list(s, &mut args)
+                .map(|v| (v.iter().map(|p| p.id).collect::<Vec<_>>(), args.compact, args.code_theme))
         };
         let defaults: Vec<&str> = PATCH_REGISTRY.iter().filter(|p| p.default_on).map(|p| p.id).collect();
 
@@ -3853,6 +4258,228 @@ mod tests {
 
         assert_eq!(parse("cjk-bold, nodrip,cjk-bold").unwrap().0, ["cjk-bold", "nodrip"]);
         assert!(parse("all=1").is_err());
+
+        let mut args = PatchArgs::default();
+        let ids: Vec<_> = parse_patch_list("all,pro-tier=Gemini-4-Carbon-Medium", &mut args)
+            .unwrap()
+            .iter()
+            .map(|p| p.id)
+            .collect();
+        assert_eq!(ids, [defaults.as_slice(), &["pro-tier"]].concat());
+        assert_eq!(args.tiers[0].as_deref(), Some("gemini-4-carbon-medium"));
+        assert!(parse("pro-tier=bad name").is_err());
+    }
+
+    #[test]
+    fn patch_args_cli_values_win_and_select_their_patch() {
+        let mut args = PatchArgs { compact: Some(200_000), code_theme: Some("bw".into()), tiers: [None, Some("gemini-4-neon-high".into()), None] };
+        let cli = PatchArgs { compact: Some(180_000), code_theme: None, tiers: [Some("gemini-4-carbon-low".into()), None, None] };
+        args.overlay(&cli);
+        assert_eq!(
+            args,
+            PatchArgs {
+                compact: Some(180_000),
+                code_theme: Some("bw".into()),
+                tiers: [Some("gemini-4-carbon-low".into()), Some("gemini-4-neon-high".into()), None]
+            }
+        );
+        let mut patches = Vec::new();
+        cli.ensure_selected(&mut patches);
+        assert_eq!(patches.iter().map(|p| p.id).collect::<Vec<_>>(), ["compact", "pro-tier"]);
+    }
+
+    #[test]
+    fn available_model_ids_keep_known_order_and_binary_presence() {
+        assert_eq!(find_all(b"abcabcab", b"ab").collect::<Vec<_>>(), [0, 3, 6]);
+        assert_eq!(find_all(b"aaaa", b"aa").collect::<Vec<_>>(), [0, 1, 2]);
+        assert_eq!(find_all(b"abc", b"").count(), 0);
+
+        // Go 문자열처럼 구분자 없이 붙어 있는 모델 ID 들
+        let mut buf = vec![0u8; 512];
+        let blob = b"..gemini-4-neon-highclaude-sonnet-5-5-lowgemini-4-carbon-highgemini-4-carbon-lowzz";
+        buf[100..100 + blob.len()].copy_from_slice(blob);
+        let ctx = BinaryContext {
+            data: &buf,
+            format: Format::Elf64,
+            arch: Arch::X86_64,
+            segments: Vec::new(),
+            funcs: [("modelutils.modelIDForTier", (0usize, 64usize))].into_iter().collect(),
+            compact_tokens: DEFAULT_COMPACT_TOKENS,
+            code_theme: DEFAULT_CODE_THEME.to_string(),
+            tier_models: default_tier_models(),
+        };
+        assert_eq!(
+            available_model_ids(&ctx),
+            ["gemini-4-carbon-high", "gemini-4-carbon-low", "gemini-4-neon-high", "claude-sonnet-5-5-low"]
+        );
+        assert_eq!(find_model_id_offset(&ctx, "claude-sonnet-5-5-low"), Ok(100 + 20));
+        assert!(find_model_id_offset(&ctx, "gemini-4-neon-xhigh").is_err());
+    }
+
+    fn tier_ctx<'a>(buf: &'a [u8], fn_start: usize, fn_end: usize, models: [&str; 3]) -> BinaryContext<'a> {
+        BinaryContext {
+            data: buf,
+            format: Format::Elf64,
+            arch: Arch::X86_64,
+            segments: Vec::new(),
+            funcs: [("modelutils.modelIDForTier", (fn_start, fn_end))].into_iter().collect(),
+            compact_tokens: DEFAULT_COMPACT_TOKENS,
+            code_theme: DEFAULT_CODE_THEME.to_string(),
+            tier_models: models.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn resolve_all_three_tiers_x86_in_one_function() {
+        // agy 1.5.7~1.5.13 modelIDForTier: flash_lite(2)·flash(3) 는 ret 까지 37바이트, pro(4)는 24바이트 + 공용 블록
+        fn branch37(tier: u8, field: u8) -> Vec<u8> {
+            let mut v = vec![0x83, 0xfb, tier, 0x75, 0x2b, 0x48, 0x85, 0xc0, 0x74, 0x0a];
+            v.extend([0x48, 0x8b, 0x50, field, 0x48, 0x8b, 0x70, field + 8]);
+            v.extend([0xeb, 0x04, 0x31, 0xf6, 0x31, 0xd2, 0x48, 0x85, 0xf6, 0x74, 0x4a]);
+            v.extend([0x48, 0x8b, 0x02, 0x48, 0x8b, 0x5a, 0x08, 0x31, 0xc9, 0x31, 0xff, 0xc9, 0xc3]);
+            v.extend([0x0f, 0x1f, 0x40, 0x00]); // 정렬용 nop
+            v
+        }
+        let mut code = branch37(2, 0x08);
+        code.extend(branch37(3, 0x20));
+        code.extend([0x83, 0xfb, 0x04, 0x75, 0x2f, 0x48, 0x85, 0xc0, 0x74, 0x0a, 0x48, 0x8b, 0x50, 0x38, 0x48, 0x8b, 0x70, 0x40]);
+        code.extend([0xeb, 0x04, 0x31, 0xf6, 0x31, 0xd2, 0x48, 0x85, 0xf6, 0x75, 0x0a]);
+        code.extend([0x31, 0xc0, 0x31, 0xdb, 0x31, 0xc9, 0x89, 0xc7, 0xc9, 0xc3]); // 공용 빈 반환 블록
+        code.extend([0x48, 0x8b, 0x02, 0x48, 0x8b, 0x5a, 0x08, 0x31, 0xc9, 0x31, 0xff, 0xc9, 0xc3]);
+
+        let mut buf = vec![0u8; 1024];
+        let fn_start = 64;
+        buf[fn_start..fn_start + code.len()].copy_from_slice(&code);
+        let strings = b"gemini-4-carbon-highgemini-4-neon-mediumgemini-4-hydrogen-lowgemini-4-carbon-low";
+        buf[600..600 + strings.len()].copy_from_slice(strings);
+        let original = buf.clone();
+        let fn_end = fn_start + code.len() + 16;
+        let lea_target = |buf: &[u8], site: usize| {
+            let t = (site as i64 + 7 + read_i32(buf, site + 3) as i64) as usize;
+            String::from_utf8(buf[t..t + read_u32(buf, site + 8) as usize].to_vec()).unwrap()
+        };
+        let defaults = TIERS.map(|t| t.default_model);
+        let sites = [(fn_start + 2 * 46 + 5, 24), (fn_start + 46 + 5, 37), (fn_start + 5, 37)]; // TIERS 순서
+        for (ti, &(site, len)) in sites.iter().enumerate() {
+            assert_eq!(find_tier_site_x86(&tier_ctx(&buf, fn_start, fn_end, defaults), TIERS[ti].tier), Ok((site, len, false)));
+        }
+
+        // 세 패치를 같은 원본에서 계산해 한꺼번에 쓴다 (build_patched_binary 와 같음)
+        let resolvers: [Resolver; 3] = [resolve_pro_tier, resolve_flash_tier, resolve_flash_lite_tier];
+        let all = |buf: &mut Vec<u8>, models: [&str; 3]| {
+            let edits: Vec<ByteEdit> = resolvers.iter().flat_map(|r| r(&tier_ctx(buf, fn_start, fn_end, models)).unwrap()).collect();
+            apply(buf, edits);
+        };
+        all(&mut buf, defaults);
+        for (ti, &(site, len)) in sites.iter().enumerate() {
+            assert_eq!(lea_target(&buf, site), TIERS[ti].default_model);
+            assert!(buf[site + 18..site + len].iter().all(|&c| c == 0xcc));
+            assert_eq!(detect_patched_tier(&tier_ctx(&buf, fn_start, fn_end, defaults), ti).as_deref(), Some(TIERS[ti].default_model));
+            assert_eq!(find_tier_site_x86(&tier_ctx(&buf, fn_start, fn_end, defaults), TIERS[ti].tier), Ok((site, len, true)));
+        }
+        // 정렬용 nop 과 공용 빈 반환 블록 등 분기 밖 바이트는 그대로
+        let changed: Vec<usize> = (0..buf.len()).filter(|&i| buf[i] != original[i]).collect();
+        assert!(changed.iter().all(|&i| sites.iter().any(|&(s, l)| (s..s + l).contains(&i))));
+
+        // 같은 값으로 다시 적용하면 결과가 같고, 다른 값으로 바꿀 수 있다
+        let once = buf.clone();
+        all(&mut buf, defaults);
+        assert_eq!(buf, once);
+        all(&mut buf, ["gemini-4-carbon-low", "gemini-4-carbon-high", "gemini-4-neon-medium"]);
+        assert_eq!(lea_target(&buf, sites[0].0), "gemini-4-carbon-low");
+        assert_eq!(lea_target(&buf, sites[2].0), "gemini-4-neon-medium");
+
+        // 바이너리에 없는 모델은 거부
+        assert!(resolve_flash_tier(&tier_ctx(&original, fn_start, fn_end, ["gemini-4-carbon-high", "gemini-4-neon-xhigh", "gemini-4-hydrogen-low"])).is_err());
+    }
+
+    #[test]
+    fn model_id_parser_validates_ids() {
+        assert_eq!(parse_model_id(" Gemini-4-Carbon-High "), Ok("gemini-4-carbon-high".to_string()));
+        assert_eq!(parse_model_id("gemini-3.8-flash-high"), Ok("gemini-3.8-flash-high".to_string()));
+        assert!(parse_model_id("").is_err());
+        assert!(parse_model_id("gemini 4").is_err());
+        assert!(parse_model_id("model\"").is_err());
+        assert!(parse_model_id(&"a".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn resolve_pro_tier_x86_patches_and_repatches() {
+        // agy 1.5.7~1.5.13 modelIDForTier 의 PRO(=4) 분기와 뒤따르는 공용 블록
+        let mut buf = vec![0u8; 1024];
+        let strings = b"xxgemini-4-carbon-highgemini-4-neon-mediumgemini-4-carbon-lowyy";
+        buf[600..600 + strings.len()].copy_from_slice(strings);
+        let high = 602;
+        let low = 600 + strings.windows(19).position(|w| w == b"gemini-4-carbon-low").unwrap();
+        let (fn_start, fn_end) = (64usize, 320usize);
+        let site = fn_start + 32;
+        let seq: &[u8] = &[
+            0x83, 0xfb, 0x04, 0x75, 0x2f, // cmp $4,%ebx; jne
+            0x48, 0x85, 0xc0, 0x74, 0x0a, // test %rax,%rax; je
+            0x48, 0x8b, 0x50, 0x38, 0x48, 0x8b, 0x70, 0x40, // mov 0x38(%rax),%rdx; mov 0x40(%rax),%rsi
+            0xeb, 0x04, 0x31, 0xf6, 0x31, 0xd2, // jmp; xor %esi,%esi; xor %edx,%edx
+            0x48, 0x85, 0xf6, 0x75, 0x0a, // test %rsi,%rsi; jne ok
+            0x31, 0xc0, 0x31, 0xdb, 0x31, 0xc9, 0x89, 0xc7, 0xc9, 0xc3, // 공용 빈 반환 블록
+            0x48, 0x8b, 0x02, 0x48, 0x8b, 0x5a, 0x08, // ok: mov (%rdx),%rax; mov 8(%rdx),%rbx
+        ];
+        buf[site..site + seq.len()].copy_from_slice(seq);
+        let shared = buf[site + 29..site + 39].to_vec();
+        let ctx_with = |buf: &[u8], model: &str, arch: Arch| -> Result<Vec<ByteEdit>, String> {
+            let ctx = BinaryContext {
+                data: buf,
+                format: Format::Elf64,
+                arch,
+                segments: Vec::new(),
+                funcs: [("modelutils.modelIDForTier", (fn_start, fn_end))].into_iter().collect(),
+                compact_tokens: DEFAULT_COMPACT_TOKENS,
+                code_theme: DEFAULT_CODE_THEME.to_string(),
+                tier_models: [model.to_string(), TIERS[1].default_model.to_string(), TIERS[2].default_model.to_string()],
+            };
+            resolve_pro_tier(&ctx)
+        };
+        let detect = |buf: &[u8]| {
+            detect_patched_tier(&BinaryContext {
+                data: buf,
+                format: Format::Elf64,
+                arch: Arch::X86_64,
+                segments: Vec::new(),
+                funcs: [("modelutils.modelIDForTier", (fn_start, fn_end))].into_iter().collect(),
+                compact_tokens: DEFAULT_COMPACT_TOKENS,
+                code_theme: DEFAULT_CODE_THEME.to_string(),
+                tier_models: default_tier_models(),
+            }, 0)
+        };
+
+        assert_eq!(detect(&buf), None);
+        assert!(ctx_with(&buf, "gemini-9-missing", Arch::X86_64).is_err());
+        assert!(ctx_with(&buf, TIERS[0].default_model, Arch::Arm64).is_err());
+
+        let mut prev: Option<&str> = None;
+        for (model, off) in [
+            (TIERS[0].default_model, high),
+            (TIERS[0].default_model, high),
+            ("gemini-4-carbon-low", low),
+            (TIERS[0].default_model, high),
+        ] {
+            let before = buf.clone();
+            let edits = ctx_with(&buf, model, Arch::X86_64).expect("pro-tier 매칭");
+            assert_eq!(edits.len(), 1);
+            assert_eq!(edits[0].offset, site + 5);
+            apply(&mut buf, edits);
+            let b = site + 5;
+            assert_eq!(&buf[b..b + 3], &[0x48, 0x8d, 0x05]);
+            assert_eq!((b as i64 + 7 + read_i32(&buf, b + 3) as i64) as usize, off);
+            assert_eq!(buf[b + 7], 0xbb);
+            assert_eq!(read_u32(&buf, b + 8) as usize, model.len());
+            assert_eq!(&buf[b + 12..b + 18], &[0x31, 0xc9, 0x31, 0xff, 0xc9, 0xc3]);
+            assert!(buf[b + 18..b + 24].iter().all(|&c| c == 0xcc));
+            assert_eq!(&buf[site + 29..site + 39], shared.as_slice(), "다른 티어가 쓰는 공용 블록은 그대로");
+            assert_eq!(detect(&buf).as_deref(), Some(model));
+            if prev == Some(model) {
+                assert_eq!(buf, before, "같은 모델로 다시 패치하면 결과가 같아야 함");
+            }
+            prev = Some(model);
+        }
     }
 
     #[test]
@@ -3907,6 +4534,7 @@ mod tests {
                 funcs,
                 compact_tokens: tokens,
                 code_theme: DEFAULT_CODE_THEME.to_string(),
+                tier_models: default_tier_models(),
             };
             let edits = resolve_compact(&ctx).expect("합성 바이너리에서 compact 매칭이 성공해야 함");
             assert_eq!(edits.len(), 4);
@@ -3997,6 +4625,7 @@ mod tests {
                 funcs,
                 compact_tokens: DEFAULT_COMPACT_TOKENS,
                 code_theme: theme.to_string(),
+                tier_models: default_tier_models(),
             }
         }
 
@@ -4077,6 +4706,7 @@ mod tests {
             funcs,
             compact_tokens: DEFAULT_COMPACT_TOKENS,
             code_theme: "vs".to_string(),
+            tier_models: default_tier_models(),
         };
         let edits = resolve_code_theme(&ctx).expect("정렬용 NOP이 있어도 code-theme 매칭이 성공해야 함");
         assert_eq!(edits.len(), 2);
@@ -4114,6 +4744,7 @@ mod tests {
             funcs,
             compact_tokens: DEFAULT_COMPACT_TOKENS,
             code_theme: "vs".to_string(),
+            tier_models: default_tier_models(),
         };
         let edits = resolve_batch(&ctx).expect("정렬용 NOP이 있어도 batch 매칭이 성공해야 함");
         assert_eq!(edits.len(), 1);
@@ -4149,6 +4780,7 @@ mod tests {
                     funcs,
                     compact_tokens: DEFAULT_COMPACT_TOKENS,
                     code_theme: DEFAULT_CODE_THEME.to_string(),
+                    tier_models: default_tier_models(),
                 };
                 resolve_banner(&ctx).unwrap_or_else(|e| panic!("{round}회차 banner 매칭 실패: {e}"))
             };
@@ -4181,6 +4813,7 @@ mod tests {
                 funcs: funcs.iter().map(|&(n, s, e)| (n, (s, e))).collect(),
                 compact_tokens: DEFAULT_COMPACT_TOKENS,
                 code_theme: DEFAULT_CODE_THEME.to_string(),
+                tier_models: default_tier_models(),
             };
             let mut all = Vec::new();
             for r in resolvers {
@@ -4259,6 +4892,7 @@ mod tests {
             funcs: funcs.iter().map(|&(n, s, e)| (n, (s, e))).collect(),
             compact_tokens: tokens,
             code_theme: theme.to_string(),
+            tier_models: default_tier_models(),
         }
     }
 
