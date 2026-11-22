@@ -212,7 +212,8 @@ struct BinaryContext<'a> {
     funcs: HashMap<&'a str, (usize, usize)>,
     compact_tokens: u32,
     code_theme: String,
-    pro_tier_model: String,
+    /// TIERS 순서 (pro, flash, flash_lite)
+    tier_models: [String; 3],
 }
 
 impl<'a> BinaryContext<'a> {
@@ -429,7 +430,7 @@ impl<'a> BinaryContext<'a> {
             funcs,
             compact_tokens: DEFAULT_COMPACT_TOKENS,
             code_theme: DEFAULT_CODE_THEME.to_string(),
-            pro_tier_model: DEFAULT_PRO_TIER_MODEL.to_string(),
+            tier_models: default_tier_models(),
         })
     }
 
@@ -1410,14 +1411,61 @@ fn resolve_compact(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
     Ok(edits)
 }
 
-// --- pro-tier: 서브에이전트 'pro' 티어 모델 고정 ---
+// --- pro-tier / flash-tier / flash-lite-tier: 서브에이전트 모델 티어 고정 ---
 //
 // invoke_subagent·사용자 정의 에이전트(model: pro)·훅 등은 모델을 티어(inherit/flash_lite/flash/pro)로만 받고,
 // modelutils.modelIDForTier 가 서버가 계정별로 내려주는 TieredModelConfig 의 티어별 모델 목록 첫 항목을 고른다.
-// 로컬에서 이 목록을 덮는 설정(admin_settings.json models.tiers, AGY_LLM_GATEWAY_TIER_PRO)은 LLM 게이트웨이
-// 모드에서만 읽히므로(gateway.applyConfiguredModelTiers 가 유일한 사용처, 정적 분석 기준), PRO(=4) 분기가 지정한 모델 ID 를 바로 돌려주게 바꾼다.
+// 로컬에서 이 목록을 덮는 설정(admin_settings.json models.tiers, AGY_LLM_GATEWAY_TIER_*)은 LLM 게이트웨이
+// 모드에서만 읽히므로(gateway.applyConfiguredModelTiers 가 유일한 사용처, 정적 분석 기준), 티어 분기가 지정한
+// 모델 ID 를 바로 돌려주게 바꾼다. agy 유틸리티 모델은 flash_lite, 없으면 flash 티어를 쓰므로 그 두 티어를
+// 고정하면 유틸리티 작업도 같은 모델을 쓴다.
 
-const DEFAULT_PRO_TIER_MODEL: &str = "gemini-4-carbon-high";
+/// 고정할 수 있는 티어. `tier` 는 exa.cortex_pb.ModelTier 값.
+struct TierSpec {
+    id: &'static str,
+    flag: &'static str,
+    /// 대화형 화면 알림 문구 ("pro 티어 모델: …", "pro 티어 모델이 '…'(으)로 …")
+    label: &'static str,
+    subject: &'static str,
+    tier: u8,
+    default_model: &'static str,
+}
+
+/// BinaryContext::tier_models·PatchArgs::tiers 와 같은 순서
+const TIERS: [TierSpec; 3] = [
+    TierSpec {
+        id: "pro-tier",
+        flag: "--pro-tier",
+        label: "pro 티어 모델",
+        subject: "pro 티어 모델이",
+        tier: 4,
+        default_model: "gemini-4-carbon-high",
+    },
+    TierSpec {
+        id: "flash-tier",
+        flag: "--flash-tier",
+        label: "flash 티어 모델",
+        subject: "flash 티어 모델이",
+        tier: 3,
+        default_model: "gemini-4-neon-medium",
+    },
+    TierSpec {
+        id: "flash-lite-tier",
+        flag: "--flash-lite-tier",
+        label: "flash_lite 티어 모델",
+        subject: "flash_lite 티어 모델이",
+        tier: 2,
+        default_model: "gemini-4-hydrogen-low",
+    },
+];
+
+fn tier_index(id: &str) -> Option<usize> {
+    TIERS.iter().position(|t| t.id == id)
+}
+
+fn default_tier_models() -> [String; 3] {
+    TIERS.map(|t| t.default_model.to_string())
+}
 /// 대화형 화면에서 -/+ 로 고르는 후보 (`agy models` 기준, 오케스트레이터 전용 모델 제외).
 /// invoke_subagent 에는 effort 인자가 없어 사고 수준은 ID 끝(-low/-medium/-high/-xhigh)으로 정해진다.
 /// 시작할 때 이 바이너리에 문자열로 들어 있는 것만 남긴다. 여기 없는 새 모델은 e 로 직접 입력한다.
@@ -1446,8 +1494,7 @@ const KNOWN_MODEL_IDS: &[&str] = &[
     "gemini-3.8-flash-medium",
     "gemini-3.8-flash-low",
 ];
-const MODEL_ID_EXAMPLES: &str = "gemini-4-carbon-high, gemini-4-carbon-medium, gemini-4-carbon-low";
-const PRO_TIER_PAD: usize = 24; // 원본 PRO 분기 본문 길이 (뒤따르는 공용 빈 반환 블록은 다른 티어도 쓰므로 그대로 둔다)
+const MODEL_ID_EXAMPLES: &str = "gemini-4-carbon-high, gemini-4-neon-medium, gemini-4-hydrogen-low";
 
 fn parse_model_id(raw: &str) -> Result<String, String> {
     let id = raw.trim().to_ascii_lowercase();
@@ -1518,47 +1565,58 @@ fn available_model_ids(ctx: &BinaryContext) -> Vec<&'static str> {
     KNOWN_MODEL_IDS.iter().zip(found).filter_map(|(id, ok)| ok.then_some(*id)).collect()
 }
 
-/// modelIDForTier 의 PRO 분기 본문 위치와 이미 패치됐는지 여부.
-///   원본:   cmp $4,%ebx; jne ..; test %rax,%rax; je ..; mov X(%rax),%rdx; mov X+8(%rax),%rsi; jmp ..;
-///           xor %esi,%esi; xor %edx,%edx; test %rsi,%rsi; jne ok   (24바이트)
-///   패치 후: cmp $4,%ebx; jne ..; lea model(%rip),%rax; mov $len,%ebx; xor %ecx,%ecx; xor %edi,%edi; leave; ret; int3...
-fn find_pro_tier_site_x86(ctx: &BinaryContext) -> Result<(usize, bool), String> {
+/// modelIDForTier 의 티어 분기 본문 (`cmp $tier,%ebx; jne ..` 바로 뒤). 분기 모양은 두 가지다.
+///   PRO(맨 끝 티어, 24바이트): test %rax,%rax; je ..; mov X(%rax),%rdx; mov X+8(%rax),%rsi; jmp ..;
+///                            xor %esi,%esi; xor %edx,%edx; test %rsi,%rsi; jne ok   — 뒤따르는 공용 빈 반환 블록은 다른 티어도 쓴다
+///   그 밖(37바이트):          위와 같되 je empty; mov (%rdx),%rax; mov 8(%rdx),%rbx; xor %ecx,%ecx; xor %edi,%edi; leave; ret
+///   패치 후(같은 길이):       lea model(%rip),%rax; mov $len,%ebx; xor %ecx,%ecx; xor %edi,%edi; leave; ret; int3...
+/// 반환값: (본문 시작, 본문 길이, 이미 패치됐는지)
+fn find_tier_site_x86(ctx: &BinaryContext, tier: u8) -> Result<(usize, usize, bool), String> {
+    const HEAD: [u8; 5] = [0x48, 0x85, 0xc0, 0x74, 0x0a];
+    const MID: [u8; 9] = [0xeb, 0x04, 0x31, 0xf6, 0x31, 0xd2, 0x48, 0x85, 0xf6]; // jmp; xor; xor; test %rsi,%rsi
+    const LOAD: [u8; 7] = [0x48, 0x8b, 0x02, 0x48, 0x8b, 0x5a, 0x08]; // mov (%rdx),%rax; mov 8(%rdx),%rbx
+    const RET: [u8; 6] = [0x31, 0xc9, 0x31, 0xff, 0xc9, 0xc3]; // error = nil; leave; ret
     let (start, end) = ctx.get_func("modelutils.modelIDForTier")?;
     let body = &ctx.data[start..end];
     let mut matches = Vec::new();
-    for i in 0..body.len().saturating_sub(5 + PRO_TIER_PAD + 10) {
-        if body[i..i + 4] != [0x83, 0xfb, 0x04, 0x75] {
+    for i in 0..body.len().saturating_sub(5 + 24) {
+        if body[i..i + 4] != [0x83, 0xfb, tier, 0x75] {
             continue;
         }
         let b = i + 5;
-        let w = &body[b..b + PRO_TIER_PAD];
-        let original = w[0..5] == [0x48, 0x85, 0xc0, 0x74, 0x0a]
+        let w = &body[b..];
+        let loads = w[0..5] == HEAD
             && w[5..8] == [0x48, 0x8b, 0x50]
             && w[9..12] == [0x48, 0x8b, 0x70]
             && w[8].wrapping_add(8) == w[12]
-            && w[13..24] == [0xeb, 0x04, 0x31, 0xf6, 0x31, 0xd2, 0x48, 0x85, 0xf6, 0x75, 0x0a]
-            // jne 의 목적지: 목록 첫 항목(문자열)을 반환값으로 읽는 mov (%rdx),%rax; mov 8(%rdx),%rbx
-            && body.get(b + 34..b + 41) == Some(&[0x48, 0x8b, 0x02, 0x48, 0x8b, 0x5a, 0x08][..]);
-        let patched = w[0..3] == [0x48, 0x8d, 0x05]
-            && w[7] == 0xbb
-            && w[12..18] == [0x31, 0xc9, 0x31, 0xff, 0xc9, 0xc3]
-            && w[18..].iter().all(|&c| c == 0xcc);
-        if original || patched {
-            matches.push((start + b, patched));
+            && w[13..22] == MID;
+        let found = if loads && w[22..24] == [0x75, 0x0a] && w.get(34..41) == Some(&LOAD[..]) {
+            Some((24, false))
+        } else if loads && w[22] == 0x74 && w.get(24..31) == Some(&LOAD[..]) && w.get(31..37) == Some(&RET[..]) {
+            Some((37, false))
+        } else if w[0..3] == [0x48, 0x8d, 0x05] && w[7] == 0xbb && w[12..18] == RET {
+            // 이미 패치됨: 원래 본문 길이는 뒤따르는 int3 개수로 되찾는다
+            let n = 18 + w[18..].iter().take_while(|&&c| c == 0xcc).count();
+            matches!(n, 24 | 37).then_some((n, true))
+        } else {
+            None
+        };
+        if let Some((n, patched)) = found {
+            matches.push((start + b, n, patched));
         }
     }
     if matches.len() != 1 {
-        return Err(format!("modelIDForTier PRO 티어 분기 패턴 매칭 실패 (매칭 수: {})", matches.len()));
+        return Err(format!("modelIDForTier 티어 {tier} 분기 패턴 매칭 실패 (매칭 수: {})", matches.len()));
     }
     Ok(matches[0])
 }
 
-/// 이미 pro-tier 패치가 돼 있으면 고정된 모델 ID
-fn detect_patched_pro_tier(ctx: &BinaryContext) -> Option<String> {
+/// 이미 티어 고정 패치가 돼 있으면 고정된 모델 ID
+fn detect_patched_tier(ctx: &BinaryContext, ti: usize) -> Option<String> {
     if ctx.arch != Arch::X86_64 {
         return None;
     }
-    let (site, true) = find_pro_tier_site_x86(ctx).ok()? else {
+    let (site, _, true) = find_tier_site_x86(ctx, TIERS[ti].tier).ok()? else {
         return None;
     };
     let pc = ctx.off_to_va(site + 7)? as i64;
@@ -1567,22 +1625,36 @@ fn detect_patched_pro_tier(ctx: &BinaryContext) -> Option<String> {
     std::str::from_utf8(ctx.data.get(str_off..str_off + len)?).ok().map(str::to_string)
 }
 
-fn resolve_pro_tier(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
+fn resolve_tier(ctx: &BinaryContext, ti: usize) -> Result<Vec<ByteEdit>, String> {
+    let spec = &TIERS[ti];
     if ctx.arch != Arch::X86_64 {
-        return Err("pro-tier 패치는 아직 x86_64 만 지원합니다.".into());
+        return Err(format!("{} 패치는 아직 x86_64 만 지원합니다.", spec.id));
     }
-    let (site, _) = find_pro_tier_site_x86(ctx)?;
-    let model_off = find_model_id_offset(ctx, &ctx.pro_tier_model)?;
+    let (site, len, _) = find_tier_site_x86(ctx, spec.tier)?;
+    let model = &ctx.tier_models[ti];
+    let model_off = find_model_id_offset(ctx, model)?;
     let model_va = ctx.off_to_va(model_off).ok_or("모델 ID 문자열 가상주소 변환 실패")?;
     let pc = ctx.off_to_va(site + 7).ok_or("LEA 명령어 가상주소 변환 실패")?;
     let disp = i32::try_from(model_va as i64 - pc as i64).map_err(|_| "RIP 상대 변위 범위 초과".to_string())?;
     let mut code = vec![0x48, 0x8d, 0x05]; // lea model(%rip),%rax
     code.extend_from_slice(&disp.to_le_bytes());
     code.push(0xbb); // mov $len,%ebx
-    code.extend_from_slice(&(ctx.pro_tier_model.len() as u32).to_le_bytes());
+    code.extend_from_slice(&(model.len() as u32).to_le_bytes());
     code.extend_from_slice(&[0x31, 0xc9, 0x31, 0xff, 0xc9, 0xc3]); // error = nil; leave; ret
-    code.resize(PRO_TIER_PAD, 0xcc);
+    code.resize(len, 0xcc);
     Ok(vec![ByteEdit { offset: site, payload: code }])
+}
+
+fn resolve_pro_tier(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
+    resolve_tier(ctx, 0)
+}
+
+fn resolve_flash_tier(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
+    resolve_tier(ctx, 1)
+}
+
+fn resolve_flash_lite_tier(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
+    resolve_tier(ctx, 2)
 }
 
 // banner / release-notes 패치가 공유하는 0xcc 패딩 공간(cave) 배치.
@@ -1961,7 +2033,7 @@ fn release_notes_text() -> String {
         ("tilde-strike", "only '~~' strikes through, single '~' stays"),
         ("code-theme", "readable code block theme for terminal colorScheme (--code-theme vs)"),
         ("compact", "custom auto-compaction token limit (--compact 180k)"),
-        ("pro-tier", "'pro' subagent tier pinned to a chosen model (--pro-tier gemini-4-carbon-high)"),
+        ("*-tier", "subagent tiers pinned: pro→carbon, flash→neon, flash_lite→hydrogen"),
         ("banner", "patch version shown next to the product name"),
     ];
     let mut out = format!(
@@ -2106,6 +2178,22 @@ const PATCH_REGISTRY: &[PatchSpec] = &[
         symbol: "modelutils.modelIDForTier",
         default_on: false,
         resolver: resolve_pro_tier,
+    },
+    PatchSpec {
+        id: "flash-tier",
+        title: "서브에이전트 flash 티어 모델 고정 (Flash Tier Model)",
+        description: "'flash' 티어를 고른 모델(기본 gemini-4-neon-medium)로 고정. flash_lite 가 없을 때 agy 유틸리티 작업도 이 티어를 씀 (기본 꺼짐, x86_64 전용)",
+        symbol: "modelutils.modelIDForTier",
+        default_on: false,
+        resolver: resolve_flash_tier,
+    },
+    PatchSpec {
+        id: "flash-lite-tier",
+        title: "서브에이전트 flash_lite 티어 모델 고정 (Flash-Lite Tier Model)",
+        description: "'flash_lite' 티어를 고른 모델(기본 gemini-4-hydrogen-low)로 고정. agy 유틸리티 작업도 이 티어를 먼저 씀 (기본 꺼짐, x86_64 전용)",
+        symbol: "modelutils.modelIDForTier",
+        default_on: false,
+        resolver: resolve_flash_lite_tier,
     },
     PatchSpec {
         id: "banner",
@@ -2779,7 +2867,7 @@ struct WizardResult {
     args: PatchArgs,
 }
 
-/// 대화형 화면에서 -/+ 로 추천값을 고르거나 e 로 직접 입력하는 문자열 값 (code-theme 테마, pro-tier 모델 ID)
+/// 대화형 화면에서 -/+ 로 추천값을 고르거나 e 로 직접 입력하는 문자열 값 (code-theme 테마, *-tier 모델 ID)
 struct TextParam {
     id: &'static str,
     /// 알림 문구에 쓰는 이름 ("코드 블록 테마: vs", "코드 블록 테마가 'vs'(으)로 …")
@@ -2803,7 +2891,7 @@ fn validate_code_theme(ctx: &BinaryContext, raw: &str) -> Result<String, String>
     Ok(theme)
 }
 
-fn validate_pro_tier_model(ctx: &BinaryContext, raw: &str) -> Result<String, String> {
+fn validate_model_id(ctx: &BinaryContext, raw: &str) -> Result<String, String> {
     let model = parse_model_id(raw)?;
     find_model_id_offset(ctx, &model)?;
     Ok(model)
@@ -2891,7 +2979,26 @@ fn append_inline_param(
 
 impl<'a> Wizard<'a> {
     fn new(src_bin: &'a Path, target_bin: &'a Path, bin_dir: &'a Path, version: &'a str, ctx: &'a BinaryContext<'a>) -> Self {
-        let avail: Vec<Result<(), String>> = PATCH_REGISTRY.iter().map(|p| (p.resolver)(ctx).map(|_| ())).collect();
+        // 티어 고정 패치에 고를 모델 ID. 쓸 수 없는 바이너리(ARM64 등)에서는 수백 MB 를 훑지 않는다
+        let model_presets = if ctx.arch == Arch::X86_64 { available_model_ids(ctx) } else { Vec::new() };
+        let avail: Vec<Result<(), String>> = PATCH_REGISTRY
+            .iter()
+            .map(|p| {
+                let r = (p.resolver)(ctx).map(|_| ());
+                match tier_index(p.id) {
+                    // 기본 모델이 이 바이너리에 없어도 고를 모델이 있으면 줄은 쓸 수 있다 (켤 때 값을 검사한다)
+                    Some(ti)
+                        if r.is_err()
+                            && ctx.arch == Arch::X86_64
+                            && !model_presets.is_empty()
+                            && find_tier_site_x86(ctx, TIERS[ti].tier).is_ok() =>
+                    {
+                        Ok(())
+                    }
+                    _ => r,
+                }
+            })
+            .collect();
         let selected = PATCH_REGISTRY
             .iter()
             .zip(&avail)
@@ -2929,8 +3036,7 @@ impl<'a> Wizard<'a> {
             editing_compact: false,
             compact_buf: Vec::new(),
             compact_pos: 0,
-            texts: vec![
-                TextParam {
+            texts: std::iter::once(TextParam {
                     id: "code-theme",
                     label: "코드 블록 테마",
                     subject: "코드 블록 테마가",
@@ -2942,23 +3048,35 @@ impl<'a> Wizard<'a> {
                     editing: false,
                     buf: Vec::new(),
                     pos: 0,
-                },
-                TextParam {
-                    id: "pro-tier",
-                    label: "pro 티어 모델",
-                    subject: "pro 티어 모델이",
-                    hint: "모델",
-                    // pro-tier 를 쓸 수 없는 바이너리(ARM64 등)에서는 수백 MB 를 훑지 않는다
-                    presets: if ctx.arch == Arch::X86_64 { available_model_ids(ctx) } else { Vec::new() },
-                    max_len: 64,
-                    validate: validate_pro_tier_model,
-                    value: detect_patched_pro_tier(ctx).unwrap_or_else(|| ctx.pro_tier_model.clone()),
-                    editing: false,
-                    buf: Vec::new(),
-                    pos: 0,
-                },
-            ],
+                })
+            .chain(TIERS.iter().enumerate().map(|(ti, t)| TextParam {
+                id: t.id,
+                label: t.label,
+                subject: t.subject,
+                hint: "모델",
+                presets: model_presets.clone(),
+                max_len: 64,
+                validate: validate_model_id,
+                value: detect_patched_tier(ctx, ti).unwrap_or_else(|| ctx.tier_models[ti].clone()),
+                editing: false,
+                buf: Vec::new(),
+                pos: 0,
+            }))
+            .collect(),
         }
+    }
+
+    /// 티어 고정 줄은 고른 모델 ID 가 이 바이너리에 있어야 켤 수 있다 (기본 모델이 없는 옛 버전 대비)
+    fn tier_ready(&self, i: usize) -> Result<(), String> {
+        let Some(t) = self.text_param(PATCH_REGISTRY[i].id).filter(|t| tier_index(t.id).is_some()) else {
+            return Ok(());
+        };
+        if t.presets.contains(&t.value.as_str()) {
+            return Ok(());
+        }
+        (t.validate)(self.ctx, &t.value)
+            .map(|_| ())
+            .map_err(|e| format!("{e}. -/+ 로 고르거나 e 로 입력하세요."))
     }
 
     fn text_param(&self, id: &str) -> Option<&TextParam> {
@@ -3000,6 +3118,12 @@ impl<'a> Wizard<'a> {
             self.flash = Some((S_WARN, format!("'{}' 패치는 이 바이너리에 적용할 수 없어 선택할 수 없습니다.", PATCH_REGISTRY[i].id)));
             return;
         }
+        if !self.selected[i] {
+            if let Err(e) = self.tier_ready(i) {
+                self.flash = Some((S_WARN, e));
+                return;
+            }
+        }
         self.selected[i] = !self.selected[i];
 
         // batch 는 nodrip 과 함께 동작해야 하므로 두 패치를 연동한다.
@@ -3016,7 +3140,9 @@ impl<'a> Wizard<'a> {
     }
 
     fn toggle_all(&mut self) {
-        let avail_idx: Vec<usize> = (0..PATCH_REGISTRY.len()).filter(|&i| self.avail[i].is_ok()).collect();
+        let avail_idx: Vec<usize> = (0..PATCH_REGISTRY.len())
+            .filter(|&i| self.avail[i].is_ok() && (self.selected[i] || self.tier_ready(i).is_ok()))
+            .collect();
         let all_on = avail_idx.iter().all(|&i| self.selected[i]);
         for i in avail_idx {
             self.selected[i] = !all_on;
@@ -3630,7 +3756,7 @@ fn interactive_wizard(
                         args: PatchArgs {
                             compact: Some(wiz.compact_tokens),
                             code_theme: wiz.text_value("code-theme"),
-                            pro_tier: wiz.text_value("pro-tier"),
+                            tiers: TIERS.map(|t| wiz.text_value(t.id)),
                         },
                     }));
                 }
@@ -3639,26 +3765,27 @@ fn interactive_wizard(
     }
 }
 
-/// 값을 받는 패치(compact / code-theme / pro-tier)에 줄 값. 비어 있으면 기본값을 쓴다.
+/// 값을 받는 패치(compact / code-theme / *-tier)에 줄 값. 비어 있으면 기본값을 쓴다.
 #[derive(Default, Clone, Debug, PartialEq)]
 struct PatchArgs {
     compact: Option<u32>,
     code_theme: Option<String>,
-    pro_tier: Option<String>,
+    /// TIERS 순서 (pro, flash, flash_lite)
+    tiers: [Option<String>; 3],
 }
 
 impl PatchArgs {
     fn is_empty(&self) -> bool {
-        self.compact.is_none() && self.code_theme.is_none() && self.pro_tier.is_none()
+        self.compact.is_none() && self.code_theme.is_none() && self.tiers.iter().all(Option::is_none)
     }
 
     /// 값을 준 패치를 선택 목록에 넣는다 (`--compact 180k` 만 줘도 compact 가 적용되도록)
     fn ensure_selected(&self, patches: &mut Vec<&'static PatchSpec>) {
-        for (id, given) in [
-            ("compact", self.compact.is_some()),
-            ("code-theme", self.code_theme.is_some()),
-            ("pro-tier", self.pro_tier.is_some()),
-        ] {
+        let tiers = TIERS.iter().zip(&self.tiers).map(|(t, v)| (t.id, v.is_some()));
+        for (id, given) in [("compact", self.compact.is_some()), ("code-theme", self.code_theme.is_some())]
+            .into_iter()
+            .chain(tiers)
+        {
             if given {
                 ensure_patch_selected(patches, id);
             }
@@ -3673,8 +3800,10 @@ impl PatchArgs {
         if other.code_theme.is_some() {
             self.code_theme.clone_from(&other.code_theme);
         }
-        if other.pro_tier.is_some() {
-            self.pro_tier.clone_from(&other.pro_tier);
+        for (mine, theirs) in self.tiers.iter_mut().zip(&other.tiers) {
+            if theirs.is_some() {
+                mine.clone_from(theirs);
+            }
         }
     }
 
@@ -3685,8 +3814,10 @@ impl PatchArgs {
         if let Some(theme) = &self.code_theme {
             ctx.code_theme.clone_from(theme);
         }
-        if let Some(model) = &self.pro_tier {
-            ctx.pro_tier_model.clone_from(model);
+        for (slot, model) in ctx.tier_models.iter_mut().zip(&self.tiers) {
+            if let Some(model) = model {
+                slot.clone_from(model);
+            }
         }
     }
 }
@@ -3696,7 +3827,7 @@ fn apply_inline_patch_arg(id: &str, val: Option<&str>, args: &mut PatchArgs) -> 
         match id {
             "compact" => args.compact = Some(parse_compact_tokens(raw_val)?),
             "code-theme" => args.code_theme = Some(parse_code_theme(raw_val)?),
-            "pro-tier" => args.pro_tier = Some(parse_model_id(raw_val)?),
+            _ if tier_index(id).is_some() => args.tiers[tier_index(id).unwrap_or(0)] = Some(parse_model_id(raw_val)?),
             _ => return Err(format!("'{id}' 패치는 '=값' 인자를 지원하지 않습니다.")),
         }
     }
@@ -3791,12 +3922,12 @@ fn build_patched_binary(
                 ctx.code_theme,
                 offs.join(", ")
             );
-        } else if spec.id == "pro-tier" {
+        } else if let Some(ti) = tier_index(spec.id) {
             println!(
                 "    - [{}] {} [model = {}] ({})",
                 spec.id,
                 spec.title,
-                ctx.pro_tier_model,
+                ctx.tier_models[ti],
                 offs.join(", ")
             );
         } else {
@@ -3853,7 +3984,7 @@ fn print_help() {
   agy-cli-patch -p <목록> -o <파일명>     원하는 패치만 골라 지정한 이름으로 바이너리 생성
   agy-cli-patch -p all --compact 180k -o agy-batch  자동 컴팩션 임계값을 180k 토큰으로 변경
   agy-cli-patch -p all --code-theme solarized-light -o agy-batch  코드 블록 테마 변경
-  agy-cli-patch -p all --pro-tier gemini-4-carbon-high -o agy-batch  서브에이전트 'pro' 티어를 카본으로 고정
+  agy-cli-patch -p all,pro-tier,flash-tier,flash-lite-tier -o agy-batch  서브에이전트 티어 고정 (pro→carbon, flash→neon, flash_lite→hydrogen)
   agy-cli-patch --preset                  기본 프리셋 2종(agy-batch, agy-nodrip) 일괄 생성
   agy-cli-patch -p all --in-place         원본 백업(antigravity.orig) 후 기본 agy에 직접 적용
   agy-cli-patch --restore                 antigravity.orig 백업에서 원본 복구
@@ -3864,7 +3995,9 @@ fn print_help() {
   -p, --patches <ID>        쉼표로 구분된 패치 ID 또는 'all' (예: nodrip,batch,compact=180k)
   --compact <토큰>          자동 컴팩션 토큰 임계값 지정 (32k~1000k, 예: 180k, 180000; 지정 시 compact 자동 활성화)
   --code-theme <테마>       terminal 스킴 코드 블록 Chroma 테마 지정 (기본: vs, 예: vs, solarized-light, bw)
-  --pro-tier <모델 ID>      'pro' 티어(invoke_subagent 등)에 쓸 모델 고정 (기본: gemini-4-carbon-high; 지정 시 pro-tier 자동 활성화)
+  --pro-tier <모델 ID>      'pro' 티어(invoke_subagent 등)에 쓸 모델 (기본: gemini-4-carbon-high; 지정 시 pro-tier 자동 활성화)
+  --flash-tier <모델 ID>    'flash' 티어에 쓸 모델 (기본: gemini-4-neon-medium; 지정 시 flash-tier 자동 활성화)
+  --flash-lite-tier <모델 ID> 'flash_lite' 티어에 쓸 모델 (기본: gemini-4-hydrogen-low; 지정 시 flash-lite-tier 자동 활성화)
   -o, --output <이름>       생성할 실행 파일 이름 또는 경로
   --preset                  프롬프트 없이 agy-batch와 agy-nodrip 생성
   --in-place                원본 백업 후 기본 바이너리 덮어쓰기
@@ -3923,9 +4056,12 @@ fn run() -> Result<(), String> {
                 let raw = args.next().ok_or("--code-theme 옵션에 테마 이름(예: vs, solarized-light, bw)이 필요합니다.")?;
                 cli_args.code_theme = Some(parse_code_theme(&raw)?);
             }
-            "--pro-tier" => {
-                let raw = args.next().ok_or("--pro-tier 옵션에 모델 ID(예: gemini-4-carbon-high)가 필요합니다.")?;
-                cli_args.pro_tier = Some(parse_model_id(&raw)?);
+            flag if TIERS.iter().any(|t| t.flag == flag) => {
+                let ti = TIERS.iter().position(|t| t.flag == flag).unwrap_or(0);
+                let raw = args
+                    .next()
+                    .ok_or_else(|| format!("{flag} 옵션에 모델 ID(예: {})가 필요합니다.", TIERS[ti].default_model))?;
+                cli_args.tiers[ti] = Some(parse_model_id(&raw)?);
             }
             "-o" | "--output" => {
                 output_arg = Some(args.next().ok_or("-o/--output 옵션에 파일명이 필요합니다.")?);
@@ -4032,7 +4168,7 @@ fn run() -> Result<(), String> {
                 }
             }
         } else {
-            // -p 의 '=값' 보다 --compact / --code-theme / --pro-tier 가 우선한다
+            // -p 의 '=값' 보다 --compact / --code-theme / --*-tier 가 우선한다
             let mut args = PatchArgs::default();
             let mut patches = parse_patch_list(patches_arg.as_deref().unwrap_or("all"), &mut args)?;
             cli_args.ensure_selected(&mut patches);
@@ -4130,18 +4266,22 @@ mod tests {
             .map(|p| p.id)
             .collect();
         assert_eq!(ids, [defaults.as_slice(), &["pro-tier"]].concat());
-        assert_eq!(args.pro_tier.as_deref(), Some("gemini-4-carbon-medium"));
+        assert_eq!(args.tiers[0].as_deref(), Some("gemini-4-carbon-medium"));
         assert!(parse("pro-tier=bad name").is_err());
     }
 
     #[test]
     fn patch_args_cli_values_win_and_select_their_patch() {
-        let mut args = PatchArgs { compact: Some(200_000), code_theme: Some("bw".into()), pro_tier: None };
-        let cli = PatchArgs { compact: Some(180_000), code_theme: None, pro_tier: Some("gemini-4-carbon-low".into()) };
+        let mut args = PatchArgs { compact: Some(200_000), code_theme: Some("bw".into()), tiers: [None, Some("gemini-4-neon-high".into()), None] };
+        let cli = PatchArgs { compact: Some(180_000), code_theme: None, tiers: [Some("gemini-4-carbon-low".into()), None, None] };
         args.overlay(&cli);
         assert_eq!(
             args,
-            PatchArgs { compact: Some(180_000), code_theme: Some("bw".into()), pro_tier: Some("gemini-4-carbon-low".into()) }
+            PatchArgs {
+                compact: Some(180_000),
+                code_theme: Some("bw".into()),
+                tiers: [Some("gemini-4-carbon-low".into()), Some("gemini-4-neon-high".into()), None]
+            }
         );
         let mut patches = Vec::new();
         cli.ensure_selected(&mut patches);
@@ -4166,7 +4306,7 @@ mod tests {
             funcs: [("modelutils.modelIDForTier", (0usize, 64usize))].into_iter().collect(),
             compact_tokens: DEFAULT_COMPACT_TOKENS,
             code_theme: DEFAULT_CODE_THEME.to_string(),
-            pro_tier_model: DEFAULT_PRO_TIER_MODEL.to_string(),
+            tier_models: default_tier_models(),
         };
         assert_eq!(
             available_model_ids(&ctx),
@@ -4174,6 +4314,83 @@ mod tests {
         );
         assert_eq!(find_model_id_offset(&ctx, "claude-sonnet-5-5-low"), Ok(100 + 20));
         assert!(find_model_id_offset(&ctx, "gemini-4-neon-xhigh").is_err());
+    }
+
+    fn tier_ctx<'a>(buf: &'a [u8], fn_start: usize, fn_end: usize, models: [&str; 3]) -> BinaryContext<'a> {
+        BinaryContext {
+            data: buf,
+            format: Format::Elf64,
+            arch: Arch::X86_64,
+            segments: Vec::new(),
+            funcs: [("modelutils.modelIDForTier", (fn_start, fn_end))].into_iter().collect(),
+            compact_tokens: DEFAULT_COMPACT_TOKENS,
+            code_theme: DEFAULT_CODE_THEME.to_string(),
+            tier_models: models.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn resolve_all_three_tiers_x86_in_one_function() {
+        // agy 1.5.7~1.5.13 modelIDForTier: flash_lite(2)·flash(3) 는 ret 까지 37바이트, pro(4)는 24바이트 + 공용 블록
+        fn branch37(tier: u8, field: u8) -> Vec<u8> {
+            let mut v = vec![0x83, 0xfb, tier, 0x75, 0x2b, 0x48, 0x85, 0xc0, 0x74, 0x0a];
+            v.extend([0x48, 0x8b, 0x50, field, 0x48, 0x8b, 0x70, field + 8]);
+            v.extend([0xeb, 0x04, 0x31, 0xf6, 0x31, 0xd2, 0x48, 0x85, 0xf6, 0x74, 0x4a]);
+            v.extend([0x48, 0x8b, 0x02, 0x48, 0x8b, 0x5a, 0x08, 0x31, 0xc9, 0x31, 0xff, 0xc9, 0xc3]);
+            v.extend([0x0f, 0x1f, 0x40, 0x00]); // 정렬용 nop
+            v
+        }
+        let mut code = branch37(2, 0x08);
+        code.extend(branch37(3, 0x20));
+        code.extend([0x83, 0xfb, 0x04, 0x75, 0x2f, 0x48, 0x85, 0xc0, 0x74, 0x0a, 0x48, 0x8b, 0x50, 0x38, 0x48, 0x8b, 0x70, 0x40]);
+        code.extend([0xeb, 0x04, 0x31, 0xf6, 0x31, 0xd2, 0x48, 0x85, 0xf6, 0x75, 0x0a]);
+        code.extend([0x31, 0xc0, 0x31, 0xdb, 0x31, 0xc9, 0x89, 0xc7, 0xc9, 0xc3]); // 공용 빈 반환 블록
+        code.extend([0x48, 0x8b, 0x02, 0x48, 0x8b, 0x5a, 0x08, 0x31, 0xc9, 0x31, 0xff, 0xc9, 0xc3]);
+
+        let mut buf = vec![0u8; 1024];
+        let fn_start = 64;
+        buf[fn_start..fn_start + code.len()].copy_from_slice(&code);
+        let strings = b"gemini-4-carbon-highgemini-4-neon-mediumgemini-4-hydrogen-lowgemini-4-carbon-low";
+        buf[600..600 + strings.len()].copy_from_slice(strings);
+        let original = buf.clone();
+        let fn_end = fn_start + code.len() + 16;
+        let lea_target = |buf: &[u8], site: usize| {
+            let t = (site as i64 + 7 + read_i32(buf, site + 3) as i64) as usize;
+            String::from_utf8(buf[t..t + read_u32(buf, site + 8) as usize].to_vec()).unwrap()
+        };
+        let defaults = TIERS.map(|t| t.default_model);
+        let sites = [(fn_start + 2 * 46 + 5, 24), (fn_start + 46 + 5, 37), (fn_start + 5, 37)]; // TIERS 순서
+        for (ti, &(site, len)) in sites.iter().enumerate() {
+            assert_eq!(find_tier_site_x86(&tier_ctx(&buf, fn_start, fn_end, defaults), TIERS[ti].tier), Ok((site, len, false)));
+        }
+
+        // 세 패치를 같은 원본에서 계산해 한꺼번에 쓴다 (build_patched_binary 와 같음)
+        let resolvers: [Resolver; 3] = [resolve_pro_tier, resolve_flash_tier, resolve_flash_lite_tier];
+        let all = |buf: &mut Vec<u8>, models: [&str; 3]| {
+            let edits: Vec<ByteEdit> = resolvers.iter().flat_map(|r| r(&tier_ctx(buf, fn_start, fn_end, models)).unwrap()).collect();
+            apply(buf, edits);
+        };
+        all(&mut buf, defaults);
+        for (ti, &(site, len)) in sites.iter().enumerate() {
+            assert_eq!(lea_target(&buf, site), TIERS[ti].default_model);
+            assert!(buf[site + 18..site + len].iter().all(|&c| c == 0xcc));
+            assert_eq!(detect_patched_tier(&tier_ctx(&buf, fn_start, fn_end, defaults), ti).as_deref(), Some(TIERS[ti].default_model));
+            assert_eq!(find_tier_site_x86(&tier_ctx(&buf, fn_start, fn_end, defaults), TIERS[ti].tier), Ok((site, len, true)));
+        }
+        // 정렬용 nop 과 공용 빈 반환 블록 등 분기 밖 바이트는 그대로
+        let changed: Vec<usize> = (0..buf.len()).filter(|&i| buf[i] != original[i]).collect();
+        assert!(changed.iter().all(|&i| sites.iter().any(|&(s, l)| (s..s + l).contains(&i))));
+
+        // 같은 값으로 다시 적용하면 결과가 같고, 다른 값으로 바꿀 수 있다
+        let once = buf.clone();
+        all(&mut buf, defaults);
+        assert_eq!(buf, once);
+        all(&mut buf, ["gemini-4-carbon-low", "gemini-4-carbon-high", "gemini-4-neon-medium"]);
+        assert_eq!(lea_target(&buf, sites[0].0), "gemini-4-carbon-low");
+        assert_eq!(lea_target(&buf, sites[2].0), "gemini-4-neon-medium");
+
+        // 바이너리에 없는 모델은 거부
+        assert!(resolve_flash_tier(&tier_ctx(&original, fn_start, fn_end, ["gemini-4-carbon-high", "gemini-4-neon-xhigh", "gemini-4-hydrogen-low"])).is_err());
     }
 
     #[test]
@@ -4216,12 +4433,12 @@ mod tests {
                 funcs: [("modelutils.modelIDForTier", (fn_start, fn_end))].into_iter().collect(),
                 compact_tokens: DEFAULT_COMPACT_TOKENS,
                 code_theme: DEFAULT_CODE_THEME.to_string(),
-                pro_tier_model: model.to_string(),
+                tier_models: [model.to_string(), TIERS[1].default_model.to_string(), TIERS[2].default_model.to_string()],
             };
             resolve_pro_tier(&ctx)
         };
         let detect = |buf: &[u8]| {
-            detect_patched_pro_tier(&BinaryContext {
+            detect_patched_tier(&BinaryContext {
                 data: buf,
                 format: Format::Elf64,
                 arch: Arch::X86_64,
@@ -4229,20 +4446,20 @@ mod tests {
                 funcs: [("modelutils.modelIDForTier", (fn_start, fn_end))].into_iter().collect(),
                 compact_tokens: DEFAULT_COMPACT_TOKENS,
                 code_theme: DEFAULT_CODE_THEME.to_string(),
-                pro_tier_model: DEFAULT_PRO_TIER_MODEL.to_string(),
-            })
+                tier_models: default_tier_models(),
+            }, 0)
         };
 
         assert_eq!(detect(&buf), None);
         assert!(ctx_with(&buf, "gemini-9-missing", Arch::X86_64).is_err());
-        assert!(ctx_with(&buf, DEFAULT_PRO_TIER_MODEL, Arch::Arm64).is_err());
+        assert!(ctx_with(&buf, TIERS[0].default_model, Arch::Arm64).is_err());
 
         let mut prev: Option<&str> = None;
         for (model, off) in [
-            (DEFAULT_PRO_TIER_MODEL, high),
-            (DEFAULT_PRO_TIER_MODEL, high),
+            (TIERS[0].default_model, high),
+            (TIERS[0].default_model, high),
             ("gemini-4-carbon-low", low),
-            (DEFAULT_PRO_TIER_MODEL, high),
+            (TIERS[0].default_model, high),
         ] {
             let before = buf.clone();
             let edits = ctx_with(&buf, model, Arch::X86_64).expect("pro-tier 매칭");
@@ -4317,7 +4534,7 @@ mod tests {
                 funcs,
                 compact_tokens: tokens,
                 code_theme: DEFAULT_CODE_THEME.to_string(),
-                pro_tier_model: DEFAULT_PRO_TIER_MODEL.to_string(),
+                tier_models: default_tier_models(),
             };
             let edits = resolve_compact(&ctx).expect("합성 바이너리에서 compact 매칭이 성공해야 함");
             assert_eq!(edits.len(), 4);
@@ -4408,7 +4625,7 @@ mod tests {
                 funcs,
                 compact_tokens: DEFAULT_COMPACT_TOKENS,
                 code_theme: theme.to_string(),
-                pro_tier_model: DEFAULT_PRO_TIER_MODEL.to_string(),
+                tier_models: default_tier_models(),
             }
         }
 
@@ -4489,7 +4706,7 @@ mod tests {
             funcs,
             compact_tokens: DEFAULT_COMPACT_TOKENS,
             code_theme: "vs".to_string(),
-            pro_tier_model: DEFAULT_PRO_TIER_MODEL.to_string(),
+            tier_models: default_tier_models(),
         };
         let edits = resolve_code_theme(&ctx).expect("정렬용 NOP이 있어도 code-theme 매칭이 성공해야 함");
         assert_eq!(edits.len(), 2);
@@ -4527,7 +4744,7 @@ mod tests {
             funcs,
             compact_tokens: DEFAULT_COMPACT_TOKENS,
             code_theme: "vs".to_string(),
-            pro_tier_model: DEFAULT_PRO_TIER_MODEL.to_string(),
+            tier_models: default_tier_models(),
         };
         let edits = resolve_batch(&ctx).expect("정렬용 NOP이 있어도 batch 매칭이 성공해야 함");
         assert_eq!(edits.len(), 1);
@@ -4563,7 +4780,7 @@ mod tests {
                     funcs,
                     compact_tokens: DEFAULT_COMPACT_TOKENS,
                     code_theme: DEFAULT_CODE_THEME.to_string(),
-                    pro_tier_model: DEFAULT_PRO_TIER_MODEL.to_string(),
+                    tier_models: default_tier_models(),
                 };
                 resolve_banner(&ctx).unwrap_or_else(|e| panic!("{round}회차 banner 매칭 실패: {e}"))
             };
@@ -4596,7 +4813,7 @@ mod tests {
                 funcs: funcs.iter().map(|&(n, s, e)| (n, (s, e))).collect(),
                 compact_tokens: DEFAULT_COMPACT_TOKENS,
                 code_theme: DEFAULT_CODE_THEME.to_string(),
-                pro_tier_model: DEFAULT_PRO_TIER_MODEL.to_string(),
+                tier_models: default_tier_models(),
             };
             let mut all = Vec::new();
             for r in resolvers {
@@ -4675,7 +4892,7 @@ mod tests {
             funcs: funcs.iter().map(|&(n, s, e)| (n, (s, e))).collect(),
             compact_tokens: tokens,
             code_theme: theme.to_string(),
-            pro_tier_model: DEFAULT_PRO_TIER_MODEL.to_string(),
+            tier_models: default_tier_models(),
         }
     }
 
