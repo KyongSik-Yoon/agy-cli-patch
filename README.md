@@ -78,6 +78,9 @@ agy-cli-patch -p all,release-notes -o agy-batch
 # 릴리즈 노트를 터미널에서 확인 (바이너리는 건드리지 않음)
 agy-cli-patch --notes
 
+# 바이너리에 고정된 서브에이전트 티어 표를 한 줄로 확인 (읽기 전용, 고정 안 됐으면 빈 줄)
+agy-cli-patch --tiers
+
 # 일괄 출력(batch)만 빼고 나머지 패치를 적용해 agy-nodrip 생성
 agy-cli-patch -p nodrip,cjk-bold,tilde-strike,code-theme,banner -o agy-nodrip
 
@@ -155,6 +158,7 @@ AGY_CLI_DISABLE_AUTO_UPDATE = "true"
   - PolicyGuardian 판정과 language server는 설정에서 읽은 티어를 쓰므로, 그 티어를 고정했다면 함께 바뀝니다(정적 분석 기준).
 - 사고 수준(effort)은 모델 ID 끝(`-low`/`-medium`/`-high`/`-xhigh`)으로 정해집니다. `invoke_subagent`에는 effort 인자가 없어서 같은 티어로 뜨는 서브에이전트는 모두 고른 ID의 수준으로 돕니다(패치 전 서버의 `pro` 값 `gemini-4-hydrogen-tiered-xhigh`도 xhigh 하나로 고정). 카본은 `-high`가 가장 높습니다.
 - 모델 ID는 바이너리에 문자열로 들어 있는 것만 쓸 수 있습니다(새 코드를 넣지 않고 기존 문자열을 가리키기 때문). 없는 ID를 주면 패치하지 않고 알립니다. 서버 모델 목록(`agy models`)에 없는 ID는 서브에이전트를 띄울 때 모델을 찾지 못해 실패할 수 있으니 `agy models`에 나오는 ID를 쓰세요.
+- `agy-cli-patch --tiers [--bin <경로>]`는 지금 바이너리에 고정된 티어만 `pro=…,flash=…,flash_lite=…` 한 줄로 출력합니다. 실행 중인 agy의 `/proc/<pid>/exe`처럼 업데이트로 교체돼 지워진 파일도 읽으므로, 라우팅 훅이 실제 티어 표를 확인하는 데 씁니다([agy-decision-lab](https://github.com/KyongSik-Yoon/agy-decision-lab)의 `AGY_TIER_MODELS=auto`).
 - PreToolUse 훅이 `invoke_subagent`의 `Model` 인자를 다른 티어로 바꾸면 그 티어가 쓰입니다. 실행 결과에 `A pre-tool hook changed the arguments of this tool call` 이 보이면 훅이 바꾼 것입니다.
 - 로컬 설정으로 티어를 바꾸는 장치(`admin_settings.json`의 `models.tiers`, `AGY_LLM_GATEWAY_TIER_PRO`·`_FLASH`·`_FLASH_LITE`)는 바이너리를 분석해 보면 LLM 게이트웨이 모드에서만 읽혀, 일반 로그인 환경에서는 효과가 없는 것으로 보입니다.
 
