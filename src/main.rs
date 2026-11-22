@@ -214,12 +214,14 @@ struct BinaryContext<'a> {
     code_theme: String,
     /// TIERS 순서 (pro, flash, flash_lite)
     tier_models: [String; 3],
+    /// Go 코드가 든 코드 섹션(ELF `.text`, Mach-O `__text`)의 파일 범위 [시작, 끝)
+    text_section: Option<(usize, usize)>,
 }
 
 impl<'a> BinaryContext<'a> {
     fn parse(data: &'a [u8]) -> Result<Self, String> {
         let mut segments = Vec::new();
-        let (format, arch, text_va, text_off) = if &data[..4] == b"\x7fELF" {
+        let (format, arch, text_va, text_off, text_size) = if &data[..4] == b"\x7fELF" {
             let e_machine = read_u16(data, 0x12);
             let arch = match e_machine {
                 0x3e => Arch::X86_64,
@@ -266,20 +268,22 @@ impl<'a> BinaryContext<'a> {
 
             let mut t_va = 0usize;
             let mut t_off = 0usize;
+            let mut t_size = 0usize;
             for i in 0..e_shnum {
-                let (sh_name, sh_addr, sh_off, _) = shdr(i);
+                let (sh_name, sh_addr, sh_off, sh_size) = shdr(i);
                 let s = &shstr[sh_name as usize..];
                 let end = s.iter().position(|&b| b == 0).unwrap_or(s.len());
                 if &s[..end] == b".text" {
                     t_va = sh_addr as usize;
                     t_off = sh_off as usize;
+                    t_size = sh_size as usize;
                     break;
                 }
             }
             if t_off == 0 {
                 return Err("ELF .text 섹션을 찾을 수 없습니다.".into());
             }
-            (Format::Elf64, arch, t_va, t_off)
+            (Format::Elf64, arch, t_va, t_off, t_size)
         } else if read_u32(data, 0) == 0xfeedfacf {
             let cputype = read_u32(data, 4);
             let arch = match cputype {
@@ -292,6 +296,7 @@ impl<'a> BinaryContext<'a> {
             let mut off = 32usize;
             let mut t_va = 0usize;
             let mut t_off = 0usize;
+            let mut t_size = 0usize;
             for _ in 0..ncmds {
                 let cmd = read_u32(data, off);
                 let cmdsize = read_u32(data, off + 4) as usize;
@@ -311,6 +316,7 @@ impl<'a> BinaryContext<'a> {
                         let end = sectname.iter().position(|&b| b == 0).unwrap_or(16);
                         if &sectname[..end] == b"__text" {
                             t_va = read_u64(data, sect_off + 32) as usize;
+                            t_size = read_u64(data, sect_off + 40) as usize;
                             t_off = read_u32(data, sect_off + 48) as usize;
                             break;
                         }
@@ -322,7 +328,7 @@ impl<'a> BinaryContext<'a> {
             if t_off == 0 {
                 return Err("Mach-O __text 섹션을 찾을 수 없습니다.".into());
             }
-            (Format::MachO64, arch, t_va, t_off)
+            (Format::MachO64, arch, t_va, t_off, t_size)
         } else {
             return Err("지원하지 않는 바이너리 포맷입니다 (ELF64 또는 Mach-O 64 필요).".into());
         };
@@ -386,6 +392,7 @@ impl<'a> BinaryContext<'a> {
             "store.cutAtRuneBoundary",
             "render.renderPlannerBody",
             "render.glamourStyleForScheme",
+            "render.glamourStyle", // 1.5.14+ 에서 glamourStyleForScheme 이 이 이름으로 바뀜
             "parser.ScanDelimiter",
             "extension.(*strikethroughParser).Parse",
             "utils.GetCheckpointConfig",
@@ -431,6 +438,7 @@ impl<'a> BinaryContext<'a> {
             compact_tokens: DEFAULT_COMPACT_TOKENS,
             code_theme: DEFAULT_CODE_THEME.to_string(),
             tier_models: default_tier_models(),
+            text_section: Some((text_off, (text_off + text_size).min(data.len()))),
         })
     }
 
@@ -949,8 +957,15 @@ struct A64CodeThemeSite {
 
 const A64_ORR_IMM6: u32 = 0xb27f_07e0; // orr xL, xzr, #0x6 (원본 "native" 길이)
 
+/// 코드 블록 테마를 정하는 함수: 1.5.13 까지 `render.glamourStyleForScheme`, 1.5.14+ `render.glamourStyle`
+fn code_theme_func(ctx: &BinaryContext) -> Result<(usize, usize), String> {
+    ctx.get_func("render.glamourStyleForScheme")
+        .or_else(|_| ctx.get_func("render.glamourStyle"))
+        .map_err(|_| "심볼 테이블에서 함수를 찾을 수 없습니다: render.glamourStyleForScheme / render.glamourStyle".to_string())
+}
+
 fn find_code_theme_site_a64(ctx: &BinaryContext) -> Result<A64CodeThemeSite, String> {
-    let (start, end) = ctx.get_func("render.glamourStyleForScheme")?;
+    let (start, end) = code_theme_func(ctx)?;
     let d = ctx.data;
     // "terminal" = 0x6c61_6e69_6d72_6574 (little-endian 8바이트)
     let chunks = [0x6574u32, 0x6d72, 0x6e69, 0x6c61];
@@ -1060,8 +1075,17 @@ fn skip_x86_nops(body: &[u8], mut pos: usize) -> usize {
     pos
 }
 
+/// `mov r64, [rsp+disp8|disp32]` 이면 그 길이 (1.5.14 는 "terminal" 상수와 비교 사이에 문자열 포인터를 다시 읽는다)
+fn x86_rsp_load_len(b: &[u8]) -> Option<usize> {
+    match b {
+        [0x48 | 0x4c, 0x8b, m, 0x24, ..] if m & 0xc7 == 0x44 => Some(5),
+        [0x48 | 0x4c, 0x8b, m, 0x24, ..] if m & 0xc7 == 0x84 => Some(8),
+        _ => None,
+    }
+}
+
 fn find_code_theme_site(ctx: &BinaryContext) -> Result<CodeThemeSite, String> {
-    let (start, end) = ctx.get_func("render.glamourStyleForScheme")?;
+    let (start, end) = code_theme_func(ctx)?;
     let body = &ctx.data[start..end];
     let mut matches = Vec::new();
     for i in 0..body.len().saturating_sub(42) {
@@ -1072,7 +1096,10 @@ fn find_code_theme_site(ctx: &BinaryContext) -> Result<CodeThemeSite, String> {
             continue;
         }
         // Go 어셈블러가 Intel JCC Erratum 완화를 위해 cmp/jne 경계에 정렬용 NOP을 삽입할 수 있다.
-        let cmp_rel = skip_x86_nops(body, i + 10);
+        let mut cmp_rel = skip_x86_nops(body, i + 10);
+        if let Some(n) = x86_rsp_load_len(&body[cmp_rel..]) {
+            cmp_rel = skip_x86_nops(body, cmp_rel + n);
+        }
         if cmp_rel + 3 >= body.len() || body[cmp_rel] != 0x48 || body[cmp_rel + 1] != 0x39 {
             continue;
         }
@@ -1616,38 +1643,138 @@ fn find_tier_site_x86(ctx: &BinaryContext, tier: u8) -> Result<(usize, usize, bo
     Ok(matches[0])
 }
 
+/// ARM64 modelIDForTier 의 티어 분기 (`cmp w1, #tier; b.ne ..` 바로 뒤). macOS·Linux 빌드가 같다.
+///   공통 머리: cbz x0,+12; ldp x4,x5,[x0,#X]; b +12; mov x5,xzr; mov x4,xzr
+///   flash 계열: cbz x5,empty; ldp x0,x1,[x4]; <반환 꼬리>
+///   PRO:        cbnz x5,ok   (뒤따르는 공용 빈 반환 블록은 다른 티어도 쓴다), ok: ldp x0,x1,[x4]; <반환 꼬리>
+///   반환 꼬리:  mov x2,xzr; mov x3,xzr; ldur x29,[sp,#-8]; ldr x30,[sp],#N; ret   (error = nil 후 복귀)
+///   패치 후(앞 4워드): adrp x0,model; add x0,x0,#lo; movz x1,#len; b <반환 꼬리>
+/// 반환값: (본문 시작, 반환 꼬리 위치, 이미 패치됐는지)
+fn find_tier_site_a64(ctx: &BinaryContext, tier: u8) -> Result<(usize, usize, bool), String> {
+    const LDP_X0_X1_X4: u32 = 0xa940_0480;
+    let d = ctx.data;
+    let is_ret_tail = |t: usize| {
+        t + 20 <= d.len()
+            && word(d, t) == 0xaa1f_03e2
+            && word(d, t + 4) == 0xaa1f_03e3
+            && word(d, t + 8) == 0xf85f_83fd
+            && word(d, t + 12) & 0xffe0_0fff == 0xf840_07fe
+            && word(d, t + 16) == 0xd65f_03c0
+    };
+    let (start, end) = ctx.get_func("modelutils.modelIDForTier")?;
+    let cmp = 0x7100_003f | (u32::from(tier) << 10); // cmp w1, #tier
+    let mut matches = Vec::new();
+    let mut off = start;
+    while off + 8 + 24 <= end {
+        if word(d, off) != cmp || a64::bcond(word(d, off + 4)) != Some(a64::COND_NE) {
+            off += 4;
+            continue;
+        }
+        let body = off + 8;
+        let w = |k: usize| word(d, body + k * 4);
+        let head = w(0) == 0xb400_0060
+            && w(1) & 0xffc0_7fff == 0xa940_1404
+            && w(2) == 0x1400_0003
+            && w(3) == 0xaa1f_03e5
+            && w(4) == 0xaa1f_03e4;
+        let found = if head && w(5) & 0xff00_001f == 0xb400_0005 && w(6) == LDP_X0_X1_X4 && is_ret_tail(body + 28) {
+            Some((body + 28, false))
+        } else if head && w(5) & 0xff00_001f == 0xb500_0005 {
+            let ok = a64::bcond_target(w(5), body + 20); // cbnz 도 imm19 위치가 b.cond 와 같다
+            (word(d, ok) == LDP_X0_X1_X4 && is_ret_tail(ok + 4)).then_some((ok + 4, false))
+        } else if a64::is_adrp(w(0))
+            && a64::rd(w(0)) == 0
+            && a64::is_add_imm(w(1))
+            && a64::rd(w(1)) == 0
+            && a64::add_rn(w(1)) == 0
+            && a64::is_movz(w(2))
+            && a64::rd(w(2)) == 1
+            && a64::is_b(w(3))
+        {
+            // 이미 패치됨: b 의 목적지가 반환 꼬리
+            ctx.off_to_va(body + 12)
+                .map(|pc| a64::branch26_target(w(3), pc))
+                .and_then(|t| ctx.va_to_off(t))
+                .filter(|&t| is_ret_tail(t))
+                .map(|t| (t, true))
+        } else {
+            None
+        };
+        if let Some((tail, patched)) = found {
+            matches.push((body, tail, patched));
+        }
+        off += 4;
+    }
+    if matches.len() != 1 {
+        return Err(format!("modelIDForTier ARM64 티어 {tier} 분기 패턴 매칭 실패 (매칭 수: {})", matches.len()));
+    }
+    Ok(matches[0])
+}
+
+/// 이 바이너리에서 티어 분기를 찾을 수 있는지 (아키텍처별)
+fn tier_site_found(ctx: &BinaryContext, tier: u8) -> bool {
+    match ctx.arch {
+        Arch::X86_64 => find_tier_site_x86(ctx, tier).is_ok(),
+        Arch::Arm64 => find_tier_site_a64(ctx, tier).is_ok(),
+    }
+}
+
 /// 이미 티어 고정 패치가 돼 있으면 고정된 모델 ID
 fn detect_patched_tier(ctx: &BinaryContext, ti: usize) -> Option<String> {
-    if ctx.arch != Arch::X86_64 {
-        return None;
-    }
-    let (site, _, true) = find_tier_site_x86(ctx, TIERS[ti].tier).ok()? else {
-        return None;
+    let tier = TIERS[ti].tier;
+    let (str_va, len) = match ctx.arch {
+        Arch::X86_64 => {
+            let (site, _, true) = find_tier_site_x86(ctx, tier).ok()? else {
+                return None;
+            };
+            let pc = ctx.off_to_va(site + 7)? as i64;
+            (usize::try_from(pc + read_i32(ctx.data, site + 3) as i64).ok()?, read_u32(ctx.data, site + 8) as usize)
+        }
+        Arch::Arm64 => {
+            let (body, _, true) = find_tier_site_a64(ctx, tier).ok()? else {
+                return None;
+            };
+            let page = a64::adrp_target(word(ctx.data, body), ctx.off_to_va(body)?);
+            (page + a64::add_imm12(word(ctx.data, body + 4)), a64::imm16(word(ctx.data, body + 8)) as usize)
+        }
     };
-    let pc = ctx.off_to_va(site + 7)? as i64;
-    let str_off = ctx.va_to_off(usize::try_from(pc + read_i32(ctx.data, site + 3) as i64).ok()?)?;
-    let len = read_u32(ctx.data, site + 8) as usize;
+    let str_off = ctx.va_to_off(str_va)?;
     std::str::from_utf8(ctx.data.get(str_off..str_off + len)?).ok().map(str::to_string)
 }
 
 fn resolve_tier(ctx: &BinaryContext, ti: usize) -> Result<Vec<ByteEdit>, String> {
     let spec = &TIERS[ti];
-    if ctx.arch != Arch::X86_64 {
-        return Err(format!("{} 패치는 아직 x86_64 만 지원합니다.", spec.id));
-    }
-    let (site, len, _) = find_tier_site_x86(ctx, spec.tier)?;
     let model = &ctx.tier_models[ti];
     let model_off = find_model_id_offset(ctx, model)?;
     let model_va = ctx.off_to_va(model_off).ok_or("모델 ID 문자열 가상주소 변환 실패")?;
-    let pc = ctx.off_to_va(site + 7).ok_or("LEA 명령어 가상주소 변환 실패")?;
-    let disp = i32::try_from(model_va as i64 - pc as i64).map_err(|_| "RIP 상대 변위 범위 초과".to_string())?;
-    let mut code = vec![0x48, 0x8d, 0x05]; // lea model(%rip),%rax
-    code.extend_from_slice(&disp.to_le_bytes());
-    code.push(0xbb); // mov $len,%ebx
-    code.extend_from_slice(&(model.len() as u32).to_le_bytes());
-    code.extend_from_slice(&[0x31, 0xc9, 0x31, 0xff, 0xc9, 0xc3]); // error = nil; leave; ret
-    code.resize(len, 0xcc);
-    Ok(vec![ByteEdit { offset: site, payload: code }])
+    match ctx.arch {
+        Arch::X86_64 => {
+            let (site, len, _) = find_tier_site_x86(ctx, spec.tier)?;
+            let pc = ctx.off_to_va(site + 7).ok_or("LEA 명령어 가상주소 변환 실패")?;
+            let disp = i32::try_from(model_va as i64 - pc as i64).map_err(|_| "RIP 상대 변위 범위 초과".to_string())?;
+            let mut code = vec![0x48, 0x8d, 0x05]; // lea model(%rip),%rax
+            code.extend_from_slice(&disp.to_le_bytes());
+            code.push(0xbb); // mov $len,%ebx
+            code.extend_from_slice(&(model.len() as u32).to_le_bytes());
+            code.extend_from_slice(&[0x31, 0xc9, 0x31, 0xff, 0xc9, 0xc3]); // error = nil; leave; ret
+            code.resize(len, 0xcc);
+            Ok(vec![ByteEdit { offset: site, payload: code }])
+        }
+        Arch::Arm64 => {
+            let (body, tail, _) = find_tier_site_a64(ctx, spec.tier)?;
+            let pc = ctx.off_to_va(body).ok_or("ADRP 명령어 가상주소 변환 실패")?;
+            let tail_va = ctx.off_to_va(tail).ok_or("반환 꼬리 가상주소 변환 실패")?;
+            Ok(vec![ByteEdit {
+                offset: body,
+                payload: words(&[
+                    a64::adrp(0, pc, model_va)?,
+                    a64::add_imm(0, 0, model_va & 0xfff),
+                    a64::movz(1, model.len() as u32),
+                    a64::b(pc + 12, tail_va)?,
+                ]),
+            }])
+        }
+    }
 }
 
 /// `--tiers` 출력: 이 바이너리에 고정된 티어만 `pro=…,flash=…,flash_lite=…` 로 (없으면 빈 문자열).
@@ -1722,14 +1849,15 @@ fn find_banner_site_x86(ctx: &BinaryContext) -> Result<(usize, usize), String> {
     Ok(matches[0])
 }
 
-/// 이미 패치된 banner 가 쓰는 동굴. lea 가 가리키는 채널 문자열 자리에서 구한다.
-fn banner_cave_x86(ctx: &BinaryContext) -> Result<Option<usize>, String> {
+/// 이미 패치된 banner 가 쓰는 동굴과 기존 채널 문자열의 끝. lea 가 가리키는 채널 문자열 자리에서 구한다.
+fn banner_cave_x86(ctx: &BinaryContext) -> Result<Option<(usize, usize)>, String> {
     let Ok((site, 0)) = find_banner_site_x86(ctx) else {
         return Ok(None);
     };
+    let len = read_u32(ctx.data, site + 24) as usize; // mov $len,%edx
     x86_rel32_target(ctx.data, site + 19, site + 23)
         .filter(|&p| ctx.data.get(p..).is_some_and(|s| s.starts_with(b"patch v")))
-        .and_then(|p| p.checked_sub(CAVE_CHAN_OFF))
+        .and_then(|p| Some((p.checked_sub(CAVE_CHAN_OFF)?, p + len)))
         .map(Some)
         .ok_or_else(|| "BannerWithInfo 기존 패치가 가리키는 채널 문자열(\"patch v…\")을 찾을 수 없습니다.".into())
 }
@@ -1757,9 +1885,9 @@ fn find_build_header_call_x86(ctx: &BinaryContext) -> Result<usize, String> {
     Ok(call_site)
 }
 
-/// 이미 패치된 release-notes 가 쓰는 동굴. BuildHeader 가 부르는 트램펄린
+/// 이미 패치된 release-notes 가 쓰는 동굴과 기존 트램펄린의 끝. BuildHeader 가 부르는 트램펄린
 /// (`lea notes(%rip),%r8; mov $len,%r9d; jmp concatstring3`)의 노트 문자열 자리에서 구한다.
-fn release_notes_cave_x86(ctx: &BinaryContext) -> Result<Option<usize>, String> {
+fn release_notes_cave_x86(ctx: &BinaryContext) -> Result<Option<(usize, usize)>, String> {
     let call = find_build_header_call_x86(ctx)?;
     let (concat2, _) = ctx.get_func("runtime.concatstring2")?;
     let (concat3, _) = ctx.get_func("runtime.concatstring3")?;
@@ -1774,35 +1902,101 @@ fn release_notes_cave_x86(ctx: &BinaryContext) -> Result<Option<usize>, String> 
                 .is_some_and(|w| w[0..3] == [0x4c, 0x8d, 0x05] && w[7..9] == [0x41, 0xb9] && w[13] == 0xe9)
                 && x86_rel32_target(d, t + 14, t + 18) == Some(concat3)
         })
-        .and_then(|t| x86_rel32_target(d, t + 3, t + 7))
-        .filter(|&n| n >= CAVE_NOTES_OFF && d.get(n..).is_some_and(|s| s.starts_with(b"\n\n")))
-        .map(|n| Some(n - CAVE_NOTES_OFF))
+        .and_then(|t| Some((x86_rel32_target(d, t + 3, t + 7)?, t + 18)))
+        .filter(|&(n, _)| n >= CAVE_NOTES_OFF && d.get(n..).is_some_and(|s| s.starts_with(b"\n\n")))
+        .map(|(n, end)| Some((n - CAVE_NOTES_OFF, end)))
         .ok_or_else(|| "BuildHeader 가 concatstring2 도, 알아볼 수 있는 릴리즈 노트 트램펄린도 부르지 않습니다.".into())
 }
 
-/// x86_64 banner / release-notes 가 함께 쓸 동굴을 고른다:
-/// 자기 패치가 이미 쓴 동굴(`own`) → 다른 패치가 쓴 동굴(`other`) → 새 0xcc 패딩.
-/// 패치마다 새 동굴을 찾으면 0xcc 패딩이 한 곳뿐인 버전(1.5.9·1.5.10·1.5.12)에서 재패치가 실패한다.
-/// 자기 동굴이 아니면 자기 몫(`own_range`, 동굴 기준 오프셋)이 0xcc 로 비어 있어야 한다
-/// (배치가 다른 옛 패치본에서 동굴 밖을 덮어쓰지 않도록).
+/// banner(채널 문자열) / release-notes(노트 + 트램펄린) 몫
+#[derive(Clone, Copy, PartialEq)]
+enum CavePart {
+    Chan,
+    Notes,
+}
+
+impl CavePart {
+    /// 고정 배치에서 동굴 기준 자기 몫
+    fn range(self) -> std::ops::Range<usize> {
+        match self {
+            CavePart::Chan => CAVE_CHAN_OFF..CAVE_NOTES_OFF,
+            CavePart::Notes => CAVE_NOTES_OFF..CAVE_MIN,
+        }
+    }
+}
+
+/// `from` 부터 이어지는 0xcc 의 끝
+fn cc_run_end(data: &[u8], from: usize) -> usize {
+    from + data.get(from..).map_or(0, |s| s.iter().take_while(|&&b| b == 0xcc).count())
+}
+
+/// 코드 섹션(`.text` / `__text`) 안의 0xcc 구간 [시작, 끝), 파일 순서 (16바이트 이상만).
+/// 같은 실행 세그먼트에 .rodata·__go_type 같은 데이터도 있어서, 함수 사이 패딩만 보도록 코드 섹션으로 좁힌다.
+/// Go 함수 표 범위보다 넓게 잡는 이유: 1.5.14 linux_x64 의 쓸 만한 패딩(877바이트)은 Go 코드 뒤,
+/// 함께 링크된 C 코드 사이에서 페이지 경계까지 채운 0xcc 다.
+fn code_cc_runs(ctx: &BinaryContext) -> Result<Vec<(usize, usize)>, String> {
+    let (lo, hi) = ctx.text_section.unwrap_or((0, ctx.data.len()));
+    let hi = hi.min(ctx.data.len());
+    let d = &ctx.data[..hi];
+    let mut runs = Vec::new();
+    let mut i = lo;
+    while i < hi {
+        if d[i] != 0xcc {
+            i += 1;
+            continue;
+        }
+        let e = cc_run_end(d, i);
+        if e - i >= 16 {
+            runs.push((i, e));
+        }
+        i = e;
+    }
+    Ok(runs)
+}
+
+/// x86_64 banner / release-notes 가 쓸 자리를 고른다. 반환: (동굴 기준점, 자기 몫을 쓸 수 있는 끝)
+/// 1. 자기 패치가 이미 쓴 자리(`own` = 동굴, 그때 쓴 내용의 끝): 그 뒤로 이어지는 0xcc 까지, 고정 배치 몫을 넘지 않게.
+/// 2. 다른 패치가 쓴 동굴(`other` = 동굴, 그 패치 내용의 끝)에 자기 몫이 0xcc 로 비어 있으면 그 동굴 (고정 배치).
+///    패치마다 새 동굴을 찾으면 0xcc 패딩이 한 곳뿐인 버전(1.5.9·1.5.10·1.5.12)에서 재패치가 실패한다.
+/// 3. 새 1024바이트 0xcc 동굴 (고정 배치: 채널 +0, 노트 +64).
+/// 4. 그런 동굴이 없으면(1.5.14 linux_x64) 대체 배치: 함수 사이 0xcc 구간을 따로 쓴다.
+///    채널은 32~255바이트 구간 중 첫째, 노트는 256바이트 이상 중 가장 긴 것 — 크기대가 달라 서로의 구간을
+///    고르지 않고, 원본 바이트만 보고 각자 골라도 겹치지 않는다. 다른 패치 내용 바로 뒤에 남은 0xcc 꼬리는
+///    고르지 않아 적용 순서와 상관없이 같은 자리가 되고 그 패치의 재패치 여유도 줄지 않는다.
+///    배치가 다른 옛 패치본을 만나도 0xcc 만 쓴다.
+///    동굴 기준점은 자기 문자열 위치에서 고정 배치 오프셋을 뺀 값이라 재패치 때 같은 식으로 되찾는다.
 fn pick_cave_x86(
     ctx: &BinaryContext,
-    own: Option<usize>,
-    other: Option<usize>,
-    own_range: std::ops::Range<usize>,
-) -> Result<usize, String> {
-    if let Some(cave) = own {
-        return Ok(cave);
+    part: CavePart,
+    own: Option<(usize, usize)>,
+    other: Option<(usize, usize)>,
+) -> Result<(usize, usize), String> {
+    let r = part.range();
+    if let Some((cave, content_end)) = own {
+        return Ok((cave, (cave + r.end).min(cc_run_end(ctx.data, content_end).max(content_end))));
     }
-    let cave = match other {
-        Some(cave) => cave,
-        None => find_cave(ctx)?,
+    let free = |cave: usize| {
+        ctx.data
+            .get(cave + r.start..cave + r.end)
+            .is_some_and(|s| s.iter().all(|&b| b == 0xcc))
     };
-    let (start, end) = (cave + own_range.start, cave + own_range.end);
-    if !ctx.data.get(start..end).is_some_and(|s| s.iter().all(|&b| b == 0xcc)) {
-        return Err(format!("동굴 0x{start:x}..0x{end:x} 가 비어 있지 않습니다 (알아볼 수 없는 기존 패치)."));
+    match other {
+        Some((cave, _)) if free(cave) => return Ok((cave, cave + r.end)),
+        None => {
+            if let Ok(cave) = find_cave(ctx) {
+                return Ok((cave, cave + r.end));
+            }
+        }
+        Some(_) => {}
     }
-    Ok(cave)
+    let other_tail = other.map(|(_, end)| end);
+    let runs: Vec<_> = code_cc_runs(ctx)?.into_iter().filter(|&(s, _)| Some(s) != other_tail).collect();
+    let pick = match part {
+        CavePart::Chan => runs.iter().find(|&&(s, e)| (32..256).contains(&(e - s))).copied(),
+        CavePart::Notes => runs.iter().filter(|&&(s, e)| e - s >= 256).max_by_key(|&&(s, e)| e - s).copied(),
+    };
+    pick.and_then(|(s, e)| Some((s.checked_sub(r.start)?, e)))
+        .ok_or_else(|| format!("실행 파일 내 0xcc 여유 공간({CAVE_MIN}바이트, 또는 따로 쓸 구간)을 찾을 수 없습니다."))
 }
 
 /// Mach-O ARM64: `__TEXT` 세그먼트(r-x) 안, 마지막 섹션 뒤의 페이지 정렬 패딩을 동굴로 쓴다.
@@ -1987,7 +2181,7 @@ fn resolve_release_notes_a64(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, Strin
 fn resolve_banner(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
     match ctx.arch {
         Arch::X86_64 => {
-            // 제품명 옆 괄호 안에 표시: "Antigravity CLI 1.5.7 (patch v0.2.9)"
+            // 제품명 옆 괄호 안에 표시: "Antigravity CLI 1.5.7 (patch v0.2.10)"
             let chan = format!("patch v{}", env!("CARGO_PKG_VERSION")).into_bytes();
             assert!(chan.len() <= CAVE_NOTES_OFF - CAVE_CHAN_OFF);
 
@@ -1995,16 +2189,25 @@ fn resolve_banner(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
             // 패치된 형태도 받아 패치본을 다시 패치할 수 있게 한다 (두 저장 명령의 위치만 다르다).
             let (chan_site, stores_off) = find_banner_site_x86(ctx)?;
             let chan_site_end = chan_site + 55;
-            let cave = pick_cave_x86(
+            let own = banner_cave_x86(ctx)?;
+            let (cave, limit) = pick_cave_x86(
                 ctx,
-                banner_cave_x86(ctx)?,
+                CavePart::Chan,
+                own,
                 release_notes_cave_x86(ctx).ok().flatten(),
-                CAVE_CHAN_OFF..CAVE_NOTES_OFF,
             )?;
             let chan_off = cave + CAVE_CHAN_OFF;
+            if chan_off + chan.len() > limit {
+                return Err("채널 문자열이 0xcc 여유 공간을 초과합니다.".into());
+            }
+            // 기존 문자열이 더 길었으면 남는 꼬리를 0xcc 로 되돌린다 (다음 재패치 때 쓸 자리를 줄이지 않게)
+            let mut chan_payload = chan.clone();
+            if let Some((_, old_end)) = own {
+                chan_payload.resize(chan.len().max(old_end.saturating_sub(chan_off)), 0xcc);
+            }
             let mut edits = vec![ByteEdit {
                 offset: chan_off,
-                payload: chan.clone(),
+                payload: chan_payload,
             }];
 
             // 원본은 채널 분기 진입 시 제품명 문자열(rax=ptr, rbx=len)을 스택 슬롯에 저장하고,
@@ -2071,11 +2274,12 @@ fn resolve_release_notes(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
             // 이미 패치된 바이너리면 그때 쓴 동굴을 다시 쓴다.
             let call_site = find_build_header_call_x86(ctx)?;
             let (concat3_start, _) = ctx.get_func("runtime.concatstring3")?;
-            let cave_offset = pick_cave_x86(
+            let own = release_notes_cave_x86(ctx)?;
+            let (cave_offset, limit) = pick_cave_x86(
                 ctx,
-                release_notes_cave_x86(ctx)?,
+                CavePart::Notes,
+                own,
                 banner_cave_x86(ctx).ok().flatten(),
-                CAVE_NOTES_OFF..CAVE_MIN,
             )?;
 
             let notes = format!("\n\n{}", release_notes_text()).into_bytes();
@@ -2108,10 +2312,16 @@ fn resolve_release_notes(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
             tramp.push(0xe9);
             tramp.extend_from_slice(&(rel_c3 as i32).to_le_bytes());
 
-            if tramp_va + tramp.len() > cave_offset + CAVE_MIN {
+            if tramp_va + tramp.len() > limit {
                 return Err("릴리즈 노트가 0xcc 여유 공간을 초과합니다.".into());
             }
 
+            // 노트와 트램펄린 사이, 그리고 기존 트램펄린이 더 뒤에 있었으면 그 자리까지 0xcc 로 채운다
+            let mut notes = notes;
+            notes.resize(tramp_va - notes_va, 0xcc);
+            if let Some((_, old_end)) = own {
+                tramp.resize(tramp.len().max(old_end.saturating_sub(tramp_va)), 0xcc);
+            }
             let mut edits = vec![
                 ByteEdit {
                     offset: notes_va,
@@ -2190,7 +2400,7 @@ const PATCH_REGISTRY: &[PatchSpec] = &[
     PatchSpec {
         id: "pro-tier",
         title: "서브에이전트 pro 티어 모델 고정 (Pro Tier Model)",
-        description: "invoke_subagent 등에서 'pro' 티어가 서버 지정 모델 대신 고른 모델(기본 gemini-4-carbon-high)로 실행되도록 고정 (기본 꺼짐, x86_64 전용)",
+        description: "invoke_subagent 등에서 'pro' 티어가 서버 지정 모델 대신 고른 모델(기본 gemini-4-carbon-high)로 실행되도록 고정 (기본 꺼짐)",
         symbol: "modelutils.modelIDForTier",
         default_on: false,
         resolver: resolve_pro_tier,
@@ -2198,7 +2408,7 @@ const PATCH_REGISTRY: &[PatchSpec] = &[
     PatchSpec {
         id: "flash-tier",
         title: "서브에이전트 flash 티어 모델 고정 (Flash Tier Model)",
-        description: "'flash' 티어를 고른 모델(기본 gemini-4-neon-medium)로 고정. flash_lite 가 없을 때 agy 유틸리티 작업도 이 티어를 씀 (기본 꺼짐, x86_64 전용)",
+        description: "'flash' 티어를 고른 모델(기본 gemini-4-neon-medium)로 고정. flash_lite 가 없을 때 agy 유틸리티 작업도 이 티어를 씀 (기본 꺼짐)",
         symbol: "modelutils.modelIDForTier",
         default_on: false,
         resolver: resolve_flash_tier,
@@ -2206,7 +2416,7 @@ const PATCH_REGISTRY: &[PatchSpec] = &[
     PatchSpec {
         id: "flash-lite-tier",
         title: "서브에이전트 flash_lite 티어 모델 고정 (Flash-Lite Tier Model)",
-        description: "'flash_lite' 티어를 고른 모델(기본 gemini-4-hydrogen-low)로 고정. agy 유틸리티 작업도 이 티어를 먼저 씀 (기본 꺼짐, x86_64 전용)",
+        description: "'flash_lite' 티어를 고른 모델(기본 gemini-4-hydrogen-low)로 고정. agy 유틸리티 작업도 이 티어를 먼저 씀 (기본 꺼짐)",
         symbol: "modelutils.modelIDForTier",
         default_on: false,
         resolver: resolve_flash_lite_tier,
@@ -2214,7 +2424,7 @@ const PATCH_REGISTRY: &[PatchSpec] = &[
     PatchSpec {
         id: "banner",
         title: "제품명 옆 패치 버전 표시 (Patch Version Tag)",
-        description: "상단 'Antigravity CLI 1.5.7' 옆에 '(patch v0.2.9)' 형태로 패치 버전 표시",
+        description: "상단 'Antigravity CLI 1.5.7' 옆에 '(patch v0.2.10)' 형태로 패치 버전 표시",
         symbol: "render.BannerWithInfo",
         default_on: true,
         resolver: resolve_banner,
@@ -2995,8 +3205,8 @@ fn append_inline_param(
 
 impl<'a> Wizard<'a> {
     fn new(src_bin: &'a Path, target_bin: &'a Path, bin_dir: &'a Path, version: &'a str, ctx: &'a BinaryContext<'a>) -> Self {
-        // 티어 고정 패치에 고를 모델 ID. 쓸 수 없는 바이너리(ARM64 등)에서는 수백 MB 를 훑지 않는다
-        let model_presets = if ctx.arch == Arch::X86_64 { available_model_ids(ctx) } else { Vec::new() };
+        // 티어 고정 패치에 고를 모델 ID (바이너리에 문자열로 들어 있는 것만)
+        let model_presets = available_model_ids(ctx);
         let avail: Vec<Result<(), String>> = PATCH_REGISTRY
             .iter()
             .map(|p| {
@@ -3005,9 +3215,8 @@ impl<'a> Wizard<'a> {
                     // 기본 모델이 이 바이너리에 없어도 고를 모델이 있으면 줄은 쓸 수 있다 (켤 때 값을 검사한다)
                     Some(ti)
                         if r.is_err()
-                            && ctx.arch == Arch::X86_64
                             && !model_presets.is_empty()
-                            && find_tier_site_x86(ctx, TIERS[ti].tier).is_ok() =>
+                            && tier_site_found(ctx, TIERS[ti].tier) =>
                     {
                         Ok(())
                     }
@@ -4336,6 +4545,7 @@ mod tests {
             compact_tokens: DEFAULT_COMPACT_TOKENS,
             code_theme: DEFAULT_CODE_THEME.to_string(),
             tier_models: default_tier_models(),
+            text_section: None,
         };
         assert_eq!(
             available_model_ids(&ctx),
@@ -4355,6 +4565,7 @@ mod tests {
             compact_tokens: DEFAULT_COMPACT_TOKENS,
             code_theme: DEFAULT_CODE_THEME.to_string(),
             tier_models: models.map(str::to_string),
+            text_section: None,
         }
     }
 
@@ -4468,6 +4679,7 @@ mod tests {
                 compact_tokens: DEFAULT_COMPACT_TOKENS,
                 code_theme: DEFAULT_CODE_THEME.to_string(),
                 tier_models: [model.to_string(), TIERS[1].default_model.to_string(), TIERS[2].default_model.to_string()],
+                text_section: None,
             };
             resolve_pro_tier(&ctx)
         };
@@ -4481,6 +4693,7 @@ mod tests {
                 compact_tokens: DEFAULT_COMPACT_TOKENS,
                 code_theme: DEFAULT_CODE_THEME.to_string(),
                 tier_models: default_tier_models(),
+                text_section: None,
             }, 0)
         };
 
@@ -4569,6 +4782,7 @@ mod tests {
                 compact_tokens: tokens,
                 code_theme: DEFAULT_CODE_THEME.to_string(),
                 tier_models: default_tier_models(),
+                text_section: None,
             };
             let edits = resolve_compact(&ctx).expect("합성 바이너리에서 compact 매칭이 성공해야 함");
             assert_eq!(edits.len(), 4);
@@ -4660,6 +4874,7 @@ mod tests {
                 compact_tokens: DEFAULT_COMPACT_TOKENS,
                 code_theme: theme.to_string(),
                 tier_models: default_tier_models(),
+                text_section: None,
             }
         }
 
@@ -4741,12 +4956,70 @@ mod tests {
             compact_tokens: DEFAULT_COMPACT_TOKENS,
             code_theme: "vs".to_string(),
             tier_models: default_tier_models(),
+            text_section: None,
         };
         let edits = resolve_code_theme(&ctx).expect("정렬용 NOP이 있어도 code-theme 매칭이 성공해야 함");
         assert_eq!(edits.len(), 2);
         apply(&mut buf, edits);
         assert_eq!(read_i32(&buf, lea_off + 3), (vs_off as i64 - lea_next as i64) as i32);
         assert_eq!(read_u32(&buf, mov_len_off + 8), 2);
+    }
+
+    #[test]
+    fn resolve_code_theme_accepts_agy_1_5_14_glamour_style() {
+        // agy 1.5.14: 함수 이름이 render.glamourStyle 로 바뀌고, "terminal" 상수와 비교 사이에
+        // 비교할 문자열 포인터를 스택에서 다시 읽는다 (mov 0x19f0(%rsp),%rcx; cmp %rax,(%rcx)).
+        let mut buf = vec![0x90u8; 512];
+        let native_tag = b"<style name=\"native\">";
+        let vs_tag = b"<style name=\"vs\">";
+        buf[16..16 + native_tag.len()].copy_from_slice(native_tag);
+        let native_off = 16 + 13;
+        buf[64..64 + vs_tag.len()].copy_from_slice(vs_tag);
+        let vs_off = 64 + 13;
+
+        let (fn_start, fn_end) = (160usize, 320usize);
+        let site = fn_start + 12;
+        buf[site..site + 2].copy_from_slice(&[0x48, 0xb8]);
+        buf[site + 2..site + 10].copy_from_slice(b"terminal");
+        buf[site + 10..site + 18].copy_from_slice(&[0x48, 0x8b, 0x8c, 0x24, 0xf0, 0x19, 0x00, 0x00]);
+        buf[site + 18..site + 21].copy_from_slice(&[0x48, 0x39, 0x01]);
+        buf[site + 21..site + 27].copy_from_slice(&[0x0f, 0x85, 0xe9, 0x00, 0x00, 0x00]);
+        let lea_off = site + 27;
+        let lea_next = lea_off + 7;
+        buf[lea_off..lea_off + 3].copy_from_slice(&[0x48, 0x8d, 0x05]);
+        buf[lea_off + 3..lea_next].copy_from_slice(&((native_off as i64 - lea_next as i64) as i32).to_le_bytes());
+        buf[lea_next..lea_next + 8].copy_from_slice(&[0x48, 0x89, 0x84, 0x24, 0x10, 0x15, 0x00, 0x00]);
+        let mov_len_off = lea_next + 8;
+        buf[mov_len_off..mov_len_off + 8].copy_from_slice(&[0x48, 0xc7, 0x84, 0x24, 0x18, 0x15, 0x00, 0x00]);
+        buf[mov_len_off + 8..mov_len_off + 12].copy_from_slice(&6u32.to_le_bytes());
+
+        fn ctx_at<'a>(buf: &'a [u8], theme: &str, range: (usize, usize)) -> BinaryContext<'a> {
+            let mut funcs = HashMap::new();
+            funcs.insert("render.glamourStyle", range);
+            BinaryContext {
+                data: buf,
+                format: Format::Elf64,
+                arch: Arch::X86_64,
+                segments: Vec::new(),
+                funcs,
+                compact_tokens: DEFAULT_COMPACT_TOKENS,
+                code_theme: theme.to_string(),
+                tier_models: default_tier_models(),
+                text_section: None,
+            }
+        }
+        let ctx_for = |buf, theme| ctx_at(buf, theme, (fn_start, fn_end));
+        let owned = buf.clone();
+        assert_eq!(detect_patched_code_theme(&ctx_for(&owned, "vs")), None);
+        let edits = resolve_code_theme(&ctx_for(&owned, "vs")).expect("1.5.14 형태도 매칭돼야 함");
+        apply(&mut buf, edits);
+        assert_eq!(read_i32(&buf, lea_off + 3), (vs_off as i64 - lea_next as i64) as i32);
+        assert_eq!(read_u32(&buf, mov_len_off + 8), 2);
+        assert_eq!(detect_patched_code_theme(&ctx_for(&buf, "vs")).as_deref(), Some("vs"));
+        // 스택 읽기가 없는 1.5.13 이하 이름만 있으면 그 이름으로 찾는다 (위 테스트들) — 둘 다 없으면 오류
+        let mut ctx = ctx_for(&owned, "vs");
+        ctx.funcs.clear();
+        assert!(resolve_code_theme(&ctx).err().is_some_and(|e| e.contains("render.glamourStyle")));
     }
 
     #[test]
@@ -4779,6 +5052,7 @@ mod tests {
             compact_tokens: DEFAULT_COMPACT_TOKENS,
             code_theme: "vs".to_string(),
             tier_models: default_tier_models(),
+            text_section: None,
         };
         let edits = resolve_batch(&ctx).expect("정렬용 NOP이 있어도 batch 매칭이 성공해야 함");
         assert_eq!(edits.len(), 1);
@@ -4815,6 +5089,7 @@ mod tests {
                     compact_tokens: DEFAULT_COMPACT_TOKENS,
                     code_theme: DEFAULT_CODE_THEME.to_string(),
                     tier_models: default_tier_models(),
+                    text_section: None,
                 };
                 resolve_banner(&ctx).unwrap_or_else(|e| panic!("{round}회차 banner 매칭 실패: {e}"))
             };
@@ -4848,6 +5123,7 @@ mod tests {
                 compact_tokens: DEFAULT_COMPACT_TOKENS,
                 code_theme: DEFAULT_CODE_THEME.to_string(),
                 tier_models: default_tier_models(),
+                text_section: None,
             };
             let mut all = Vec::new();
             for r in resolvers {
@@ -4906,11 +5182,107 @@ mod tests {
             assert_eq!(b, expected);
         }
 
-        // 배치를 알아볼 수 없는 옛 패치본: release-notes 동굴의 banner 몫이 비어 있지 않으면 쓰지 않는다
+        // 배치를 알아볼 수 없는 옛 패치본: release-notes 동굴의 banner 몫이 비어 있지 않으면 그 몫에 덮어쓰지 않고
+        // 대체 배치로 다른 0xcc 구간에 쓴다 (노트 뒤에 남은 0xcc 꼬리는 고르지 않는다)
         let mut odd = buf.clone();
         apply_x86(&mut odd, &funcs, &[resolve_release_notes]).unwrap();
         odd[cave + CAVE_CHAN_OFF] = 0x00;
-        assert!(apply_x86(&mut odd, &funcs, &[resolve_banner]).is_err());
+        let before = odd.clone();
+        apply_x86(&mut odd, &funcs, &[resolve_banner]).unwrap();
+        let chan_off = (site as i64 + 23 + read_i32(&odd, site + 19) as i64) as usize;
+        assert_eq!(chan_off, cave + CAVE_CHAN_OFF + 1);
+        assert!((0..odd.len()).filter(|&i| odd[i] != before[i]).all(|i| (site..site + 55).contains(&i) || before[i] == 0xcc));
+    }
+
+    #[test]
+    fn code_cc_runs_stay_inside_code_section() {
+        // 같은 실행 세그먼트의 데이터(.rodata 등)에 있는 0xcc 는 패딩이 아니므로 고르지 않는다
+        let mut buf = vec![0u8; 4096];
+        buf[100..140].fill(0xcc); // 코드 섹션 앞 (데이터)
+        buf[1100..1140].fill(0xcc); // 코드 섹션 안
+        buf[1990..2030].fill(0xcc); // 섹션 끝에 걸침 → 섹션 안쪽 10바이트만 남아 너무 짧다
+        let ctx = BinaryContext {
+            data: &buf,
+            format: Format::Elf64,
+            arch: Arch::X86_64,
+            segments: Vec::new(),
+            funcs: HashMap::new(),
+            compact_tokens: DEFAULT_COMPACT_TOKENS,
+            code_theme: DEFAULT_CODE_THEME.to_string(),
+            tier_models: default_tier_models(),
+            text_section: Some((1024, 2000)),
+        };
+        assert_eq!(code_cc_runs(&ctx), Ok(vec![(1100, 1140)]));
+    }
+
+    #[test]
+    fn x86_banner_and_release_notes_split_when_no_big_cave() {
+        // agy 1.5.14 linux_x64 처럼 1024바이트 0xcc 동굴이 없고, 함수 사이 0xcc 구간만 있는 합성 바이너리
+        let mut buf = vec![0u8; 16384];
+        let bwi = (64usize, 256usize);
+        let site = bwi.0 + 16;
+        buf[site..site + 9].copy_from_slice(&[0x48, 0x85, 0xd2, 0x0f, 0x84, 0x00, 0x01, 0x00, 0x00]);
+        buf[site + 9..site + 25].copy_from_slice(&[
+            0x48, 0x89, 0x9c, 0x24, 0xb0, 0x02, 0x00, 0x00, 0x48, 0x89, 0x84, 0x24, 0x20, 0x03, 0x00, 0x00,
+        ]);
+        buf[site + 25..site + 55].fill(0xaa);
+        let bh = (256usize, 448usize);
+        let (concat2, concat3) = (512usize, 576usize);
+        let pat = bh.0 + 16;
+        buf[pat..pat + 11].copy_from_slice(&[0x48, 0x89, 0xc7, 0x48, 0x89, 0xde, 0x31, 0xc0, 0x48, 0x8d, 0x1d]);
+        buf[pat + 11..pat + 17].fill(0xaa);
+        let call = pat + 17;
+        buf[call] = 0xe8;
+        buf[call + 1..call + 5].copy_from_slice(&((concat2 as i32) - (call as i32 + 5)).to_le_bytes());
+        let funcs = [
+            ("render.BannerWithInfo", bwi.0, bwi.1),
+            ("render.BuildHeader", bh.0, bh.1),
+            ("runtime.concatstring2", concat2, concat2 + 64),
+            ("runtime.concatstring3", concat3, concat3 + 64),
+        ];
+        // 노트+트램펄린이 딱 들어가는 큰 구간, 채널용 40바이트 구간, 너무 작은 구간들
+        let notes_len = 2 + release_notes_text().len();
+        let n = 8192usize;
+        let notes_end = ((n + notes_len + 15) & !15) + 18;
+        buf[1024..1044].fill(0xcc); // 20바이트: 채널에도 작다
+        buf[2048..2088].fill(0xcc); // 40바이트: 채널 자리
+        buf[3072..3112].fill(0xcc); // 40바이트: 둘째 후보 (첫째만 쓴다)
+        let original = buf.clone();
+        let both: &[Resolver] = &[resolve_banner, resolve_release_notes];
+
+        let with_notes_run = |end: usize| {
+            let mut b = original.clone();
+            b[n..end].fill(0xcc);
+            b
+        };
+        let fresh = with_notes_run(notes_end);
+        let mut expected = fresh.clone();
+        apply_x86(&mut expected, &funcs, both).unwrap();
+        let chan_off = (site as i64 + 23 + read_i32(&expected, site + 19) as i64) as usize;
+        assert_eq!(chan_off, 2048);
+        assert!(expected[n..].starts_with(b"\n\n"));
+        // 호출 자리 밖에서 바뀐 바이트는 모두 원래 0xcc 였다
+        assert!((0..expected.len())
+            .filter(|&i| expected[i] != fresh[i])
+            .all(|i| (site..site + 55).contains(&i) || (call..call + 5).contains(&i) || fresh[i] == 0xcc));
+
+        let mut again = expected.clone();
+        apply_x86(&mut again, &funcs, both).unwrap();
+        assert_eq!(again, expected);
+        for order in [[resolve_banner as Resolver, resolve_release_notes], [resolve_release_notes, resolve_banner]] {
+            let mut b = fresh.clone();
+            for r in order {
+                apply_x86(&mut b, &funcs, &[r]).unwrap();
+                apply_x86(&mut b, &funcs, &[r]).unwrap();
+            }
+            assert_eq!(b, expected);
+        }
+
+        // 노트 구간이 1바이트 모자라면 release-notes 만 실패하고 banner 는 그대로 된다
+        let mut short = with_notes_run(notes_end - 1);
+        assert!(apply_x86(&mut short.clone(), &funcs, &[resolve_release_notes]).is_err());
+        apply_x86(&mut short, &funcs, &[resolve_banner]).unwrap();
+        assert_eq!((site as i64 + 23 + read_i32(&short, site + 19) as i64) as usize, 2048);
     }
 
     fn put_words(buf: &mut [u8], off: usize, insns: &[u32]) {
@@ -4927,6 +5299,7 @@ mod tests {
             compact_tokens: tokens,
             code_theme: theme.to_string(),
             tier_models: default_tier_models(),
+            text_section: None,
         }
     }
 
@@ -5031,4 +5404,77 @@ mod tests {
             assert_eq!(detect_patched_code_theme(&a64_ctx(&buf, &funcs, 0, theme)).as_deref(), Some(theme));
         }
     }
+
+    #[test]
+    fn a64_all_three_tiers_patch_and_repatch() {
+        // agy 1.5.13 macOS·Linux ARM64 modelIDForTier 와 같은 모양
+        const RET_TAIL: [u32; 5] = [0xaa1f_03e2, 0xaa1f_03e3, 0xf85f_83fd, 0xf845_07fe, 0xd65f_03c0];
+        let head = |field: u32| [0xb400_0060, 0xa940_1404 | (field / 8) << 15, 0x1400_0003, 0xaa1f_03e5, 0xaa1f_03e4];
+        let mut code: Vec<u32> = vec![0xf940_0b90, 0xeb30_63ff, 0x5400_0ae9, 0xf81b_0ffe, 0xf81f_83fd, 0xd100_23fd];
+        for (tier, field) in [(2u32, 8u32), (3, 0x20)] {
+            code.extend([0x7100_003f | tier << 10, 0x5400_01a1]); // cmp w1,#tier; b.ne 다음 티어
+            code.extend(head(field));
+            code.extend([0xb400_0005 | 0x3f << 5, 0xa940_0480]); // cbz x5,empty; ldp x0,x1,[x4]
+            code.extend(RET_TAIL);
+        }
+        code.extend([0x7100_103f, 0x5400_0281]);
+        code.extend(head(0x38));
+        code.push(0xb500_0005 | 8 << 5); // cbnz x5, ok(+0x20)
+        code.extend([0xaa1f_03e0, 0xaa1f_03e1, 0xaa1f_03e2, 0xaa1f_03e3, 0xf85f_83fd, 0xf845_07fe, 0xd65f_03c0]); // 공용 빈 반환
+        code.push(0xa940_0480); // ok: ldp x0,x1,[x4]
+        code.extend(RET_TAIL);
+
+        let mut buf = vec![0u8; 0x3000];
+        let fn_start = 0x100;
+        put_words(&mut buf, fn_start, &code);
+        let strings = b"gemini-4-carbon-highgemini-4-neon-mediumgemini-4-hydrogen-lowgemini-4-carbon-low";
+        buf[0x2345..0x2345 + strings.len()].copy_from_slice(strings);
+        let original = buf.clone();
+        let funcs = [("modelutils.modelIDForTier", fn_start, fn_start + code.len() * 4 + 16)];
+        let ctx_with = |buf: &[u8], models: [&str; 3]| -> Vec<ByteEdit> {
+            let mut ctx = a64_ctx(buf, &funcs, DEFAULT_COMPACT_TOKENS, DEFAULT_CODE_THEME);
+            ctx.tier_models = models.map(str::to_string);
+            [resolve_pro_tier, resolve_flash_tier, resolve_flash_lite_tier].iter().flat_map(|r| r(&ctx).unwrap()).collect()
+        };
+        let defaults = TIERS.map(|t| t.default_model);
+        // TIERS 순서(pro, flash, flash_lite)의 본문 시작과 반환 꼬리
+        let bodies = [fn_start + 4 * (6 + 2 * 14 + 2), fn_start + 4 * (6 + 14 + 2), fn_start + 4 * (6 + 2)]; // 티어 2·3 덩어리는 14워드
+        let tails = [bodies[0] + 4 * (6 + 7 + 1), bodies[1] + 28, bodies[2] + 28];
+        let a64 = a64_ctx(&buf, &funcs, DEFAULT_COMPACT_TOKENS, DEFAULT_CODE_THEME);
+        for ti in 0..3 {
+            assert_eq!(find_tier_site_a64(&a64, TIERS[ti].tier), Ok((bodies[ti], tails[ti], false)));
+        }
+        assert_eq!(tier_query_line(&a64), "");
+
+        let edits = ctx_with(&buf, defaults);
+        apply(&mut buf, edits);
+        let a64 = a64_ctx(&buf, &funcs, DEFAULT_COMPACT_TOKENS, DEFAULT_CODE_THEME);
+        for ti in 0..3 {
+            let b = bodies[ti];
+            let target = a64::adrp_target(word(&buf, b), b) + a64::add_imm12(word(&buf, b + 4));
+            assert_eq!(&buf[target..target + defaults[ti].len()], defaults[ti].as_bytes());
+            assert_eq!(word(&buf, b + 8), a64::movz(1, defaults[ti].len() as u32));
+            assert_eq!(a64::branch26_target(word(&buf, b + 12), b + 12), tails[ti]);
+            assert_eq!(find_tier_site_a64(&a64, TIERS[ti].tier), Ok((b, tails[ti], true)));
+            assert_eq!(detect_patched_tier(&a64, ti).as_deref(), Some(defaults[ti]));
+        }
+        assert_eq!(
+            tier_query_line(&a64),
+            "pro=gemini-4-carbon-high,flash=gemini-4-neon-medium,flash_lite=gemini-4-hydrogen-low"
+        );
+        // 각 본문의 앞 16바이트만 바뀐다 (공용 빈 반환 블록·반환 꼬리는 그대로)
+        assert!((0..buf.len()).filter(|&i| buf[i] != original[i]).all(|i| bodies.iter().any(|&b| (b..b + 16).contains(&i))));
+
+        // 같은 값으로 다시 적용하면 같고, 다른 값으로 바꿀 수 있다
+        let once = buf.clone();
+        let edits = ctx_with(&buf, defaults);
+        apply(&mut buf, edits);
+        assert_eq!(buf, once);
+        let edits = ctx_with(&buf, ["gemini-4-carbon-low", "gemini-4-carbon-high", "gemini-4-neon-medium"]);
+        apply(&mut buf, edits);
+        let a64 = a64_ctx(&buf, &funcs, DEFAULT_COMPACT_TOKENS, DEFAULT_CODE_THEME);
+        assert_eq!(detect_patched_tier(&a64, 0).as_deref(), Some("gemini-4-carbon-low"));
+        assert_eq!(detect_patched_tier(&a64, 2).as_deref(), Some("gemini-4-neon-medium"));
+    }
+
 }
