@@ -932,7 +932,7 @@ part('wizard', function(){
     {id: 'code-theme', t: '터미널 스킴 코드 블록 가독성 개선 (Terminal Code Theme)', d: 'colorScheme: terminal 사용 시 흐린 회색(#d0d0d0)으로 묻히는 코드 블록 테마(native)를 선명한 테마(기본 vs)로 교체', s: 'render.glamourStyleForScheme', def: true, off: '0xa31fe01, 0xa31fe15'},
     {id: 'compact', t: '자동 컴팩션 토큰 임계값 변경 (Auto-Compact Limit)', d: '내장 자동 컴팩션(CHECKPOINT) 발동 기준(기본 256k)을 원하는 토큰 수(기본 180k, 32k~1000k)로 변경 (기본 꺼짐)', s: 'utils.GetCheckpointConfig', def: false, off: '0x86858d8, 0x84f5e04, 0x84f5e09, 0x84f617d'},
     {id: 'banner', t: '제품명 옆 패치 버전 표시 (Patch Version Tag)', d: "상단 'Antigravity CLI 1.5.7' 옆에 '(patch v0.2.7)' 형태로 패치 버전 표시", s: 'render.BannerWithInfo', def: true, off: '0xa8a4287, 0xa326f90'},
-    {id: 'release-notes', t: '상단 배너 릴리즈 노트 표시 (Release Notes)', d: '로고 아래에 패치 기능 요약 및 GitHub 정보 표시 (기본 꺼짐, -p 로 명시해야 적용)', s: 'render.BuildHeader', def: false, off: '0xa8a42c7, 0xa8a45e0, 0xa318180'}
+    {id: 'release-notes', t: '상단 배너 릴리즈 노트 표시 (Release Notes)', d: '로고 아래에 패치 기능 요약 및 GitHub 정보 표시 (기본 꺼짐, -p 로 명시해야 적용)', s: 'render.BuildHeader', def: false, off: '0xa8a42c7, 0xa8a45a0, 0xa318180'}
   ];
   var N = P.length, B = 1, ND = 0, TI = 4, CI = 5;
   var THEME_PRESETS = ['vs', 'solarized-light', 'bw', 'github', 'catppuccin-latte', 'xcode'];
