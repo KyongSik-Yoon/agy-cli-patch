@@ -1604,27 +1604,32 @@ fn resolve_banner(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
     match ctx.arch {
         Arch::X86_64 => {
             let (bwi_start, bwi_end) = ctx.get_func("render.BannerWithInfo")?;
-            let cave_offset = find_cave(ctx)?;
 
             // 제품명 옆 괄호 안에 표시: "Antigravity CLI 1.5.7 (patch v0.2.6)"
             let chan = format!("patch v{}", env!("CARGO_PKG_VERSION")).into_bytes();
             assert!(chan.len() <= CAVE_NOTES_OFF - CAVE_CHAN_OFF);
-            let chan_va = cave_offset + CAVE_CHAN_OFF;
-
-            let mut edits = vec![ByteEdit {
-                offset: chan_va,
-                payload: chan.clone(),
-            }];
 
             // BannerWithInfo 패치: 빈 채널 대신 주입된 채널 문자열 포맷 루틴 활성화
+            //   원본:   test %rdx,%rdx; je ..; mov %rbx,0x2b0(%rsp); mov %rax,..(%rsp); ... (55바이트)
+            //   패치 후: mov %rbx,0x2b0(%rsp); mov %rax,..(%rsp); lea chan(%rip),%rcx; mov $len,%edx; jmp +55; nop...
+            // 패치된 형태도 받아 패치본을 다시 패치할 수 있게 한다 (두 저장 명령의 위치만 다르다).
+            const STORE_RBX: [u8; 8] = [0x48, 0x89, 0x9c, 0x24, 0xb0, 0x02, 0x00, 0x00];
+            const STORE_RAX: [u8; 4] = [0x48, 0x89, 0x84, 0x24];
             let bwi_body = &ctx.data[bwi_start..bwi_end];
             let mut bwi_matches = Vec::new();
             for i in 0..bwi_body.len().saturating_sub(55) {
-                if &bwi_body[i..i + 5] == &[0x48, 0x85, 0xd2, 0x0f, 0x84]
-                    && &bwi_body[i + 9..i + 17] == &[0x48, 0x89, 0x9c, 0x24, 0xb0, 0x02, 0x00, 0x00]
-                    && &bwi_body[i + 17..i + 21] == &[0x48, 0x89, 0x84, 0x24]
+                let w = &bwi_body[i..i + 55];
+                if w[0..5] == [0x48, 0x85, 0xd2, 0x0f, 0x84] && w[9..17] == STORE_RBX && w[17..21] == STORE_RAX {
+                    bwi_matches.push((bwi_start + i, 9));
+                } else if w[0..8] == STORE_RBX
+                    && w[8..12] == STORE_RAX
+                    && w[16..19] == [0x48, 0x8d, 0x0d]
+                    && w[23] == 0xba
+                    && w[28] == 0xe9
+                    && read_i32(w, 29) == 55 - 33
+                    && w[33..].iter().all(|&b| b == 0x90)
                 {
-                    bwi_matches.push(bwi_start + i);
+                    bwi_matches.push((bwi_start + i, 0));
                 }
             }
             if bwi_matches.len() != 1 {
@@ -1633,16 +1638,33 @@ fn resolve_banner(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
                     bwi_matches.len()
                 ));
             }
-            let chan_site = bwi_matches[0];
+            let (chan_site, stores_off) = bwi_matches[0];
             let chan_site_end = chan_site + 55;
+
+            // 이미 패치돼 있으면 그때 lea 가 가리키던 채널 문자열 자리를 다시 쓴다. 동굴을 새로 찾으면
+            // 0xcc 패딩이 한 곳뿐인 버전(1.5.9·1.5.10·1.5.12)에서는 첫 패치가 그 자리를 써 버려 실패한다.
+            let chan_off = if stores_off == 0 {
+                let prev = usize::try_from(chan_site as i64 + 23 + read_i32(ctx.data, chan_site + 19) as i64).ok();
+                match prev.filter(|&p| ctx.data.get(p..).is_some_and(|s| s.starts_with(b"patch v"))) {
+                    Some(p) => p,
+                    None => return Err("BannerWithInfo 기존 패치가 가리키는 채널 문자열(\"patch v…\")을 찾을 수 없습니다.".into()),
+                }
+            } else {
+                find_cave(ctx)? + CAVE_CHAN_OFF
+            };
+            let mut edits = vec![ByteEdit {
+                offset: chan_off,
+                payload: chan.clone(),
+            }];
 
             // 원본은 채널 분기 진입 시 제품명 문자열(rax=ptr, rbx=len)을 스택 슬롯에 저장하고,
             // Sprintf 이후 그 슬롯을 다시 읽어 concatstring2 로 이어 붙인다.
             // 이 두 저장(mov %rbx,0x2b0(%rsp) / mov %rax,0x320(%rsp))을 건너뛰면
             // 초기화되지 않은 슬롯을 이어 붙이다 SIGSEGV 가 나므로 그대로 보존한다.
-            let mut chan_patch = ctx.data[chan_site + 9..chan_site + 25].to_vec();
+            let stores = chan_site + stores_off;
+            let mut chan_patch = ctx.data[stores..stores + 16].to_vec();
             let pc = chan_site + chan_patch.len() + 7;
-            let disp_chan = (chan_va as i64) - (pc as i64);
+            let disp_chan = (chan_off as i64) - (pc as i64);
             chan_patch.extend_from_slice(&[0x48, 0x8d, 0x0d]);
             chan_patch.extend_from_slice(&(disp_chan as i32).to_le_bytes());
 
@@ -4006,6 +4028,53 @@ mod tests {
         assert_eq!(edits.len(), 1);
         assert_eq!(edits[0].offset, site + 21);
         assert_eq!(edits[0].payload, vec![0x31, 0xc0, 0x31, 0xdb, 0x31, 0xc9, 0xc9, 0xc3]);
+    }
+
+    #[test]
+    fn resolve_banner_x86_repatches_already_patched_binary() {
+        let mut buf = vec![0u8; 4096];
+        buf[1024..2048].fill(0xcc); // 1.5.9 처럼 0xcc 패딩(동굴)이 딱 한 곳뿐인 경우
+        let (fn_start, fn_end) = (64usize, 256usize);
+        let site = fn_start + 16;
+        let stores: &[u8] = &[
+            0x48, 0x89, 0x9c, 0x24, 0xb0, 0x02, 0x00, 0x00, // mov %rbx,0x2b0(%rsp)
+            0x48, 0x89, 0x84, 0x24, 0x20, 0x03, 0x00, 0x00, // mov %rax,0x320(%rsp)
+        ];
+        buf[site..site + 9].copy_from_slice(&[0x48, 0x85, 0xd2, 0x0f, 0x84, 0x00, 0x01, 0x00, 0x00]); // test; je
+        buf[site + 9..site + 25].copy_from_slice(stores);
+        buf[site + 25..site + 55].fill(0xaa);
+
+        let chan = format!("patch v{}", env!("CARGO_PKG_VERSION"));
+        let mut first_round = Vec::new();
+        for round in 0..2 {
+            let edits = {
+                let mut funcs = HashMap::new();
+                funcs.insert("render.BannerWithInfo", (fn_start, fn_end));
+                let ctx = BinaryContext {
+                    data: &buf,
+                    format: Format::Elf64,
+                    arch: Arch::X86_64,
+                    segments: Vec::new(),
+                    funcs,
+                    compact_tokens: DEFAULT_COMPACT_TOKENS,
+                    code_theme: DEFAULT_CODE_THEME.to_string(),
+                };
+                resolve_banner(&ctx).unwrap_or_else(|e| panic!("{round}회차 banner 매칭 실패: {e}"))
+            };
+            apply(&mut buf, edits);
+
+            // 두 저장 명령이 맨 앞에 그대로 남고, lea 가 채널 문자열을, jmp 가 원래 분기 끝을 가리킨다
+            assert_eq!(&buf[site..site + 16], stores);
+            let chan_off = (site as i64 + 23 + read_i32(&buf, site + 19) as i64) as usize;
+            assert_eq!(&buf[chan_off..chan_off + chan.len()], chan.as_bytes());
+            assert_eq!(read_u32(&buf, site + 24), chan.len() as u32);
+            assert_eq!(site + 33 + read_i32(&buf, site + 29) as usize, site + 55);
+            assert_eq!(chan_off, 1024, "{round}회차: 첫 패치가 쓴 동굴을 다시 써야 함");
+            if round == 0 {
+                first_round = buf.clone();
+            }
+        }
+        assert_eq!(buf, first_round, "패치본을 다시 패치하면 결과가 같아야 함");
     }
 
     fn put_words(buf: &mut [u8], off: usize, insns: &[u32]) {
