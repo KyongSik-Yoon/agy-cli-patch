@@ -19,7 +19,7 @@
 | `pro-tier` | `modelutils.modelIDForTier` | `invoke_subagent` 등에서 `pro` 티어가 서버가 계정별로 정한 모델(예: `gemini-4-hydrogen-tiered-xhigh`) 대신 고른 모델(기본 `gemini-4-carbon-high`)로 실행되도록 고정 (x86_64 전용, **기본 꺼짐**) |
 | `flash-tier` | `modelutils.modelIDForTier` | `flash` 티어를 고른 모델(기본 `gemini-4-neon-medium`)로 고정. `flash_lite`가 없을 때 agy 유틸리티 작업도 이 티어를 씀 (x86_64 전용, Neon은 1.5.12+, **기본 꺼짐**) |
 | `flash-lite-tier` | `modelutils.modelIDForTier` | `flash_lite` 티어를 고른 모델(기본 `gemini-4-hydrogen-low`)로 고정. agy 유틸리티 작업도 이 티어를 먼저 씀 (x86_64 전용, Hydrogen은 1.5.9+, **기본 꺼짐**) |
-| `banner` | `render.BannerWithInfo` | 상단 `Antigravity CLI 1.5.7` 옆에 `(patch v0.2.8)` 형태로 패치 버전 표시 (Linux ARM64 제외) |
+| `banner` | `render.BannerWithInfo` | 상단 `Antigravity CLI 1.5.7` 옆에 `(patch v0.2.9)` 형태로 패치 버전 표시 (Linux ARM64 제외) |
 | `release-notes` | `render.BuildHeader` | 로고 아래에 패치 기능 요약 및 GitHub 저장소 정보 표시 (Linux ARM64 제외, **기본 꺼짐** — `-p all,release-notes`처럼 명시해야 적용) |
 
 ## 설치 및 빌드
