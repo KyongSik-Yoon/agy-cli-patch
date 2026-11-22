@@ -1919,6 +1919,8 @@ fn which_in_path(cmd: &str) -> Option<PathBuf> {
     None
 }
 
+const VERSION_UNKNOWN: &str = "확인 불가";
+
 fn binary_version(path: &Path) -> String {
     Command::new(path)
         .arg("--version")
@@ -1930,7 +1932,19 @@ fn binary_version(path: &Path) -> String {
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .and_then(|s| s.lines().next().map(|l| l.trim().to_string()))
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "확인 불가".to_string())
+        .unwrap_or_else(|| VERSION_UNKNOWN.to_string())
+}
+
+/// `--in-place` 백업을 대상 바이너리로 새로 써야 하는지 판정한다.
+/// 패치본은 언제나 백업에서 만들어지므로 백업과 버전이 같다. 버전이 달라졌다면 agy 자체 업데이트가
+/// 대상을 새 릴리즈 원본으로 바꾼 것이다. 패치 자리 하나(nodrip)만 보고 판정하면 nodrip 을 뺀 조합으로
+/// in-place 한 패치본을 원본으로 오인해 하나뿐인 원본 백업을 덮어쓴다.
+/// 버전을 알 수 없으면 백업을 지키는 쪽으로 갱신하지 않는다.
+fn should_refresh_backup(target_version: &str, backup_version: &str, target_cut_unpatched: bool) -> bool {
+    target_cut_unpatched
+        && target_version != VERSION_UNKNOWN
+        && backup_version != VERSION_UNKNOWN
+        && target_version != backup_version
 }
 
 fn detect_default_binary() -> PathBuf {
@@ -3566,28 +3580,28 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
 
-    // 새 릴리즈 업데이트 시 backup_bin 자동 갱신
-    if backup_bin.exists() && target_bin != backup_bin {
-        let cur_mmap = MmapFile::open(&target_bin)?;
-        let cur_ctx = BinaryContext::parse(cur_mmap.as_slice())?;
-        if is_unpatched_cut(&cur_ctx)? {
-            copy_reflink(&target_bin, &backup_bin)?;
-        }
-    }
-
-    let src_bin = if target_bin != backup_bin && backup_bin.exists() {
-        backup_bin.clone()
-    } else {
-        target_bin.clone()
-    };
-
     // mise 설치 디렉토리명(예: 1.5.6)은 agy 자체 업데이트 후 실제 버전과 어긋날 수 있으므로
     // 바이너리가 보고하는 버전을 함께 출력한다.
     let target_version = binary_version(&target_bin);
     println!("[*] 대상 바이너리: {} (버전 {})", target_bin.display(), target_version);
-    if src_bin != target_bin {
-        println!("[*] 패치 원본:     {} (버전 {})", src_bin.display(), binary_version(&src_bin));
+
+    let has_backup = target_bin != backup_bin && backup_bin.exists();
+    if has_backup {
+        let mut backup_version = binary_version(&backup_bin);
+        // agy 자체 업데이트로 대상이 새 릴리즈 원본으로 바뀌었으면 백업도 그 원본으로 갱신한다
+        if target_version != backup_version {
+            let cur_mmap = MmapFile::open(&target_bin)?;
+            let cur_ctx = BinaryContext::parse(cur_mmap.as_slice())?;
+            if should_refresh_backup(&target_version, &backup_version, is_unpatched_cut(&cur_ctx)?) {
+                copy_reflink(&target_bin, &backup_bin)?;
+                println!("[+] agy 업데이트 감지: 원본 백업 갱신 ({backup_version} -> {target_version})");
+                backup_version = target_version.clone();
+            }
+        }
+        println!("[*] 패치 원본:     {} (버전 {})", backup_bin.display(), backup_version);
     }
+
+    let src_bin = if has_backup { backup_bin.clone() } else { target_bin.clone() };
 
     let mmap = MmapFile::open(&src_bin)?;
     let mut ctx = BinaryContext::parse(mmap.as_slice())?;
@@ -3714,6 +3728,19 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backup_refreshes_only_when_agy_updated_to_another_version() {
+        // agy 자체 업데이트: 버전이 바뀌었고 패치가 풀린 원본
+        assert!(should_refresh_backup("1.5.13", "1.5.12", true));
+        // nodrip 을 뺀 조합으로 in-place 한 패치본: nodrip 자리는 원본이지만 백업과 같은 버전이므로 지킨다
+        assert!(!should_refresh_backup("1.5.13", "1.5.13", true));
+        // 다른 버전이라도 nodrip 이 패치돼 있으면 원본이 아니다
+        assert!(!should_refresh_backup("1.5.13", "1.5.12", false));
+        // 버전을 알 수 없으면 덮어쓰지 않는다
+        assert!(!should_refresh_backup(VERSION_UNKNOWN, "1.5.12", true));
+        assert!(!should_refresh_backup("1.5.13", VERSION_UNKNOWN, true));
+    }
 
     #[test]
     fn compact_token_parser_supports_suffixes_and_validates_range() {
