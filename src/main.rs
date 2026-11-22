@@ -1415,7 +1415,7 @@ fn resolve_compact(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
 // invoke_subagent·사용자 정의 에이전트(model: pro)·훅 등은 모델을 티어(inherit/flash_lite/flash/pro)로만 받고,
 // modelutils.modelIDForTier 가 서버가 계정별로 내려주는 TieredModelConfig 의 티어별 모델 목록 첫 항목을 고른다.
 // 로컬에서 이 목록을 덮는 설정(admin_settings.json models.tiers, AGY_LLM_GATEWAY_TIER_PRO)은 LLM 게이트웨이
-// 모드에서만 쓰이므로, PRO(=4) 분기가 지정한 모델 ID 를 바로 돌려주게 바꾼다.
+// 모드에서만 읽히므로(gateway.applyConfiguredModelTiers 가 유일한 사용처, 정적 분석 기준), PRO(=4) 분기가 지정한 모델 ID 를 바로 돌려주게 바꾼다.
 
 const DEFAULT_PRO_TIER_MODEL: &str = "gemini-4-carbon-high";
 const PRO_TIER_PRESETS: &[&str] = &["gemini-4-carbon-high", "gemini-4-carbon-medium", "gemini-4-carbon-low"];

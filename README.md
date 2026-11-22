@@ -145,9 +145,9 @@ AGY_CLI_DISABLE_AUTO_UPDATE = "true"
 ### `pro-tier`가 바꾸는 범위
 
 - `invoke_subagent`, 사용자 정의 에이전트 frontmatter의 `model:`, 훅의 model은 모두 티어(`inherit`/`flash_lite`/`flash`/`pro`)로만 모델을 받고, 실제 모델은 서버가 계정별로 내려주는 티어 목록에서 고릅니다. `pro-tier`는 그중 `pro` 티어가 고른 모델을 돌려주게 바꾸므로, 다른 기능(유틸리티 모델, PolicyGuardian 판정 등)이 `pro` 티어를 고를 때도 같은 모델을 씁니다.
-- 모델 ID는 바이너리에 문자열로 들어 있는 것만 쓸 수 있습니다(새 코드를 넣지 않고 기존 문자열을 가리키기 때문). 없는 ID를 주면 패치하지 않고 알립니다. 서버 모델 목록(`agy models`)에 없는 ID를 고르면 서브에이전트를 띄울 때 모델을 찾지 못해 실패하므로 `agy models`에 나오는 ID를 쓰세요.
+- 모델 ID는 바이너리에 문자열로 들어 있는 것만 쓸 수 있습니다(새 코드를 넣지 않고 기존 문자열을 가리키기 때문). 없는 ID를 주면 패치하지 않고 알립니다. 서버 모델 목록(`agy models`)에 없는 ID는 서브에이전트를 띄울 때 모델을 찾지 못해 실패할 수 있으니 `agy models`에 나오는 ID를 쓰세요.
 - PreToolUse 훅이 `invoke_subagent`의 `Model` 인자를 다른 티어로 바꾸면 그 티어가 쓰입니다. 실행 결과에 `A pre-tool hook changed the arguments of this tool call` 이 보이면 훅이 바꾼 것입니다.
-- 로컬 설정으로 티어를 바꾸는 장치(`admin_settings.json`의 `models.tiers`, `AGY_LLM_GATEWAY_TIER_PRO`)는 LLM 게이트웨이 모드에서만 쓰여 일반 로그인 환경에서는 효과가 없습니다.
+- 로컬 설정으로 티어를 바꾸는 장치(`admin_settings.json`의 `models.tiers`, `AGY_LLM_GATEWAY_TIER_PRO`)는 바이너리를 분석해 보면 LLM 게이트웨이 모드에서만 읽혀, 일반 로그인 환경에서는 효과가 없는 것으로 보입니다.
 
 ### remote-control 데몬
 
