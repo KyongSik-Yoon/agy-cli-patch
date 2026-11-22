@@ -214,12 +214,14 @@ struct BinaryContext<'a> {
     code_theme: String,
     /// TIERS 순서 (pro, flash, flash_lite)
     tier_models: [String; 3],
+    /// Go 코드가 든 코드 섹션(ELF `.text`, Mach-O `__text`)의 파일 범위 [시작, 끝)
+    text_section: Option<(usize, usize)>,
 }
 
 impl<'a> BinaryContext<'a> {
     fn parse(data: &'a [u8]) -> Result<Self, String> {
         let mut segments = Vec::new();
-        let (format, arch, text_va, text_off) = if &data[..4] == b"\x7fELF" {
+        let (format, arch, text_va, text_off, text_size) = if &data[..4] == b"\x7fELF" {
             let e_machine = read_u16(data, 0x12);
             let arch = match e_machine {
                 0x3e => Arch::X86_64,
@@ -266,20 +268,22 @@ impl<'a> BinaryContext<'a> {
 
             let mut t_va = 0usize;
             let mut t_off = 0usize;
+            let mut t_size = 0usize;
             for i in 0..e_shnum {
-                let (sh_name, sh_addr, sh_off, _) = shdr(i);
+                let (sh_name, sh_addr, sh_off, sh_size) = shdr(i);
                 let s = &shstr[sh_name as usize..];
                 let end = s.iter().position(|&b| b == 0).unwrap_or(s.len());
                 if &s[..end] == b".text" {
                     t_va = sh_addr as usize;
                     t_off = sh_off as usize;
+                    t_size = sh_size as usize;
                     break;
                 }
             }
             if t_off == 0 {
                 return Err("ELF .text 섹션을 찾을 수 없습니다.".into());
             }
-            (Format::Elf64, arch, t_va, t_off)
+            (Format::Elf64, arch, t_va, t_off, t_size)
         } else if read_u32(data, 0) == 0xfeedfacf {
             let cputype = read_u32(data, 4);
             let arch = match cputype {
@@ -292,6 +296,7 @@ impl<'a> BinaryContext<'a> {
             let mut off = 32usize;
             let mut t_va = 0usize;
             let mut t_off = 0usize;
+            let mut t_size = 0usize;
             for _ in 0..ncmds {
                 let cmd = read_u32(data, off);
                 let cmdsize = read_u32(data, off + 4) as usize;
@@ -311,6 +316,7 @@ impl<'a> BinaryContext<'a> {
                         let end = sectname.iter().position(|&b| b == 0).unwrap_or(16);
                         if &sectname[..end] == b"__text" {
                             t_va = read_u64(data, sect_off + 32) as usize;
+                            t_size = read_u64(data, sect_off + 40) as usize;
                             t_off = read_u32(data, sect_off + 48) as usize;
                             break;
                         }
@@ -322,7 +328,7 @@ impl<'a> BinaryContext<'a> {
             if t_off == 0 {
                 return Err("Mach-O __text 섹션을 찾을 수 없습니다.".into());
             }
-            (Format::MachO64, arch, t_va, t_off)
+            (Format::MachO64, arch, t_va, t_off, t_size)
         } else {
             return Err("지원하지 않는 바이너리 포맷입니다 (ELF64 또는 Mach-O 64 필요).".into());
         };
@@ -432,6 +438,7 @@ impl<'a> BinaryContext<'a> {
             compact_tokens: DEFAULT_COMPACT_TOKENS,
             code_theme: DEFAULT_CODE_THEME.to_string(),
             tier_models: default_tier_models(),
+            text_section: Some((text_off, (text_off + text_size).min(data.len()))),
         })
     }
 
@@ -1923,14 +1930,13 @@ fn cc_run_end(data: &[u8], from: usize) -> usize {
     from + data.get(from..).map_or(0, |s| s.iter().take_while(|&&b| b == 0xcc).count())
 }
 
-/// 코드 세그먼트(BuildHeader 가 있는 세그먼트) 안의 0xcc 구간 [시작, 끝), 파일 순서 (16바이트 이상만)
+/// 코드 섹션(`.text` / `__text`) 안의 0xcc 구간 [시작, 끝), 파일 순서 (16바이트 이상만).
+/// 같은 실행 세그먼트에 .rodata·__go_type 같은 데이터도 있어서, 함수 사이 패딩만 보도록 코드 섹션으로 좁힌다.
+/// Go 함수 표 범위보다 넓게 잡는 이유: 1.5.14 linux_x64 의 쓸 만한 패딩(877바이트)은 Go 코드 뒤,
+/// 함께 링크된 C 코드 사이에서 페이지 경계까지 채운 0xcc 다.
 fn code_cc_runs(ctx: &BinaryContext) -> Result<Vec<(usize, usize)>, String> {
-    let (anchor, _) = ctx.get_func("render.BuildHeader")?;
-    let (lo, hi) = ctx
-        .segments
-        .iter()
-        .find(|&&(off, _, size)| off <= anchor && anchor < off + size)
-        .map_or((0, ctx.data.len()), |&(off, _, size)| (off, (off + size).min(ctx.data.len())));
+    let (lo, hi) = ctx.text_section.unwrap_or((0, ctx.data.len()));
+    let hi = hi.min(ctx.data.len());
     let d = &ctx.data[..hi];
     let mut runs = Vec::new();
     let mut i = lo;
@@ -4539,6 +4545,7 @@ mod tests {
             compact_tokens: DEFAULT_COMPACT_TOKENS,
             code_theme: DEFAULT_CODE_THEME.to_string(),
             tier_models: default_tier_models(),
+            text_section: None,
         };
         assert_eq!(
             available_model_ids(&ctx),
@@ -4558,6 +4565,7 @@ mod tests {
             compact_tokens: DEFAULT_COMPACT_TOKENS,
             code_theme: DEFAULT_CODE_THEME.to_string(),
             tier_models: models.map(str::to_string),
+            text_section: None,
         }
     }
 
@@ -4671,6 +4679,7 @@ mod tests {
                 compact_tokens: DEFAULT_COMPACT_TOKENS,
                 code_theme: DEFAULT_CODE_THEME.to_string(),
                 tier_models: [model.to_string(), TIERS[1].default_model.to_string(), TIERS[2].default_model.to_string()],
+                text_section: None,
             };
             resolve_pro_tier(&ctx)
         };
@@ -4684,6 +4693,7 @@ mod tests {
                 compact_tokens: DEFAULT_COMPACT_TOKENS,
                 code_theme: DEFAULT_CODE_THEME.to_string(),
                 tier_models: default_tier_models(),
+                text_section: None,
             }, 0)
         };
 
@@ -4772,6 +4782,7 @@ mod tests {
                 compact_tokens: tokens,
                 code_theme: DEFAULT_CODE_THEME.to_string(),
                 tier_models: default_tier_models(),
+                text_section: None,
             };
             let edits = resolve_compact(&ctx).expect("합성 바이너리에서 compact 매칭이 성공해야 함");
             assert_eq!(edits.len(), 4);
@@ -4863,6 +4874,7 @@ mod tests {
                 compact_tokens: DEFAULT_COMPACT_TOKENS,
                 code_theme: theme.to_string(),
                 tier_models: default_tier_models(),
+                text_section: None,
             }
         }
 
@@ -4944,6 +4956,7 @@ mod tests {
             compact_tokens: DEFAULT_COMPACT_TOKENS,
             code_theme: "vs".to_string(),
             tier_models: default_tier_models(),
+            text_section: None,
         };
         let edits = resolve_code_theme(&ctx).expect("정렬용 NOP이 있어도 code-theme 매칭이 성공해야 함");
         assert_eq!(edits.len(), 2);
@@ -4992,6 +5005,7 @@ mod tests {
                 compact_tokens: DEFAULT_COMPACT_TOKENS,
                 code_theme: theme.to_string(),
                 tier_models: default_tier_models(),
+                text_section: None,
             }
         }
         let ctx_for = |buf, theme| ctx_at(buf, theme, (fn_start, fn_end));
@@ -5038,6 +5052,7 @@ mod tests {
             compact_tokens: DEFAULT_COMPACT_TOKENS,
             code_theme: "vs".to_string(),
             tier_models: default_tier_models(),
+            text_section: None,
         };
         let edits = resolve_batch(&ctx).expect("정렬용 NOP이 있어도 batch 매칭이 성공해야 함");
         assert_eq!(edits.len(), 1);
@@ -5074,6 +5089,7 @@ mod tests {
                     compact_tokens: DEFAULT_COMPACT_TOKENS,
                     code_theme: DEFAULT_CODE_THEME.to_string(),
                     tier_models: default_tier_models(),
+                    text_section: None,
                 };
                 resolve_banner(&ctx).unwrap_or_else(|e| panic!("{round}회차 banner 매칭 실패: {e}"))
             };
@@ -5107,6 +5123,7 @@ mod tests {
                 compact_tokens: DEFAULT_COMPACT_TOKENS,
                 code_theme: DEFAULT_CODE_THEME.to_string(),
                 tier_models: default_tier_models(),
+                text_section: None,
             };
             let mut all = Vec::new();
             for r in resolvers {
@@ -5175,6 +5192,27 @@ mod tests {
         let chan_off = (site as i64 + 23 + read_i32(&odd, site + 19) as i64) as usize;
         assert_eq!(chan_off, cave + CAVE_CHAN_OFF + 1);
         assert!((0..odd.len()).filter(|&i| odd[i] != before[i]).all(|i| (site..site + 55).contains(&i) || before[i] == 0xcc));
+    }
+
+    #[test]
+    fn code_cc_runs_stay_inside_code_section() {
+        // 같은 실행 세그먼트의 데이터(.rodata 등)에 있는 0xcc 는 패딩이 아니므로 고르지 않는다
+        let mut buf = vec![0u8; 4096];
+        buf[100..140].fill(0xcc); // 코드 섹션 앞 (데이터)
+        buf[1100..1140].fill(0xcc); // 코드 섹션 안
+        buf[1990..2030].fill(0xcc); // 섹션 끝에 걸침 → 섹션 안쪽 10바이트만 남아 너무 짧다
+        let ctx = BinaryContext {
+            data: &buf,
+            format: Format::Elf64,
+            arch: Arch::X86_64,
+            segments: Vec::new(),
+            funcs: HashMap::new(),
+            compact_tokens: DEFAULT_COMPACT_TOKENS,
+            code_theme: DEFAULT_CODE_THEME.to_string(),
+            tier_models: default_tier_models(),
+            text_section: Some((1024, 2000)),
+        };
+        assert_eq!(code_cc_runs(&ctx), Ok(vec![(1100, 1140)]));
     }
 
     #[test]
@@ -5261,6 +5299,7 @@ mod tests {
             compact_tokens: tokens,
             code_theme: theme.to_string(),
             tier_models: default_tier_models(),
+            text_section: None,
         }
     }
 
