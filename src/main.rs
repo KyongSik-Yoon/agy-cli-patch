@@ -1616,38 +1616,138 @@ fn find_tier_site_x86(ctx: &BinaryContext, tier: u8) -> Result<(usize, usize, bo
     Ok(matches[0])
 }
 
+/// ARM64 modelIDForTier 의 티어 분기 (`cmp w1, #tier; b.ne ..` 바로 뒤). macOS·Linux 빌드가 같다.
+///   공통 머리: cbz x0,+12; ldp x4,x5,[x0,#X]; b +12; mov x5,xzr; mov x4,xzr
+///   flash 계열: cbz x5,empty; ldp x0,x1,[x4]; <반환 꼬리>
+///   PRO:        cbnz x5,ok   (뒤따르는 공용 빈 반환 블록은 다른 티어도 쓴다), ok: ldp x0,x1,[x4]; <반환 꼬리>
+///   반환 꼬리:  mov x2,xzr; mov x3,xzr; ldur x29,[sp,#-8]; ldr x30,[sp],#N; ret   (error = nil 후 복귀)
+///   패치 후(앞 4워드): adrp x0,model; add x0,x0,#lo; movz x1,#len; b <반환 꼬리>
+/// 반환값: (본문 시작, 반환 꼬리 위치, 이미 패치됐는지)
+fn find_tier_site_a64(ctx: &BinaryContext, tier: u8) -> Result<(usize, usize, bool), String> {
+    const LDP_X0_X1_X4: u32 = 0xa940_0480;
+    let d = ctx.data;
+    let is_ret_tail = |t: usize| {
+        t + 20 <= d.len()
+            && word(d, t) == 0xaa1f_03e2
+            && word(d, t + 4) == 0xaa1f_03e3
+            && word(d, t + 8) == 0xf85f_83fd
+            && word(d, t + 12) & 0xffe0_0fff == 0xf840_07fe
+            && word(d, t + 16) == 0xd65f_03c0
+    };
+    let (start, end) = ctx.get_func("modelutils.modelIDForTier")?;
+    let cmp = 0x7100_003f | (u32::from(tier) << 10); // cmp w1, #tier
+    let mut matches = Vec::new();
+    let mut off = start;
+    while off + 8 + 24 <= end {
+        if word(d, off) != cmp || a64::bcond(word(d, off + 4)) != Some(a64::COND_NE) {
+            off += 4;
+            continue;
+        }
+        let body = off + 8;
+        let w = |k: usize| word(d, body + k * 4);
+        let head = w(0) == 0xb400_0060
+            && w(1) & 0xffc0_7fff == 0xa940_1404
+            && w(2) == 0x1400_0003
+            && w(3) == 0xaa1f_03e5
+            && w(4) == 0xaa1f_03e4;
+        let found = if head && w(5) & 0xff00_001f == 0xb400_0005 && w(6) == LDP_X0_X1_X4 && is_ret_tail(body + 28) {
+            Some((body + 28, false))
+        } else if head && w(5) & 0xff00_001f == 0xb500_0005 {
+            let ok = a64::bcond_target(w(5), body + 20); // cbnz 도 imm19 위치가 b.cond 와 같다
+            (word(d, ok) == LDP_X0_X1_X4 && is_ret_tail(ok + 4)).then_some((ok + 4, false))
+        } else if a64::is_adrp(w(0))
+            && a64::rd(w(0)) == 0
+            && a64::is_add_imm(w(1))
+            && a64::rd(w(1)) == 0
+            && a64::add_rn(w(1)) == 0
+            && a64::is_movz(w(2))
+            && a64::rd(w(2)) == 1
+            && a64::is_b(w(3))
+        {
+            // 이미 패치됨: b 의 목적지가 반환 꼬리
+            ctx.off_to_va(body + 12)
+                .map(|pc| a64::branch26_target(w(3), pc))
+                .and_then(|t| ctx.va_to_off(t))
+                .filter(|&t| is_ret_tail(t))
+                .map(|t| (t, true))
+        } else {
+            None
+        };
+        if let Some((tail, patched)) = found {
+            matches.push((body, tail, patched));
+        }
+        off += 4;
+    }
+    if matches.len() != 1 {
+        return Err(format!("modelIDForTier ARM64 티어 {tier} 분기 패턴 매칭 실패 (매칭 수: {})", matches.len()));
+    }
+    Ok(matches[0])
+}
+
+/// 이 바이너리에서 티어 분기를 찾을 수 있는지 (아키텍처별)
+fn tier_site_found(ctx: &BinaryContext, tier: u8) -> bool {
+    match ctx.arch {
+        Arch::X86_64 => find_tier_site_x86(ctx, tier).is_ok(),
+        Arch::Arm64 => find_tier_site_a64(ctx, tier).is_ok(),
+    }
+}
+
 /// 이미 티어 고정 패치가 돼 있으면 고정된 모델 ID
 fn detect_patched_tier(ctx: &BinaryContext, ti: usize) -> Option<String> {
-    if ctx.arch != Arch::X86_64 {
-        return None;
-    }
-    let (site, _, true) = find_tier_site_x86(ctx, TIERS[ti].tier).ok()? else {
-        return None;
+    let tier = TIERS[ti].tier;
+    let (str_va, len) = match ctx.arch {
+        Arch::X86_64 => {
+            let (site, _, true) = find_tier_site_x86(ctx, tier).ok()? else {
+                return None;
+            };
+            let pc = ctx.off_to_va(site + 7)? as i64;
+            (usize::try_from(pc + read_i32(ctx.data, site + 3) as i64).ok()?, read_u32(ctx.data, site + 8) as usize)
+        }
+        Arch::Arm64 => {
+            let (body, _, true) = find_tier_site_a64(ctx, tier).ok()? else {
+                return None;
+            };
+            let page = a64::adrp_target(word(ctx.data, body), ctx.off_to_va(body)?);
+            (page + a64::add_imm12(word(ctx.data, body + 4)), a64::imm16(word(ctx.data, body + 8)) as usize)
+        }
     };
-    let pc = ctx.off_to_va(site + 7)? as i64;
-    let str_off = ctx.va_to_off(usize::try_from(pc + read_i32(ctx.data, site + 3) as i64).ok()?)?;
-    let len = read_u32(ctx.data, site + 8) as usize;
+    let str_off = ctx.va_to_off(str_va)?;
     std::str::from_utf8(ctx.data.get(str_off..str_off + len)?).ok().map(str::to_string)
 }
 
 fn resolve_tier(ctx: &BinaryContext, ti: usize) -> Result<Vec<ByteEdit>, String> {
     let spec = &TIERS[ti];
-    if ctx.arch != Arch::X86_64 {
-        return Err(format!("{} 패치는 아직 x86_64 만 지원합니다.", spec.id));
-    }
-    let (site, len, _) = find_tier_site_x86(ctx, spec.tier)?;
     let model = &ctx.tier_models[ti];
     let model_off = find_model_id_offset(ctx, model)?;
     let model_va = ctx.off_to_va(model_off).ok_or("모델 ID 문자열 가상주소 변환 실패")?;
-    let pc = ctx.off_to_va(site + 7).ok_or("LEA 명령어 가상주소 변환 실패")?;
-    let disp = i32::try_from(model_va as i64 - pc as i64).map_err(|_| "RIP 상대 변위 범위 초과".to_string())?;
-    let mut code = vec![0x48, 0x8d, 0x05]; // lea model(%rip),%rax
-    code.extend_from_slice(&disp.to_le_bytes());
-    code.push(0xbb); // mov $len,%ebx
-    code.extend_from_slice(&(model.len() as u32).to_le_bytes());
-    code.extend_from_slice(&[0x31, 0xc9, 0x31, 0xff, 0xc9, 0xc3]); // error = nil; leave; ret
-    code.resize(len, 0xcc);
-    Ok(vec![ByteEdit { offset: site, payload: code }])
+    match ctx.arch {
+        Arch::X86_64 => {
+            let (site, len, _) = find_tier_site_x86(ctx, spec.tier)?;
+            let pc = ctx.off_to_va(site + 7).ok_or("LEA 명령어 가상주소 변환 실패")?;
+            let disp = i32::try_from(model_va as i64 - pc as i64).map_err(|_| "RIP 상대 변위 범위 초과".to_string())?;
+            let mut code = vec![0x48, 0x8d, 0x05]; // lea model(%rip),%rax
+            code.extend_from_slice(&disp.to_le_bytes());
+            code.push(0xbb); // mov $len,%ebx
+            code.extend_from_slice(&(model.len() as u32).to_le_bytes());
+            code.extend_from_slice(&[0x31, 0xc9, 0x31, 0xff, 0xc9, 0xc3]); // error = nil; leave; ret
+            code.resize(len, 0xcc);
+            Ok(vec![ByteEdit { offset: site, payload: code }])
+        }
+        Arch::Arm64 => {
+            let (body, tail, _) = find_tier_site_a64(ctx, spec.tier)?;
+            let pc = ctx.off_to_va(body).ok_or("ADRP 명령어 가상주소 변환 실패")?;
+            let tail_va = ctx.off_to_va(tail).ok_or("반환 꼬리 가상주소 변환 실패")?;
+            Ok(vec![ByteEdit {
+                offset: body,
+                payload: words(&[
+                    a64::adrp(0, pc, model_va)?,
+                    a64::add_imm(0, 0, model_va & 0xfff),
+                    a64::movz(1, model.len() as u32),
+                    a64::b(pc + 12, tail_va)?,
+                ]),
+            }])
+        }
+    }
 }
 
 /// `--tiers` 출력: 이 바이너리에 고정된 티어만 `pro=…,flash=…,flash_lite=…` 로 (없으면 빈 문자열).
@@ -2190,7 +2290,7 @@ const PATCH_REGISTRY: &[PatchSpec] = &[
     PatchSpec {
         id: "pro-tier",
         title: "서브에이전트 pro 티어 모델 고정 (Pro Tier Model)",
-        description: "invoke_subagent 등에서 'pro' 티어가 서버 지정 모델 대신 고른 모델(기본 gemini-4-carbon-high)로 실행되도록 고정 (기본 꺼짐, x86_64 전용)",
+        description: "invoke_subagent 등에서 'pro' 티어가 서버 지정 모델 대신 고른 모델(기본 gemini-4-carbon-high)로 실행되도록 고정 (기본 꺼짐)",
         symbol: "modelutils.modelIDForTier",
         default_on: false,
         resolver: resolve_pro_tier,
@@ -2198,7 +2298,7 @@ const PATCH_REGISTRY: &[PatchSpec] = &[
     PatchSpec {
         id: "flash-tier",
         title: "서브에이전트 flash 티어 모델 고정 (Flash Tier Model)",
-        description: "'flash' 티어를 고른 모델(기본 gemini-4-neon-medium)로 고정. flash_lite 가 없을 때 agy 유틸리티 작업도 이 티어를 씀 (기본 꺼짐, x86_64 전용)",
+        description: "'flash' 티어를 고른 모델(기본 gemini-4-neon-medium)로 고정. flash_lite 가 없을 때 agy 유틸리티 작업도 이 티어를 씀 (기본 꺼짐)",
         symbol: "modelutils.modelIDForTier",
         default_on: false,
         resolver: resolve_flash_tier,
@@ -2206,7 +2306,7 @@ const PATCH_REGISTRY: &[PatchSpec] = &[
     PatchSpec {
         id: "flash-lite-tier",
         title: "서브에이전트 flash_lite 티어 모델 고정 (Flash-Lite Tier Model)",
-        description: "'flash_lite' 티어를 고른 모델(기본 gemini-4-hydrogen-low)로 고정. agy 유틸리티 작업도 이 티어를 먼저 씀 (기본 꺼짐, x86_64 전용)",
+        description: "'flash_lite' 티어를 고른 모델(기본 gemini-4-hydrogen-low)로 고정. agy 유틸리티 작업도 이 티어를 먼저 씀 (기본 꺼짐)",
         symbol: "modelutils.modelIDForTier",
         default_on: false,
         resolver: resolve_flash_lite_tier,
@@ -2995,8 +3095,8 @@ fn append_inline_param(
 
 impl<'a> Wizard<'a> {
     fn new(src_bin: &'a Path, target_bin: &'a Path, bin_dir: &'a Path, version: &'a str, ctx: &'a BinaryContext<'a>) -> Self {
-        // 티어 고정 패치에 고를 모델 ID. 쓸 수 없는 바이너리(ARM64 등)에서는 수백 MB 를 훑지 않는다
-        let model_presets = if ctx.arch == Arch::X86_64 { available_model_ids(ctx) } else { Vec::new() };
+        // 티어 고정 패치에 고를 모델 ID (바이너리에 문자열로 들어 있는 것만)
+        let model_presets = available_model_ids(ctx);
         let avail: Vec<Result<(), String>> = PATCH_REGISTRY
             .iter()
             .map(|p| {
@@ -3005,9 +3105,8 @@ impl<'a> Wizard<'a> {
                     // 기본 모델이 이 바이너리에 없어도 고를 모델이 있으면 줄은 쓸 수 있다 (켤 때 값을 검사한다)
                     Some(ti)
                         if r.is_err()
-                            && ctx.arch == Arch::X86_64
                             && !model_presets.is_empty()
-                            && find_tier_site_x86(ctx, TIERS[ti].tier).is_ok() =>
+                            && tier_site_found(ctx, TIERS[ti].tier) =>
                     {
                         Ok(())
                     }
@@ -5031,4 +5130,77 @@ mod tests {
             assert_eq!(detect_patched_code_theme(&a64_ctx(&buf, &funcs, 0, theme)).as_deref(), Some(theme));
         }
     }
+
+    #[test]
+    fn a64_all_three_tiers_patch_and_repatch() {
+        // agy 1.5.13 macOS·Linux ARM64 modelIDForTier 와 같은 모양
+        const RET_TAIL: [u32; 5] = [0xaa1f_03e2, 0xaa1f_03e3, 0xf85f_83fd, 0xf845_07fe, 0xd65f_03c0];
+        let head = |field: u32| [0xb400_0060, 0xa940_1404 | (field / 8) << 15, 0x1400_0003, 0xaa1f_03e5, 0xaa1f_03e4];
+        let mut code: Vec<u32> = vec![0xf940_0b90, 0xeb30_63ff, 0x5400_0ae9, 0xf81b_0ffe, 0xf81f_83fd, 0xd100_23fd];
+        for (tier, field) in [(2u32, 8u32), (3, 0x20)] {
+            code.extend([0x7100_003f | tier << 10, 0x5400_01a1]); // cmp w1,#tier; b.ne 다음 티어
+            code.extend(head(field));
+            code.extend([0xb400_0005 | 0x3f << 5, 0xa940_0480]); // cbz x5,empty; ldp x0,x1,[x4]
+            code.extend(RET_TAIL);
+        }
+        code.extend([0x7100_103f, 0x5400_0281]);
+        code.extend(head(0x38));
+        code.push(0xb500_0005 | 8 << 5); // cbnz x5, ok(+0x20)
+        code.extend([0xaa1f_03e0, 0xaa1f_03e1, 0xaa1f_03e2, 0xaa1f_03e3, 0xf85f_83fd, 0xf845_07fe, 0xd65f_03c0]); // 공용 빈 반환
+        code.push(0xa940_0480); // ok: ldp x0,x1,[x4]
+        code.extend(RET_TAIL);
+
+        let mut buf = vec![0u8; 0x3000];
+        let fn_start = 0x100;
+        put_words(&mut buf, fn_start, &code);
+        let strings = b"gemini-4-carbon-highgemini-4-neon-mediumgemini-4-hydrogen-lowgemini-4-carbon-low";
+        buf[0x2345..0x2345 + strings.len()].copy_from_slice(strings);
+        let original = buf.clone();
+        let funcs = [("modelutils.modelIDForTier", fn_start, fn_start + code.len() * 4 + 16)];
+        let ctx_with = |buf: &[u8], models: [&str; 3]| -> Vec<ByteEdit> {
+            let mut ctx = a64_ctx(buf, &funcs, DEFAULT_COMPACT_TOKENS, DEFAULT_CODE_THEME);
+            ctx.tier_models = models.map(str::to_string);
+            [resolve_pro_tier, resolve_flash_tier, resolve_flash_lite_tier].iter().flat_map(|r| r(&ctx).unwrap()).collect()
+        };
+        let defaults = TIERS.map(|t| t.default_model);
+        // TIERS 순서(pro, flash, flash_lite)의 본문 시작과 반환 꼬리
+        let bodies = [fn_start + 4 * (6 + 2 * 14 + 2), fn_start + 4 * (6 + 14 + 2), fn_start + 4 * (6 + 2)]; // 티어 2·3 덩어리는 14워드
+        let tails = [bodies[0] + 4 * (6 + 7 + 1), bodies[1] + 28, bodies[2] + 28];
+        let a64 = a64_ctx(&buf, &funcs, DEFAULT_COMPACT_TOKENS, DEFAULT_CODE_THEME);
+        for ti in 0..3 {
+            assert_eq!(find_tier_site_a64(&a64, TIERS[ti].tier), Ok((bodies[ti], tails[ti], false)));
+        }
+        assert_eq!(tier_query_line(&a64), "");
+
+        let edits = ctx_with(&buf, defaults);
+        apply(&mut buf, edits);
+        let a64 = a64_ctx(&buf, &funcs, DEFAULT_COMPACT_TOKENS, DEFAULT_CODE_THEME);
+        for ti in 0..3 {
+            let b = bodies[ti];
+            let target = a64::adrp_target(word(&buf, b), b) + a64::add_imm12(word(&buf, b + 4));
+            assert_eq!(&buf[target..target + defaults[ti].len()], defaults[ti].as_bytes());
+            assert_eq!(word(&buf, b + 8), a64::movz(1, defaults[ti].len() as u32));
+            assert_eq!(a64::branch26_target(word(&buf, b + 12), b + 12), tails[ti]);
+            assert_eq!(find_tier_site_a64(&a64, TIERS[ti].tier), Ok((b, tails[ti], true)));
+            assert_eq!(detect_patched_tier(&a64, ti).as_deref(), Some(defaults[ti]));
+        }
+        assert_eq!(
+            tier_query_line(&a64),
+            "pro=gemini-4-carbon-high,flash=gemini-4-neon-medium,flash_lite=gemini-4-hydrogen-low"
+        );
+        // 각 본문의 앞 16바이트만 바뀐다 (공용 빈 반환 블록·반환 꼬리는 그대로)
+        assert!((0..buf.len()).filter(|&i| buf[i] != original[i]).all(|i| bodies.iter().any(|&b| (b..b + 16).contains(&i))));
+
+        // 같은 값으로 다시 적용하면 같고, 다른 값으로 바꿀 수 있다
+        let once = buf.clone();
+        let edits = ctx_with(&buf, defaults);
+        apply(&mut buf, edits);
+        assert_eq!(buf, once);
+        let edits = ctx_with(&buf, ["gemini-4-carbon-low", "gemini-4-carbon-high", "gemini-4-neon-medium"]);
+        apply(&mut buf, edits);
+        let a64 = a64_ctx(&buf, &funcs, DEFAULT_COMPACT_TOKENS, DEFAULT_CODE_THEME);
+        assert_eq!(detect_patched_tier(&a64, 0).as_deref(), Some("gemini-4-carbon-low"));
+        assert_eq!(detect_patched_tier(&a64, 2).as_deref(), Some("gemini-4-neon-medium"));
+    }
+
 }
