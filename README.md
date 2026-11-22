@@ -16,7 +16,7 @@
 | `tilde-strike` | `goldmark/extension.(*strikethroughParser).Parse` | `1.5.0~1.5.6`, `H2~H6` 같은 범위 표기용 단일 물결표(`~`)에 취소선이 그어지는 현상 방지 (`~~` 2개만 취소선으로 인식) |
 | `code-theme` | `render.glamourStyleForScheme` | `colorScheme: terminal` 사용 시 흐린 회색(`#d0d0d0`)으로 묻히는 코드 블록 테마(`native`)를 선명한 테마(기본 `vs`)로 교체 |
 | `compact` | `utils.GetCheckpointConfig`, `config.applyFeatureProviderCheckpointOverrideConfig` | 내장 자동 컴팩션(CHECKPOINT) 발동 임계값(기본 256k)을 `32k~1000k`로 조절 (`180k`로 낮춰 `200k` 단가 할증 전 조기 요약 또는 `500k+`로 높여 1M 모델 원문 맥락 유지, **기본 꺼짐**) |
-| `banner` | `render.BannerWithInfo` | 상단 `Antigravity CLI 1.5.7` 옆에 `(patch v0.2.6)` 형태로 패치 버전 표시 (Linux ARM64 제외) |
+| `banner` | `render.BannerWithInfo` | 상단 `Antigravity CLI 1.5.7` 옆에 `(patch v0.2.7)` 형태로 패치 버전 표시 (Linux ARM64 제외) |
 | `release-notes` | `render.BuildHeader` | 로고 아래에 패치 기능 요약 및 GitHub 저장소 정보 표시 (Linux ARM64 제외, **기본 꺼짐** — `-p all,release-notes`처럼 명시해야 적용) |
 
 ## 설치 및 빌드
@@ -109,7 +109,8 @@ agy-cli-patch --restore
 
 agy는 실행할 때마다 백그라운드로 새 버전을 확인하고, 있으면 **설치된 위치의 `antigravity` 바이너리를 직접 교체**합니다. 그 결과:
 
-- `--in-place`로 적용한 패치가 업데이트와 함께 사라집니다. 다시 `agy-cli-patch -p all --in-place`를 실행하면 됩니다(패치가 풀린 것을 감지하면 `antigravity.orig` 백업도 새 버전으로 갱신).
+- `--in-place`로 적용한 패치가 업데이트와 함께 사라집니다. 다시 `agy-cli-patch -p all --in-place`를 실행하면 됩니다(대상의 버전이 백업과 달라지고 패치가 풀린 것을 감지하면 `antigravity.orig` 백업도 새 버전으로 갱신. 같은 버전이면 패치 조합과 상관없이 백업을 그대로 둡니다).
+- v0.2.6 이하에서 `nodrip`을 뺀 조합으로 `--in-place`를 쓴 적이 있다면 `antigravity.orig`가 패치본으로 덮였을 수 있습니다(`--restore` 후에도 패치가 남아 있으면 이 경우). agy를 다시 설치하고 `antigravity.orig`를 지운 뒤 `--in-place`를 다시 실행하면 새 원본으로 백업됩니다.
 - mise로 설치한 경우 디렉토리명과 실제 버전이 어긋납니다(예: `~/.local/share/mise/installs/agy/1.5.6/antigravity`가 실제로는 1.5.7). 패처는 경로와 함께 실제 버전을 출력하므로 `[*] 대상 바이너리: … (버전 1.5.7)` 줄로 확인할 수 있습니다.
 
 버전 관리를 mise 등 패키지 매니저에만 맡기려면 자체 업데이트를 끕니다. 값은 반드시 `true`여야 합니다(`1`은 적용되지 않음).

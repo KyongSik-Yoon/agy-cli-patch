@@ -1421,6 +1421,123 @@ fn find_cave(ctx: &BinaryContext) -> Result<usize, String> {
         .ok_or_else(|| format!("실행 파일 내 0xcc 여유 공간({CAVE_MIN}바이트)을 찾을 수 없습니다."))
 }
 
+/// x86_64 rel32 의 목적지 (변위가 `disp_off` 에 있고 다음 명령이 `next_off` 에서 시작할 때)
+fn x86_rel32_target(data: &[u8], disp_off: usize, next_off: usize) -> Option<usize> {
+    usize::try_from(next_off as i64 + read_i32(data, disp_off) as i64).ok()
+}
+
+/// BannerWithInfo 채널 검사 자리와, 보존할 두 저장 명령이 그 안 어디에 있는지(원본 9 / 패치 후 0).
+///   원본:   test %rdx,%rdx; je ..; mov %rbx,0x2b0(%rsp); mov %rax,..(%rsp); ... (55바이트)
+///   패치 후: mov %rbx,0x2b0(%rsp); mov %rax,..(%rsp); lea chan(%rip),%rcx; mov $len,%edx; jmp +55; nop...
+fn find_banner_site_x86(ctx: &BinaryContext) -> Result<(usize, usize), String> {
+    const STORE_RBX: [u8; 8] = [0x48, 0x89, 0x9c, 0x24, 0xb0, 0x02, 0x00, 0x00];
+    const STORE_RAX: [u8; 4] = [0x48, 0x89, 0x84, 0x24];
+    let (start, end) = ctx.get_func("render.BannerWithInfo")?;
+    let body = &ctx.data[start..end];
+    let mut matches = Vec::new();
+    for i in 0..body.len().saturating_sub(55) {
+        let w = &body[i..i + 55];
+        if w[0..5] == [0x48, 0x85, 0xd2, 0x0f, 0x84] && w[9..17] == STORE_RBX && w[17..21] == STORE_RAX {
+            matches.push((start + i, 9));
+        } else if w[0..8] == STORE_RBX
+            && w[8..12] == STORE_RAX
+            && w[16..19] == [0x48, 0x8d, 0x0d]
+            && w[23] == 0xba
+            && w[28] == 0xe9
+            && read_i32(w, 29) == 55 - 33
+            && w[33..].iter().all(|&b| b == 0x90)
+        {
+            matches.push((start + i, 0));
+        }
+    }
+    if matches.len() != 1 {
+        return Err(format!("BannerWithInfo 채널 검사 패턴 매칭 실패 (매칭 수: {})", matches.len()));
+    }
+    Ok(matches[0])
+}
+
+/// 이미 패치된 banner 가 쓰는 동굴. lea 가 가리키는 채널 문자열 자리에서 구한다.
+fn banner_cave_x86(ctx: &BinaryContext) -> Result<Option<usize>, String> {
+    let Ok((site, 0)) = find_banner_site_x86(ctx) else {
+        return Ok(None);
+    };
+    x86_rel32_target(ctx.data, site + 19, site + 23)
+        .filter(|&p| p >= CAVE_CHAN_OFF && ctx.data.get(p..).is_some_and(|s| s.starts_with(b"patch v")))
+        .map(|p| Some(p - CAVE_CHAN_OFF))
+        .ok_or_else(|| "BannerWithInfo 기존 패치가 가리키는 채널 문자열(\"patch v…\")을 찾을 수 없습니다.".into())
+}
+
+/// BuildHeader 끝의 `"\n" + strings.Join(lines, "\n")` concatstring2 호출 자리 (패치 후엔 트램펄린 호출)
+fn find_build_header_call_x86(ctx: &BinaryContext) -> Result<usize, String> {
+    let (start, end) = ctx.get_func("render.BuildHeader")?;
+    let pat = [0x48, 0x89, 0xc7, 0x48, 0x89, 0xde, 0x31, 0xc0, 0x48, 0x8d, 0x1d];
+    let matches: Vec<_> = ctx.data[start..end]
+        .windows(pat.len())
+        .enumerate()
+        .filter(|(_, w)| *w == pat)
+        .map(|(i, _)| start + i)
+        .collect();
+    if matches.len() != 1 {
+        return Err(format!("BuildHeader concatstring2 패턴 매칭 실패 (매칭 수: {})", matches.len()));
+    }
+    let call_site = matches[0] + 17;
+    if ctx.data[call_site] != 0xe8 {
+        return Err(format!(
+            "BuildHeader call site op 불일치 (기대: 0xe8, 실제: 0x{:02x})",
+            ctx.data[call_site]
+        ));
+    }
+    Ok(call_site)
+}
+
+/// 이미 패치된 release-notes 가 쓰는 동굴. BuildHeader 가 부르는 트램펄린
+/// (`lea notes(%rip),%r8; mov $len,%r9d; jmp concatstring3`)의 노트 문자열 자리에서 구한다.
+fn release_notes_cave_x86(ctx: &BinaryContext) -> Result<Option<usize>, String> {
+    let call = find_build_header_call_x86(ctx)?;
+    let (concat2, _) = ctx.get_func("runtime.concatstring2")?;
+    let (concat3, _) = ctx.get_func("runtime.concatstring3")?;
+    let d = ctx.data;
+    let tramp = x86_rel32_target(d, call + 1, call + 5);
+    if tramp == Some(concat2) {
+        return Ok(None);
+    }
+    tramp
+        .filter(|&t| {
+            d.get(t..t + 18)
+                .is_some_and(|w| w[0..3] == [0x4c, 0x8d, 0x05] && w[7..9] == [0x41, 0xb9] && w[13] == 0xe9)
+                && x86_rel32_target(d, t + 14, t + 18) == Some(concat3)
+        })
+        .and_then(|t| x86_rel32_target(d, t + 3, t + 7))
+        .filter(|&n| n >= CAVE_NOTES_OFF && d.get(n..).is_some_and(|s| s.starts_with(b"\n\n")))
+        .map(|n| Some(n - CAVE_NOTES_OFF))
+        .ok_or_else(|| "BuildHeader 가 concatstring2 도, 알아볼 수 있는 릴리즈 노트 트램펄린도 부르지 않습니다.".into())
+}
+
+/// x86_64 banner / release-notes 가 함께 쓸 동굴을 고른다:
+/// 자기 패치가 이미 쓴 동굴(`own`) → 다른 패치가 쓴 동굴(`other`) → 새 0xcc 패딩.
+/// 패치마다 새 동굴을 찾으면 0xcc 패딩이 한 곳뿐인 버전(1.5.9·1.5.10·1.5.12)에서 재패치가 실패한다.
+/// 자기 동굴이 아니면 자기 몫(`own_range`, 동굴 기준 오프셋)이 0xcc 로 비어 있어야 한다
+/// (배치가 다른 옛 패치본에서 동굴 밖을 덮어쓰지 않도록).
+fn pick_cave_x86(
+    ctx: &BinaryContext,
+    own: Option<usize>,
+    other: Option<usize>,
+    own_range: std::ops::Range<usize>,
+) -> Result<usize, String> {
+    if let Some(cave) = own {
+        return Ok(cave);
+    }
+    let cave = match other {
+        Some(cave) => cave,
+        None => find_cave(ctx)?,
+    };
+    let (start, end) = (cave + own_range.start, cave + own_range.end);
+    if !ctx.data.get(start..end).is_some_and(|s| s.iter().all(|&b| b == 0xcc)) {
+        return Err(format!("동굴 0x{start:x}..0x{end:x} 가 비어 있지 않습니다 (알아볼 수 없는 기존 패치)."));
+    }
+    Ok(cave)
+}
+
 /// Mach-O ARM64: `__TEXT` 세그먼트(r-x) 안, 마지막 섹션 뒤의 페이지 정렬 패딩을 동굴로 쓴다.
 /// 섹션 헤더로 위치를 정하므로 패치 후 내용이 바뀌어도 같은 자리를 돌려준다(재패치 가능).
 /// Linux ELF ARM64 는 실행 세그먼트 바로 뒤에 RW 세그먼트가 붙어 있어 쓸 수 있는 패딩이 없다.
@@ -1603,46 +1720,34 @@ fn resolve_release_notes_a64(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, Strin
 fn resolve_banner(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
     match ctx.arch {
         Arch::X86_64 => {
-            let (bwi_start, bwi_end) = ctx.get_func("render.BannerWithInfo")?;
-            let cave_offset = find_cave(ctx)?;
-
-            // 제품명 옆 괄호 안에 표시: "Antigravity CLI 1.5.7 (patch v0.2.6)"
+            // 제품명 옆 괄호 안에 표시: "Antigravity CLI 1.5.7 (patch v0.2.7)"
             let chan = format!("patch v{}", env!("CARGO_PKG_VERSION")).into_bytes();
             assert!(chan.len() <= CAVE_NOTES_OFF - CAVE_CHAN_OFF);
-            let chan_va = cave_offset + CAVE_CHAN_OFF;
 
+            // BannerWithInfo 패치: 빈 채널 대신 주입된 채널 문자열 포맷 루틴 활성화.
+            // 패치된 형태도 받아 패치본을 다시 패치할 수 있게 한다 (두 저장 명령의 위치만 다르다).
+            let (chan_site, stores_off) = find_banner_site_x86(ctx)?;
+            let chan_site_end = chan_site + 55;
+            let cave = pick_cave_x86(
+                ctx,
+                banner_cave_x86(ctx)?,
+                release_notes_cave_x86(ctx).ok().flatten(),
+                CAVE_CHAN_OFF..CAVE_NOTES_OFF,
+            )?;
+            let chan_off = cave + CAVE_CHAN_OFF;
             let mut edits = vec![ByteEdit {
-                offset: chan_va,
+                offset: chan_off,
                 payload: chan.clone(),
             }];
-
-            // BannerWithInfo 패치: 빈 채널 대신 주입된 채널 문자열 포맷 루틴 활성화
-            let bwi_body = &ctx.data[bwi_start..bwi_end];
-            let mut bwi_matches = Vec::new();
-            for i in 0..bwi_body.len().saturating_sub(55) {
-                if &bwi_body[i..i + 5] == &[0x48, 0x85, 0xd2, 0x0f, 0x84]
-                    && &bwi_body[i + 9..i + 17] == &[0x48, 0x89, 0x9c, 0x24, 0xb0, 0x02, 0x00, 0x00]
-                    && &bwi_body[i + 17..i + 21] == &[0x48, 0x89, 0x84, 0x24]
-                {
-                    bwi_matches.push(bwi_start + i);
-                }
-            }
-            if bwi_matches.len() != 1 {
-                return Err(format!(
-                    "BannerWithInfo 채널 검사 패턴 매칭 실패 (매칭 수: {})",
-                    bwi_matches.len()
-                ));
-            }
-            let chan_site = bwi_matches[0];
-            let chan_site_end = chan_site + 55;
 
             // 원본은 채널 분기 진입 시 제품명 문자열(rax=ptr, rbx=len)을 스택 슬롯에 저장하고,
             // Sprintf 이후 그 슬롯을 다시 읽어 concatstring2 로 이어 붙인다.
             // 이 두 저장(mov %rbx,0x2b0(%rsp) / mov %rax,0x320(%rsp))을 건너뛰면
             // 초기화되지 않은 슬롯을 이어 붙이다 SIGSEGV 가 나므로 그대로 보존한다.
-            let mut chan_patch = ctx.data[chan_site + 9..chan_site + 25].to_vec();
+            let stores = chan_site + stores_off;
+            let mut chan_patch = ctx.data[stores..stores + 16].to_vec();
             let pc = chan_site + chan_patch.len() + 7;
-            let disp_chan = (chan_va as i64) - (pc as i64);
+            let disp_chan = (chan_off as i64) - (pc as i64);
             chan_patch.extend_from_slice(&[0x48, 0x8d, 0x0d]);
             chan_patch.extend_from_slice(&(disp_chan as i32).to_le_bytes());
 
@@ -1694,9 +1799,16 @@ fn release_notes_text() -> String {
 fn resolve_release_notes(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
     match ctx.arch {
         Arch::X86_64 => {
-            let (bh_start, bh_end) = ctx.get_func("render.BuildHeader")?;
+            // BuildHeader 패치: concatstring2 호출을 트램펄린(concatstring3) 호출로 변경.
+            // 이미 패치된 바이너리면 그때 쓴 동굴을 다시 쓴다.
+            let call_site = find_build_header_call_x86(ctx)?;
             let (concat3_start, _) = ctx.get_func("runtime.concatstring3")?;
-            let cave_offset = find_cave(ctx)?;
+            let cave_offset = pick_cave_x86(
+                ctx,
+                release_notes_cave_x86(ctx)?,
+                banner_cave_x86(ctx).ok().flatten(),
+                CAVE_NOTES_OFF..CAVE_MIN,
+            )?;
 
             let notes = format!("\n\n{}", release_notes_text()).into_bytes();
 
@@ -1742,30 +1854,6 @@ fn resolve_release_notes(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
                     payload: tramp,
                 },
             ];
-
-            // BuildHeader 패치: concatstring2 호출을 트램펄린(concatstring3) 호출로 변경
-            let bh_body = &ctx.data[bh_start..bh_end];
-            let bh_pat = [0x48, 0x89, 0xc7, 0x48, 0x89, 0xde, 0x31, 0xc0, 0x48, 0x8d, 0x1d];
-            let bh_matches: Vec<_> = bh_body
-                .windows(bh_pat.len())
-                .enumerate()
-                .filter(|(_, w)| *w == bh_pat)
-                .map(|(i, _)| bh_start + i)
-                .collect();
-
-            if bh_matches.len() != 1 {
-                return Err(format!(
-                    "BuildHeader concatstring2 패턴 매칭 실패 (매칭 수: {})",
-                    bh_matches.len()
-                ));
-            }
-            let call_site = bh_matches[0] + 17;
-            if ctx.data[call_site] != 0xe8 {
-                return Err(format!(
-                    "BuildHeader call site op 불일치 (기대: 0xe8, 실제: 0x{:02x})",
-                    ctx.data[call_site]
-                ));
-            }
 
             let pc = call_site + 5;
             let rel_tramp = (tramp_va as i64) - (pc as i64);
@@ -1834,7 +1922,7 @@ const PATCH_REGISTRY: &[PatchSpec] = &[
     PatchSpec {
         id: "banner",
         title: "제품명 옆 패치 버전 표시 (Patch Version Tag)",
-        description: "상단 'Antigravity CLI 1.5.7' 옆에 '(patch v0.2.6)' 형태로 패치 버전 표시",
+        description: "상단 'Antigravity CLI 1.5.7' 옆에 '(patch v0.2.7)' 형태로 패치 버전 표시",
         symbol: "render.BannerWithInfo",
         default_on: true,
         resolver: resolve_banner,
@@ -1919,6 +2007,8 @@ fn which_in_path(cmd: &str) -> Option<PathBuf> {
     None
 }
 
+const VERSION_UNKNOWN: &str = "확인 불가";
+
 fn binary_version(path: &Path) -> String {
     Command::new(path)
         .arg("--version")
@@ -1930,7 +2020,19 @@ fn binary_version(path: &Path) -> String {
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .and_then(|s| s.lines().next().map(|l| l.trim().to_string()))
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "확인 불가".to_string())
+        .unwrap_or_else(|| VERSION_UNKNOWN.to_string())
+}
+
+/// `--in-place` 백업을 대상 바이너리로 새로 써야 하는지 판정한다.
+/// 패치본은 언제나 백업에서 만들어지므로 백업과 버전이 같다. 버전이 달라졌다면 agy 자체 업데이트가
+/// 대상을 새 릴리즈 원본으로 바꾼 것이다. 패치 자리 하나(nodrip)만 보고 판정하면 nodrip 을 뺀 조합으로
+/// in-place 한 패치본을 원본으로 오인해 하나뿐인 원본 백업을 덮어쓴다.
+/// 버전을 알 수 없으면 백업을 지키는 쪽으로 갱신하지 않는다.
+fn should_refresh_backup(target_version: &str, backup_version: &str, target_cut_unpatched: bool) -> bool {
+    target_cut_unpatched
+        && target_version != VERSION_UNKNOWN
+        && backup_version != VERSION_UNKNOWN
+        && target_version != backup_version
 }
 
 fn detect_default_binary() -> PathBuf {
@@ -3310,24 +3412,18 @@ fn parse_patch_list(
     code_theme_override: &mut Option<String>,
 ) -> Result<Vec<&'static PatchSpec>, String> {
     let items: Vec<&str> = spec_str.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    let mut out: Vec<&'static PatchSpec> = Vec::new();
     if items.is_empty() || items.contains(&"all") {
         // 'all' 은 기본 활성(default_on) 패치 전체. 기본 꺼짐 패치는 'all,release-notes' 나 'all,compact=180k' 처럼 명시한다.
-        let mut v: Vec<&'static PatchSpec> = PATCH_REGISTRY.iter().filter(|p| p.default_on).collect();
-        for item in &items {
-            let (id, val) = item.split_once('=').map_or((*item, None), |(k, rhs)| (k.trim(), Some(rhs.trim())));
-            apply_inline_patch_arg(id, val, compact_override, code_theme_override)?;
-            if let Some(spec) = PATCH_REGISTRY.iter().find(|p| p.id == id && !p.default_on) {
-                if !v.iter().any(|p| p.id == spec.id) {
-                    v.push(spec);
-                }
-            }
-        }
-        return Ok(v);
+        out.extend(PATCH_REGISTRY.iter().filter(|p| p.default_on));
     }
-    let mut out = Vec::new();
+    // 'all' 과 함께 준 ID 도 하나하나 검사한다 ('all,nodirp' 같은 오타를 조용히 무시하지 않도록)
     for item in items {
         let (id, val) = item.split_once('=').map_or((item, None), |(k, rhs)| (k.trim(), Some(rhs.trim())));
         apply_inline_patch_arg(id, val, compact_override, code_theme_override)?;
+        if id == "all" {
+            continue;
+        }
         let Some(spec) = PATCH_REGISTRY.iter().find(|p| p.id == id) else {
             let valid: Vec<&str> = PATCH_REGISTRY.iter().map(|p| p.id).collect();
             return Err(format!("알 수 없는 패치 ID: '{id}' (사용 가능: all, {})", valid.join(", ")));
@@ -3566,28 +3662,28 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
 
-    // 새 릴리즈 업데이트 시 backup_bin 자동 갱신
-    if backup_bin.exists() && target_bin != backup_bin {
-        let cur_mmap = MmapFile::open(&target_bin)?;
-        let cur_ctx = BinaryContext::parse(cur_mmap.as_slice())?;
-        if is_unpatched_cut(&cur_ctx)? {
-            copy_reflink(&target_bin, &backup_bin)?;
-        }
-    }
-
-    let src_bin = if target_bin != backup_bin && backup_bin.exists() {
-        backup_bin.clone()
-    } else {
-        target_bin.clone()
-    };
-
     // mise 설치 디렉토리명(예: 1.5.6)은 agy 자체 업데이트 후 실제 버전과 어긋날 수 있으므로
     // 바이너리가 보고하는 버전을 함께 출력한다.
     let target_version = binary_version(&target_bin);
     println!("[*] 대상 바이너리: {} (버전 {})", target_bin.display(), target_version);
-    if src_bin != target_bin {
-        println!("[*] 패치 원본:     {} (버전 {})", src_bin.display(), binary_version(&src_bin));
+
+    let has_backup = target_bin != backup_bin && backup_bin.exists();
+    if has_backup {
+        let mut backup_version = binary_version(&backup_bin);
+        // agy 자체 업데이트로 대상이 새 릴리즈 원본으로 바뀌었으면 백업도 그 원본으로 갱신한다
+        if target_version != backup_version {
+            let cur_mmap = MmapFile::open(&target_bin)?;
+            let cur_ctx = BinaryContext::parse(cur_mmap.as_slice())?;
+            if should_refresh_backup(&target_version, &backup_version, is_unpatched_cut(&cur_ctx)?) {
+                copy_reflink(&target_bin, &backup_bin)?;
+                println!("[+] agy 업데이트 감지: 원본 백업 갱신 ({backup_version} -> {target_version})");
+                backup_version = target_version.clone();
+            }
+        }
+        println!("[*] 패치 원본:     {} (버전 {})", backup_bin.display(), backup_version);
     }
+
+    let src_bin = if has_backup { backup_bin.clone() } else { target_bin.clone() };
 
     let mmap = MmapFile::open(&src_bin)?;
     let mut ctx = BinaryContext::parse(mmap.as_slice())?;
@@ -3714,6 +3810,50 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backup_refreshes_only_when_agy_updated_to_another_version() {
+        // agy 자체 업데이트: 버전이 바뀌었고 패치가 풀린 원본
+        assert!(should_refresh_backup("1.5.13", "1.5.12", true));
+        // nodrip 을 뺀 조합으로 in-place 한 패치본: nodrip 자리는 원본이지만 백업과 같은 버전이므로 지킨다
+        assert!(!should_refresh_backup("1.5.13", "1.5.13", true));
+        // 다른 버전이라도 nodrip 이 패치돼 있으면 원본이 아니다
+        assert!(!should_refresh_backup("1.5.13", "1.5.12", false));
+        // 버전을 알 수 없으면 덮어쓰지 않는다
+        assert!(!should_refresh_backup(VERSION_UNKNOWN, "1.5.12", true));
+        assert!(!should_refresh_backup("1.5.13", VERSION_UNKNOWN, true));
+    }
+
+    #[test]
+    fn patch_list_parser_validates_ids_alongside_all() {
+        let parse = |s: &str| {
+            let (mut tokens, mut theme) = (None, None);
+            parse_patch_list(s, &mut tokens, &mut theme)
+                .map(|v| (v.iter().map(|p| p.id).collect::<Vec<_>>(), tokens, theme))
+        };
+        let defaults: Vec<&str> = PATCH_REGISTRY.iter().filter(|p| p.default_on).map(|p| p.id).collect();
+
+        let err = parse("all,nodirp").expect_err("'all' 과 함께 준 오타도 거부해야 함");
+        assert!(err.contains("'nodirp'"), "{err}");
+        assert!(parse("nodirp").is_err());
+
+        assert_eq!(parse("all").unwrap().0, defaults);
+        assert_eq!(parse("").unwrap().0, defaults);
+
+        let (ids, ..) = parse("all,release-notes").unwrap();
+        assert_eq!(ids, [defaults.as_slice(), &["release-notes"]].concat());
+
+        let (ids, tokens, _) = parse("all,compact=200k").unwrap();
+        assert_eq!(ids, [defaults.as_slice(), &["compact"]].concat());
+        assert_eq!(tokens, Some(200_000));
+
+        let (ids, _, theme) = parse("all,code-theme=bw").unwrap();
+        assert_eq!(ids, defaults);
+        assert_eq!(theme.as_deref(), Some("bw"));
+
+        assert_eq!(parse("cjk-bold, nodrip,cjk-bold").unwrap().0, ["cjk-bold", "nodrip"]);
+        assert!(parse("all=1").is_err());
+    }
 
     #[test]
     fn compact_token_parser_supports_suffixes_and_validates_range() {
@@ -3979,6 +4119,131 @@ mod tests {
         assert_eq!(edits.len(), 1);
         assert_eq!(edits[0].offset, site + 21);
         assert_eq!(edits[0].payload, vec![0x31, 0xc0, 0x31, 0xdb, 0x31, 0xc9, 0xc9, 0xc3]);
+    }
+
+    #[test]
+    fn resolve_banner_x86_repatches_already_patched_binary() {
+        let mut buf = vec![0u8; 4096];
+        buf[1024..2048].fill(0xcc); // 1.5.9 처럼 0xcc 패딩(동굴)이 딱 한 곳뿐인 경우
+        let (fn_start, fn_end) = (64usize, 256usize);
+        let site = fn_start + 16;
+        let stores: &[u8] = &[
+            0x48, 0x89, 0x9c, 0x24, 0xb0, 0x02, 0x00, 0x00, // mov %rbx,0x2b0(%rsp)
+            0x48, 0x89, 0x84, 0x24, 0x20, 0x03, 0x00, 0x00, // mov %rax,0x320(%rsp)
+        ];
+        buf[site..site + 9].copy_from_slice(&[0x48, 0x85, 0xd2, 0x0f, 0x84, 0x00, 0x01, 0x00, 0x00]); // test; je
+        buf[site + 9..site + 25].copy_from_slice(stores);
+        buf[site + 25..site + 55].fill(0xaa);
+
+        let chan = format!("patch v{}", env!("CARGO_PKG_VERSION"));
+        let mut first_round = Vec::new();
+        for round in 0..2 {
+            let edits = {
+                let mut funcs = HashMap::new();
+                funcs.insert("render.BannerWithInfo", (fn_start, fn_end));
+                let ctx = BinaryContext {
+                    data: &buf,
+                    format: Format::Elf64,
+                    arch: Arch::X86_64,
+                    segments: Vec::new(),
+                    funcs,
+                    compact_tokens: DEFAULT_COMPACT_TOKENS,
+                    code_theme: DEFAULT_CODE_THEME.to_string(),
+                };
+                resolve_banner(&ctx).unwrap_or_else(|e| panic!("{round}회차 banner 매칭 실패: {e}"))
+            };
+            apply(&mut buf, edits);
+
+            // 두 저장 명령이 맨 앞에 그대로 남고, lea 가 채널 문자열을, jmp 가 원래 분기 끝을 가리킨다
+            assert_eq!(&buf[site..site + 16], stores);
+            let chan_off = (site as i64 + 23 + read_i32(&buf, site + 19) as i64) as usize;
+            assert_eq!(&buf[chan_off..chan_off + chan.len()], chan.as_bytes());
+            assert_eq!(read_u32(&buf, site + 24), chan.len() as u32);
+            assert_eq!(site + 33 + read_i32(&buf, site + 29) as usize, site + 55);
+            assert_eq!(chan_off, 1024, "{round}회차: 첫 패치가 쓴 동굴을 다시 써야 함");
+            if round == 0 {
+                first_round = buf.clone();
+            }
+        }
+        assert_eq!(buf, first_round, "패치본을 다시 패치하면 결과가 같아야 함");
+    }
+
+    type Resolver = fn(&BinaryContext) -> Result<Vec<ByteEdit>, String>;
+
+    /// build_patched_binary 처럼 같은 원본에서 모든 패치를 먼저 계산한 뒤 한꺼번에 쓴다.
+    fn apply_x86(buf: &mut [u8], funcs: &[(&'static str, usize, usize)], resolvers: &[Resolver]) -> Result<(), String> {
+        let edits = {
+            let ctx = BinaryContext {
+                data: buf,
+                format: Format::Elf64,
+                arch: Arch::X86_64,
+                segments: Vec::new(),
+                funcs: funcs.iter().map(|&(n, s, e)| (n, (s, e))).collect(),
+                compact_tokens: DEFAULT_COMPACT_TOKENS,
+                code_theme: DEFAULT_CODE_THEME.to_string(),
+            };
+            let mut all = Vec::new();
+            for r in resolvers {
+                all.extend(r(&ctx)?);
+            }
+            all
+        };
+        apply(buf, edits);
+        Ok(())
+    }
+
+    #[test]
+    fn x86_banner_and_release_notes_share_one_cave_across_repatches() {
+        // 1.5.9 처럼 0xcc 동굴이 딱 한 곳뿐인 합성 바이너리
+        let mut buf = vec![0u8; 8192];
+        let cave = 4096usize;
+        buf[cave..cave + CAVE_MIN].fill(0xcc);
+        let bwi = (64usize, 256usize);
+        let site = bwi.0 + 16;
+        buf[site..site + 9].copy_from_slice(&[0x48, 0x85, 0xd2, 0x0f, 0x84, 0x00, 0x01, 0x00, 0x00]);
+        buf[site + 9..site + 25].copy_from_slice(&[
+            0x48, 0x89, 0x9c, 0x24, 0xb0, 0x02, 0x00, 0x00, 0x48, 0x89, 0x84, 0x24, 0x20, 0x03, 0x00, 0x00,
+        ]);
+        buf[site + 25..site + 55].fill(0xaa);
+        let bh = (256usize, 448usize);
+        let (concat2, concat3) = (512usize, 576usize);
+        let pat = bh.0 + 16;
+        buf[pat..pat + 11].copy_from_slice(&[0x48, 0x89, 0xc7, 0x48, 0x89, 0xde, 0x31, 0xc0, 0x48, 0x8d, 0x1d]);
+        buf[pat + 11..pat + 17].fill(0xaa);
+        let call = pat + 17;
+        buf[call] = 0xe8;
+        buf[call + 1..call + 5].copy_from_slice(&((concat2 as i32) - (call as i32 + 5)).to_le_bytes());
+        let funcs = [
+            ("render.BannerWithInfo", bwi.0, bwi.1),
+            ("render.BuildHeader", bh.0, bh.1),
+            ("runtime.concatstring2", concat2, concat2 + 64),
+            ("runtime.concatstring3", concat3, concat3 + 64),
+        ];
+        let both: &[Resolver] = &[resolve_banner, resolve_release_notes];
+
+        let mut expected = buf.clone();
+        apply_x86(&mut expected, &funcs, both).unwrap();
+        assert!(expected[cave + CAVE_CHAN_OFF..].starts_with(b"patch v"));
+        assert!(expected[cave + CAVE_NOTES_OFF..].starts_with(b"\n\n"));
+
+        // 같은 조합을 다시 적용 / 하나씩 어느 순서로 적용해도 결과가 같아야 한다
+        let mut again = expected.clone();
+        apply_x86(&mut again, &funcs, both).unwrap();
+        assert_eq!(again, expected);
+        for order in [[resolve_banner as Resolver, resolve_release_notes], [resolve_release_notes, resolve_banner]] {
+            let mut b = buf.clone();
+            for r in order {
+                apply_x86(&mut b, &funcs, &[r]).unwrap();
+                apply_x86(&mut b, &funcs, &[r]).unwrap();
+            }
+            assert_eq!(b, expected);
+        }
+
+        // 배치를 알아볼 수 없는 옛 패치본: release-notes 동굴의 banner 몫이 비어 있지 않으면 쓰지 않는다
+        let mut odd = buf.clone();
+        apply_x86(&mut odd, &funcs, &[resolve_release_notes]).unwrap();
+        odd[cave + CAVE_CHAN_OFF] = 0x00;
+        assert!(apply_x86(&mut odd, &funcs, &[resolve_banner]).is_err());
     }
 
     fn put_words(buf: &mut [u8], off: usize, insns: &[u32]) {
