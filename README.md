@@ -53,7 +53,7 @@ cd agy-cli-patch
 agy-cli-patch
 ```
 
-- **패치 선택**: `↑↓`(또는 `j`/`k`)로 이동, `space`나 숫자키로 선택, `a`로 전체 선택/해제. `code-theme` 줄에서는 `-`/`+`로 추천 테마(`vs`, `solarized-light`, `bw`, `github`, `catppuccin-latte`, `xcode`)를 순환하거나 `e`로 바이너리에 내장된 Chroma 테마 이름을 직접 입력합니다. `compact` 줄에서는 `-`/`+`로 ±10k씩 증감하거나 `e`를 눌러 `180k`·`160000`처럼 임의 토큰 임계값을 직접 입력합니다. `pro-tier` 줄에서는 `-`/`+`로 카본 모델(`gemini-4-carbon-high`, `-medium`, `-low`)을 순환하거나 `e`로 바이너리에 들어 있는 모델 ID(`agy models` 참고)를 직접 입력합니다. 커서가 가리키는 패치의 설명과 대상 심볼이 하단에 표시됩니다. 실행 전에 각 패치를 대상 바이너리에 미리 대조하므로, 적용할 수 없는 패치(예: Linux ARM64의 `banner`)는 `✕`와 사유가 표시되고 선택되지 않습니다. `batch`를 켜면 `nodrip`도 함께 켜집니다.
+- **패치 선택**: `↑↓`(또는 `j`/`k`)로 이동, `space`나 숫자키로 선택, `a`로 전체 선택/해제. `code-theme` 줄에서는 `-`/`+`로 추천 테마(`vs`, `solarized-light`, `bw`, `github`, `catppuccin-latte`, `xcode`)를 순환하거나 `e`로 바이너리에 내장된 Chroma 테마 이름을 직접 입력합니다. `compact` 줄에서는 `-`/`+`로 ±10k씩 증감하거나 `e`를 눌러 `180k`·`160000`처럼 임의 토큰 임계값을 직접 입력합니다. `pro-tier` 줄에서는 `-`/`+`로 이 바이너리에 들어 있는 모델 ID(1.5.13 기준 23개: carbon·hydrogen·neon·argon·Claude Opus/Sonnet·3.8 Flash, 사고 수준별)를 순환하거나 `e`로 목록에 없는 ID를 직접 입력합니다. 커서가 가리키는 패치의 설명과 대상 심볼이 하단에 표시됩니다. 실행 전에 각 패치를 대상 바이너리에 미리 대조하므로, 적용할 수 없는 패치(예: Linux ARM64의 `banner`)는 `✕`와 사유가 표시되고 선택되지 않습니다. `batch`를 켜면 `nodrip`도 함께 켜집니다.
 - **출력 방식**: 새 실행 파일(이름을 바로 편집, 생성 경로와 `~/.local/bin` 링크를 미리 보여줌) 또는 기본 agy에 직접 덮어쓰기(in-place) 중에서 고릅니다. 원본과 같은 경로나 존재하지 않는 디렉토리는 막고, 기존 링크가 다른 파일을 가리키면 교체된다고 경고합니다.
 - **확인**: 적용할 패치와 출력 경로를 확인한 뒤 `enter`로 실행합니다. `esc`로 이전 단계, `q`나 `ctrl+c`로 종료합니다(터미널 상태는 항상 복구됩니다).
 
@@ -145,6 +145,7 @@ AGY_CLI_DISABLE_AUTO_UPDATE = "true"
 ### `pro-tier`가 바꾸는 범위
 
 - `invoke_subagent`, 사용자 정의 에이전트 frontmatter의 `model:`, 훅의 model은 모두 티어(`inherit`/`flash_lite`/`flash`/`pro`)로만 모델을 받고, 실제 모델은 서버가 계정별로 내려주는 티어 목록에서 고릅니다. `pro-tier`는 그중 `pro` 티어가 고른 모델을 돌려주게 바꾸므로, 다른 기능(유틸리티 모델, PolicyGuardian 판정 등)이 `pro` 티어를 고를 때도 같은 모델을 씁니다.
+- 사고 수준(effort)은 모델 ID 끝(`-low`/`-medium`/`-high`/`-xhigh`)으로 정해집니다. `invoke_subagent`에는 effort 인자가 없어서 `pro` 티어로 뜨는 서브에이전트는 모두 고른 ID의 수준으로 돕니다(패치 전 서버 값 `gemini-4-hydrogen-tiered-xhigh`도 xhigh 하나로 고정). 카본은 `-high`가 가장 높습니다.
 - 모델 ID는 바이너리에 문자열로 들어 있는 것만 쓸 수 있습니다(새 코드를 넣지 않고 기존 문자열을 가리키기 때문). 없는 ID를 주면 패치하지 않고 알립니다. 서버 모델 목록(`agy models`)에 없는 ID는 서브에이전트를 띄울 때 모델을 찾지 못해 실패할 수 있으니 `agy models`에 나오는 ID를 쓰세요.
 - PreToolUse 훅이 `invoke_subagent`의 `Model` 인자를 다른 티어로 바꾸면 그 티어가 쓰입니다. 실행 결과에 `A pre-tool hook changed the arguments of this tool call` 이 보이면 훅이 바꾼 것입니다.
 - 로컬 설정으로 티어를 바꾸는 장치(`admin_settings.json`의 `models.tiers`, `AGY_LLM_GATEWAY_TIER_PRO`)는 바이너리를 분석해 보면 LLM 게이트웨이 모드에서만 읽혀, 일반 로그인 환경에서는 효과가 없는 것으로 보입니다.

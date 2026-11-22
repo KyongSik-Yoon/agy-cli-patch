@@ -942,9 +942,10 @@ part('wizard', function(){
   ];
   var N = P.length, B = 1, ND = 0, TI = 4, CI = 5;
   var THEME_PRESETS = ['vs', 'solarized-light', 'bw', 'github', 'catppuccin-latte', 'xcode'];
-  var PRO_PRESETS = ['gemini-4-carbon-high', 'gemini-4-carbon-medium', 'gemini-4-carbon-low'];
-  // agy 1.5.7 실행 세그먼트에 문자열로 들어 있는 모델 ID. pro-tier 는 이 문자열을 가리키므로 여기 없는 ID 는 거부된다.
-  var MODEL_IDS = ['gemini-4-carbon-high', 'gemini-4-carbon-medium', 'gemini-4-carbon-low', 'gemini-4-argon-high', 'gemini-4-argon-medium', 'gemini-4-argon-low', 'gemini-3.8-flash-high', 'gemini-3.8-flash-medium', 'gemini-3.8-flash-low', 'claude-opus-5-5-high', 'claude-opus-5-5-medium', 'claude-opus-5-5-low', 'claude-sonnet-5-5-high', 'claude-sonnet-5-5-medium', 'claude-sonnet-5-5-low'];
+  // KNOWN_MODEL_IDS 중 agy 1.5.7 실행 세그먼트에 문자열로 들어 있는 모델 ID (순서 유지). -/+ 순환 후보이자,
+  // pro-tier 가 가리킬 수 있는 문자열이라 여기 없는 ID 는 거부된다.
+  var MODEL_IDS = ['gemini-4-carbon-high', 'gemini-4-carbon-medium', 'gemini-4-carbon-low', 'gemini-4-argon-high', 'gemini-4-argon-medium', 'gemini-4-argon-low', 'claude-opus-5-5-high', 'claude-opus-5-5-medium', 'claude-opus-5-5-low', 'claude-sonnet-5-5-high', 'claude-sonnet-5-5-medium', 'claude-sonnet-5-5-low', 'gemini-3.8-flash-high', 'gemini-3.8-flash-medium', 'gemini-3.8-flash-low'];
+  var PRO_PRESETS = MODEL_IDS, MODEL_ID_EXAMPLES = 'gemini-4-carbon-high, gemini-4-carbon-medium, gemini-4-carbon-low';
   // -/+ 로 추천값을 고르거나 e 로 직접 입력하는 문자열 값 (Wizard 의 TextParam)
   var TX = [
     {i: TI, label: '코드 블록 테마', subject: '코드 블록 테마가', hint: '테마', presets: THEME_PRESETS, max: 32, allow: /[A-Za-z0-9_-]/, tip: '눌러서 테마 직접 입력',
@@ -952,8 +953,8 @@ part('wizard', function(){
     {i: 6, label: 'pro 티어 모델', subject: 'pro 티어 모델이', hint: '모델', presets: PRO_PRESETS, max: 64, allow: /[A-Za-z0-9._-]/, tip: '눌러서 모델 ID 직접 입력',
       check: function(raw){
         var v = String(raw || '').trim().toLowerCase();
-        if (!v || v.length > 64 || !/^[a-z0-9._-]+$/.test(v)) return [null, "유효하지 않은 모델 ID 입니다: '" + raw + "' (영문 소문자·숫자·'-'·'.'·'_', 예: " + PRO_PRESETS.join(', ') + ')'];
-        if (!MODEL_IDS.some(function(m){ return m.indexOf(v) >= 0; })) return [null, "바이너리에 '" + v + "' 모델 ID 문자열이 없어 쓸 수 없습니다 (예: " + PRO_PRESETS.join(', ') + ')'];
+        if (!v || v.length > 64 || !/^[a-z0-9._-]+$/.test(v)) return [null, "유효하지 않은 모델 ID 입니다: '" + raw + "' (영문 소문자·숫자·'-'·'.'·'_', 예: " + MODEL_ID_EXAMPLES + ')'];
+        if (!MODEL_IDS.some(function(m){ return m.indexOf(v) >= 0; })) return [null, "바이너리에 '" + v + "' 모델 ID 문자열이 없어 쓸 수 없습니다 (예: " + MODEL_ID_EXAMPLES + ')'];
         return [v];
       }}
   ];

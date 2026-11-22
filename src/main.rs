@@ -1418,7 +1418,35 @@ fn resolve_compact(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
 // 모드에서만 읽히므로(gateway.applyConfiguredModelTiers 가 유일한 사용처, 정적 분석 기준), PRO(=4) 분기가 지정한 모델 ID 를 바로 돌려주게 바꾼다.
 
 const DEFAULT_PRO_TIER_MODEL: &str = "gemini-4-carbon-high";
-const PRO_TIER_PRESETS: &[&str] = &["gemini-4-carbon-high", "gemini-4-carbon-medium", "gemini-4-carbon-low"];
+/// 대화형 화면에서 -/+ 로 고르는 후보 (`agy models` 기준, 오케스트레이터 전용 모델 제외).
+/// invoke_subagent 에는 effort 인자가 없어 사고 수준은 ID 끝(-low/-medium/-high/-xhigh)으로 정해진다.
+/// 시작할 때 이 바이너리에 문자열로 들어 있는 것만 남긴다. 여기 없는 새 모델은 e 로 직접 입력한다.
+const KNOWN_MODEL_IDS: &[&str] = &[
+    "gemini-4-carbon-high",
+    "gemini-4-carbon-medium",
+    "gemini-4-carbon-low",
+    "gemini-4-hydrogen-xhigh",
+    "gemini-4-hydrogen-high",
+    "gemini-4-hydrogen-medium",
+    "gemini-4-hydrogen-low",
+    "gemini-4-neon-xhigh",
+    "gemini-4-neon-high",
+    "gemini-4-neon-medium",
+    "gemini-4-neon-low",
+    "gemini-4-argon-high",
+    "gemini-4-argon-medium",
+    "gemini-4-argon-low",
+    "claude-opus-5-5-high",
+    "claude-opus-5-5-medium",
+    "claude-opus-5-5-low",
+    "claude-sonnet-5-5-high",
+    "claude-sonnet-5-5-medium",
+    "claude-sonnet-5-5-low",
+    "gemini-3.8-flash-high",
+    "gemini-3.8-flash-medium",
+    "gemini-3.8-flash-low",
+];
+const MODEL_ID_EXAMPLES: &str = "gemini-4-carbon-high, gemini-4-carbon-medium, gemini-4-carbon-low";
 const PRO_TIER_PAD: usize = 24; // 원본 PRO 분기 본문 길이 (뒤따르는 공용 빈 반환 블록은 다른 티어도 쓰므로 그대로 둔다)
 
 fn parse_model_id(raw: &str) -> Result<String, String> {
@@ -1428,27 +1456,66 @@ fn parse_model_id(raw: &str) -> Result<String, String> {
         && id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '.' | '_'));
     if !valid {
         return Err(format!(
-            "유효하지 않은 모델 ID 입니다: '{raw}' (영문 소문자·숫자·'-'·'.'·'_', 예: {})",
-            PRO_TIER_PRESETS.join(", ")
+            "유효하지 않은 모델 ID 입니다: '{raw}' (영문 소문자·숫자·'-'·'.'·'_', 예: {MODEL_ID_EXAMPLES})"
         ));
     }
     Ok(id)
 }
 
-/// 모델 ID 문자열이 들어 있는 위치. 패치한 코드가 가리킬 것이므로 modelIDForTier 와 같은 (실행) 세그먼트에서 찾는다.
-/// Go 문자열은 길이를 따로 들고 다니므로 다른 문자열 사이에 붙어 있어도 된다.
-fn find_model_id_offset(ctx: &BinaryContext, model: &str) -> Result<usize, String> {
+/// 모델 ID 를 찾을 범위. 패치한 코드가 가리킬 것이므로 modelIDForTier 와 같은 (실행) 세그먼트로 한정한다.
+fn model_id_search_range(ctx: &BinaryContext) -> Result<(usize, usize), String> {
     let (func, _) = ctx.get_func("modelutils.modelIDForTier")?;
-    let (lo, hi) = ctx
+    Ok(ctx
         .segments
         .iter()
         .find(|&&(off, _, size)| func >= off && func - off < size)
-        .map_or((0, ctx.data.len()), |&(off, _, size)| (off, off + size));
-    find_subslice(&ctx.data[lo..hi], model.as_bytes())
+        .map_or((0, ctx.data.len()), |&(off, _, size)| (off, off + size)))
+}
+
+/// `needle` 이 나오는 모든 위치. 첫 바이트로 건너뛰므로 수백 MB 에서도 windows() 비교보다 훨씬 빠르다.
+fn find_all<'a>(haystack: &'a [u8], needle: &'a [u8]) -> impl Iterator<Item = usize> + 'a {
+    let first = needle.first().copied();
+    let mut i = 0;
+    std::iter::from_fn(move || {
+        let first = first?;
+        while i + needle.len() <= haystack.len() {
+            let at = i + haystack[i..].iter().position(|&b| b == first)?;
+            i = at + 1;
+            if haystack[at..].starts_with(needle) {
+                return Some(at);
+            }
+        }
+        None
+    })
+}
+
+/// 모델 ID 문자열이 들어 있는 위치.
+/// Go 문자열은 길이를 따로 들고 다니므로 다른 문자열 사이에 붙어 있어도 된다.
+fn find_model_id_offset(ctx: &BinaryContext, model: &str) -> Result<usize, String> {
+    let (lo, hi) = model_id_search_range(ctx)?;
+    find_all(&ctx.data[lo..hi], model.as_bytes())
+        .next()
         .map(|p| lo + p)
-        .ok_or_else(|| {
-            format!("바이너리에 '{model}' 모델 ID 문자열이 없어 쓸 수 없습니다 (예: {})", PRO_TIER_PRESETS.join(", "))
-        })
+        .ok_or_else(|| format!("바이너리에 '{model}' 모델 ID 문자열이 없어 쓸 수 없습니다 (예: {MODEL_ID_EXAMPLES})"))
+}
+
+/// KNOWN_MODEL_IDS 중 이 바이너리에 들어 있는 것 (순서 유지). 접두어마다 한 번만 훑는다.
+fn available_model_ids(ctx: &BinaryContext) -> Vec<&'static str> {
+    let Ok((lo, hi)) = model_id_search_range(ctx) else {
+        return Vec::new();
+    };
+    let hay = &ctx.data[lo..hi];
+    let mut found = vec![false; KNOWN_MODEL_IDS.len()];
+    for prefix in ["gemini-", "claude-"] {
+        for at in find_all(hay, prefix.as_bytes()) {
+            for (k, id) in KNOWN_MODEL_IDS.iter().enumerate() {
+                if !found[k] && id.starts_with(prefix) && hay[at..].starts_with(id.as_bytes()) {
+                    found[k] = true;
+                }
+            }
+        }
+    }
+    KNOWN_MODEL_IDS.iter().zip(found).filter_map(|(id, ok)| ok.then_some(*id)).collect()
 }
 
 /// modelIDForTier 의 PRO 분기 본문 위치와 이미 패치됐는지 여부.
@@ -2720,7 +2787,7 @@ struct TextParam {
     subject: &'static str,
     /// 하단 키 안내에서 -/+ 의 설명
     hint: &'static str,
-    presets: &'static [&'static str],
+    presets: Vec<&'static str>,
     max_len: usize,
     /// 입력값을 정규화하고 바이너리에 해당 문자열이 있는지까지 확인한다
     validate: fn(&BinaryContext, &str) -> Result<String, String>,
@@ -2868,7 +2935,7 @@ impl<'a> Wizard<'a> {
                     label: "코드 블록 테마",
                     subject: "코드 블록 테마가",
                     hint: "테마",
-                    presets: CODE_THEME_PRESETS,
+                    presets: CODE_THEME_PRESETS.to_vec(),
                     max_len: 32,
                     validate: validate_code_theme,
                     value: detect_patched_code_theme(ctx).unwrap_or_else(|| ctx.code_theme.clone()),
@@ -2881,7 +2948,8 @@ impl<'a> Wizard<'a> {
                     label: "pro 티어 모델",
                     subject: "pro 티어 모델이",
                     hint: "모델",
-                    presets: PRO_TIER_PRESETS,
+                    // pro-tier 를 쓸 수 없는 바이너리(ARM64 등)에서는 수백 MB 를 훑지 않는다
+                    presets: if ctx.arch == Arch::X86_64 { available_model_ids(ctx) } else { Vec::new() },
                     max_len: 64,
                     validate: validate_pro_tier_model,
                     value: detect_patched_pro_tier(ctx).unwrap_or_else(|| ctx.pro_tier_model.clone()),
@@ -2988,6 +3056,9 @@ impl<'a> Wizard<'a> {
         };
         if self.avail[pi].is_err() {
             self.flash = Some((S_WARN, format!("'{}' 패치는 이 바이너리에 적용할 수 없습니다.", t.id)));
+            return;
+        }
+        if t.presets.is_empty() {
             return;
         }
         let len = t.presets.len() as isize;
@@ -4075,6 +4146,34 @@ mod tests {
         let mut patches = Vec::new();
         cli.ensure_selected(&mut patches);
         assert_eq!(patches.iter().map(|p| p.id).collect::<Vec<_>>(), ["compact", "pro-tier"]);
+    }
+
+    #[test]
+    fn available_model_ids_keep_known_order_and_binary_presence() {
+        assert_eq!(find_all(b"abcabcab", b"ab").collect::<Vec<_>>(), [0, 3, 6]);
+        assert_eq!(find_all(b"aaaa", b"aa").collect::<Vec<_>>(), [0, 1, 2]);
+        assert_eq!(find_all(b"abc", b"").count(), 0);
+
+        // Go 문자열처럼 구분자 없이 붙어 있는 모델 ID 들
+        let mut buf = vec![0u8; 512];
+        let blob = b"..gemini-4-neon-highclaude-sonnet-5-5-lowgemini-4-carbon-highgemini-4-carbon-lowzz";
+        buf[100..100 + blob.len()].copy_from_slice(blob);
+        let ctx = BinaryContext {
+            data: &buf,
+            format: Format::Elf64,
+            arch: Arch::X86_64,
+            segments: Vec::new(),
+            funcs: [("modelutils.modelIDForTier", (0usize, 64usize))].into_iter().collect(),
+            compact_tokens: DEFAULT_COMPACT_TOKENS,
+            code_theme: DEFAULT_CODE_THEME.to_string(),
+            pro_tier_model: DEFAULT_PRO_TIER_MODEL.to_string(),
+        };
+        assert_eq!(
+            available_model_ids(&ctx),
+            ["gemini-4-carbon-high", "gemini-4-carbon-low", "gemini-4-neon-high", "claude-sonnet-5-5-low"]
+        );
+        assert_eq!(find_model_id_offset(&ctx, "claude-sonnet-5-5-low"), Ok(100 + 20));
+        assert!(find_model_id_offset(&ctx, "gemini-4-neon-xhigh").is_err());
     }
 
     #[test]
