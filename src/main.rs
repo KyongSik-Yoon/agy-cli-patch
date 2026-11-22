@@ -3346,24 +3346,18 @@ fn parse_patch_list(
     code_theme_override: &mut Option<String>,
 ) -> Result<Vec<&'static PatchSpec>, String> {
     let items: Vec<&str> = spec_str.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    let mut out: Vec<&'static PatchSpec> = Vec::new();
     if items.is_empty() || items.contains(&"all") {
         // 'all' 은 기본 활성(default_on) 패치 전체. 기본 꺼짐 패치는 'all,release-notes' 나 'all,compact=180k' 처럼 명시한다.
-        let mut v: Vec<&'static PatchSpec> = PATCH_REGISTRY.iter().filter(|p| p.default_on).collect();
-        for item in &items {
-            let (id, val) = item.split_once('=').map_or((*item, None), |(k, rhs)| (k.trim(), Some(rhs.trim())));
-            apply_inline_patch_arg(id, val, compact_override, code_theme_override)?;
-            if let Some(spec) = PATCH_REGISTRY.iter().find(|p| p.id == id && !p.default_on) {
-                if !v.iter().any(|p| p.id == spec.id) {
-                    v.push(spec);
-                }
-            }
-        }
-        return Ok(v);
+        out.extend(PATCH_REGISTRY.iter().filter(|p| p.default_on));
     }
-    let mut out = Vec::new();
+    // 'all' 과 함께 준 ID 도 하나하나 검사한다 ('all,nodirp' 같은 오타를 조용히 무시하지 않도록)
     for item in items {
         let (id, val) = item.split_once('=').map_or((item, None), |(k, rhs)| (k.trim(), Some(rhs.trim())));
         apply_inline_patch_arg(id, val, compact_override, code_theme_override)?;
+        if id == "all" {
+            continue;
+        }
         let Some(spec) = PATCH_REGISTRY.iter().find(|p| p.id == id) else {
             let valid: Vec<&str> = PATCH_REGISTRY.iter().map(|p| p.id).collect();
             return Err(format!("알 수 없는 패치 ID: '{id}' (사용 가능: all, {})", valid.join(", ")));
@@ -3762,6 +3756,37 @@ mod tests {
         // 버전을 알 수 없으면 덮어쓰지 않는다
         assert!(!should_refresh_backup(VERSION_UNKNOWN, "1.5.12", true));
         assert!(!should_refresh_backup("1.5.13", VERSION_UNKNOWN, true));
+    }
+
+    #[test]
+    fn patch_list_parser_validates_ids_alongside_all() {
+        let parse = |s: &str| {
+            let (mut tokens, mut theme) = (None, None);
+            parse_patch_list(s, &mut tokens, &mut theme)
+                .map(|v| (v.iter().map(|p| p.id).collect::<Vec<_>>(), tokens, theme))
+        };
+        let defaults: Vec<&str> = PATCH_REGISTRY.iter().filter(|p| p.default_on).map(|p| p.id).collect();
+
+        let err = parse("all,nodirp").expect_err("'all' 과 함께 준 오타도 거부해야 함");
+        assert!(err.contains("'nodirp'"), "{err}");
+        assert!(parse("nodirp").is_err());
+
+        assert_eq!(parse("all").unwrap().0, defaults);
+        assert_eq!(parse("").unwrap().0, defaults);
+
+        let (ids, ..) = parse("all,release-notes").unwrap();
+        assert_eq!(ids, [defaults.as_slice(), &["release-notes"]].concat());
+
+        let (ids, tokens, _) = parse("all,compact=200k").unwrap();
+        assert_eq!(ids, [defaults.as_slice(), &["compact"]].concat());
+        assert_eq!(tokens, Some(200_000));
+
+        let (ids, _, theme) = parse("all,code-theme=bw").unwrap();
+        assert_eq!(ids, defaults);
+        assert_eq!(theme.as_deref(), Some("bw"));
+
+        assert_eq!(parse("cjk-bold, nodrip,cjk-bold").unwrap().0, ["cjk-bold", "nodrip"]);
+        assert!(parse("all=1").is_err());
     }
 
     #[test]
