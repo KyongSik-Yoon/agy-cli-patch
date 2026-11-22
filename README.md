@@ -4,7 +4,7 @@
 
 `agy`(Antigravity CLI — **Linux & macOS**, **x86_64 & ARM64/Apple Silicon**) 바이너리의 스트리밍 출력 방식, 마크다운 렌더링 결함, 서브에이전트 모델 티어를 동적 심볼/시그니처 탐색으로 패치하는 초고속 모듈형 도구(Rust)입니다.
 
-릴리즈마다 바뀌는 고정 주소에 의존하지 않고, `mmap` 제로카피 매핑으로 **ELF64**(Linux) 및 **Mach-O 64**(macOS)의 텍스트 섹션과 Go `.gopclntab` 심볼 테이블을 파싱하여 대상 함수를 찾고, 아키텍처별(`x86_64` / `ARM64`) 기계어 시그니처를 검증한 뒤 패치합니다(외부 크레이트 의존성 0, Linux `FICLONE` reflink 및 macOS `codesign -f -s -` 자동 서명 지원). 단, `banner`·`release-notes` 패치는 Linux ARM64에서 지원하지 않습니다(실행 세그먼트에 문자열·트램펄린을 넣을 여유 공간이 없음). macOS Apple Silicon에서는 `pro-tier`를 뺀 모든 패치를 쓸 수 있습니다(`pro-tier`는 아직 x86_64 전용).
+릴리즈마다 바뀌는 고정 주소에 의존하지 않고, `mmap` 제로카피 매핑으로 **ELF64**(Linux) 및 **Mach-O 64**(macOS)의 텍스트 섹션과 Go `.gopclntab` 심볼 테이블을 파싱하여 대상 함수를 찾고, 아키텍처별(`x86_64` / `ARM64`) 기계어 시그니처를 검증한 뒤 패치합니다(외부 크레이트 의존성 0, Linux `FICLONE` reflink 및 macOS `codesign -f -s -` 자동 서명 지원). 단, `banner`·`release-notes` 패치는 Linux ARM64에서 지원하지 않습니다(실행 세그먼트에 문자열·트램펄린을 넣을 여유 공간이 없음). macOS Apple Silicon에서는 티어 고정 패치(`pro-tier`·`flash-tier`·`flash-lite-tier`)를 뺀 모든 패치를 쓸 수 있습니다(티어 고정은 아직 x86_64 전용).
 
 ## 지원하는 패치 목록 (`--list`)
 
@@ -16,7 +16,9 @@
 | `tilde-strike` | `goldmark/extension.(*strikethroughParser).Parse` | `1.5.0~1.5.6`, `H2~H6` 같은 범위 표기용 단일 물결표(`~`)에 취소선이 그어지는 현상 방지 (`~~` 2개만 취소선으로 인식) |
 | `code-theme` | `render.glamourStyleForScheme` | `colorScheme: terminal` 사용 시 흐린 회색(`#d0d0d0`)으로 묻히는 코드 블록 테마(`native`)를 선명한 테마(기본 `vs`)로 교체 |
 | `compact` | `utils.GetCheckpointConfig`, `config.applyFeatureProviderCheckpointOverrideConfig` | 내장 자동 컴팩션(CHECKPOINT) 발동 임계값(기본 256k)을 `32k~1000k`로 조절 (`180k`로 낮춰 `200k` 단가 할증 전 조기 요약 또는 `500k+`로 높여 1M 모델 원문 맥락 유지, **기본 꺼짐**) |
-| `pro-tier` | `modelutils.modelIDForTier` | `invoke_subagent` 등에서 `pro` 티어가 서버가 계정별로 정한 모델(예: `gemini-4-hydrogen-tiered-xhigh`) 대신 고른 모델(기본 `gemini-4-carbon-high`)로 실행되도록 고정. pro 티어를 쓰는 다른 곳(사용자 정의 에이전트의 `model: pro` 등)에도 적용 (x86_64 전용, **기본 꺼짐**) |
+| `pro-tier` | `modelutils.modelIDForTier` | `invoke_subagent` 등에서 `pro` 티어가 서버가 계정별로 정한 모델(예: `gemini-4-hydrogen-tiered-xhigh`) 대신 고른 모델(기본 `gemini-4-carbon-high`)로 실행되도록 고정 (x86_64 전용, **기본 꺼짐**) |
+| `flash-tier` | `modelutils.modelIDForTier` | `flash` 티어를 고른 모델(기본 `gemini-4-neon-medium`)로 고정. `flash_lite`가 없을 때 agy 유틸리티 작업도 이 티어를 씀 (x86_64 전용, Neon은 1.5.12+, **기본 꺼짐**) |
+| `flash-lite-tier` | `modelutils.modelIDForTier` | `flash_lite` 티어를 고른 모델(기본 `gemini-4-hydrogen-low`)로 고정. agy 유틸리티 작업도 이 티어를 먼저 씀 (x86_64 전용, Hydrogen은 1.5.9+, **기본 꺼짐**) |
 | `banner` | `render.BannerWithInfo` | 상단 `Antigravity CLI 1.5.7` 옆에 `(patch v0.2.7)` 형태로 패치 버전 표시 (Linux ARM64 제외) |
 | `release-notes` | `render.BuildHeader` | 로고 아래에 패치 기능 요약 및 GitHub 저장소 정보 표시 (Linux ARM64 제외, **기본 꺼짐** — `-p all,release-notes`처럼 명시해야 적용) |
 
@@ -53,7 +55,7 @@ cd agy-cli-patch
 agy-cli-patch
 ```
 
-- **패치 선택**: `↑↓`(또는 `j`/`k`)로 이동, `space`나 숫자키로 선택, `a`로 전체 선택/해제. `code-theme` 줄에서는 `-`/`+`로 추천 테마(`vs`, `solarized-light`, `bw`, `github`, `catppuccin-latte`, `xcode`)를 순환하거나 `e`로 바이너리에 내장된 Chroma 테마 이름을 직접 입력합니다. `compact` 줄에서는 `-`/`+`로 ±10k씩 증감하거나 `e`를 눌러 `180k`·`160000`처럼 임의 토큰 임계값을 직접 입력합니다. `pro-tier` 줄에서는 `-`/`+`로 이 바이너리에 들어 있는 모델 ID(1.5.13 기준 23개: carbon·hydrogen·neon·argon·Claude Opus/Sonnet·3.8 Flash, 사고 수준별)를 순환하거나 `e`로 목록에 없는 ID를 직접 입력합니다. 커서가 가리키는 패치의 설명과 대상 심볼이 하단에 표시됩니다. 실행 전에 각 패치를 대상 바이너리에 미리 대조하므로, 적용할 수 없는 패치(예: Linux ARM64의 `banner`)는 `✕`와 사유가 표시되고 선택되지 않습니다. `batch`를 켜면 `nodrip`도 함께 켜집니다.
+- **패치 선택**: `↑↓`(또는 `j`/`k`)로 이동, `space`나 숫자키로 선택, `a`로 전체 선택/해제. `code-theme` 줄에서는 `-`/`+`로 추천 테마(`vs`, `solarized-light`, `bw`, `github`, `catppuccin-latte`, `xcode`)를 순환하거나 `e`로 바이너리에 내장된 Chroma 테마 이름을 직접 입력합니다. `compact` 줄에서는 `-`/`+`로 ±10k씩 증감하거나 `e`를 눌러 `180k`·`160000`처럼 임의 토큰 임계값을 직접 입력합니다. 티어 고정 줄(`pro-tier`·`flash-tier`·`flash-lite-tier`)에서는 `-`/`+`로 이 바이너리에 들어 있는 모델 ID(1.5.13 기준 23개: carbon·hydrogen·neon·argon·Claude Opus/Sonnet·3.8 Flash, 사고 수준별)를 순환하거나 `e`로 목록에 없는 ID를 직접 입력합니다. 기본 모델이 바이너리에 없는 옛 버전에서는 켤 때 알리고 `-`/`+`로 고르게 합니다. 커서가 가리키는 패치의 설명과 대상 심볼이 하단에 표시됩니다. 실행 전에 각 패치를 대상 바이너리에 미리 대조하므로, 적용할 수 없는 패치(예: Linux ARM64의 `banner`)는 `✕`와 사유가 표시되고 선택되지 않습니다. `batch`를 켜면 `nodrip`도 함께 켜집니다.
 - **출력 방식**: 새 실행 파일(이름을 바로 편집, 생성 경로와 `~/.local/bin` 링크를 미리 보여줌) 또는 기본 agy에 직접 덮어쓰기(in-place) 중에서 고릅니다. 원본과 같은 경로나 존재하지 않는 디렉토리는 막고, 기존 링크가 다른 파일을 가리키면 교체된다고 경고합니다.
 - **확인**: 적용할 패치와 출력 경로를 확인한 뒤 `enter`로 실행합니다. `esc`로 이전 단계, `q`나 `ctrl+c`로 종료합니다(터미널 상태는 항상 복구됩니다).
 
@@ -90,8 +92,11 @@ agy-cli-patch -p all --compact 500k -o agy-long
 # 인라인 값으로 특정 토큰 임계값 지정 (32k~1000k)
 agy-cli-patch -p all,compact=160k -o agy-batch
 
-# 서브에이전트 'pro' 티어를 카본으로 고정 (x86_64) / 인라인 지정
-agy-cli-patch -p all --pro-tier gemini-4-carbon-high -o agy-batch
+# 서브에이전트 티어 고정: pro→carbon-high, flash→neon-medium, flash_lite→hydrogen-low (x86_64)
+agy-cli-patch -p all,pro-tier,flash-tier,flash-lite-tier -o agy-batch
+
+# 티어별 모델 지정 (옵션 또는 인라인)
+agy-cli-patch -p all --pro-tier gemini-4-carbon-high --flash-tier gemini-4-neon-high -o agy-batch
 agy-cli-patch -p all,pro-tier=gemini-4-carbon-medium -o agy-batch
 
 # 마크다운 패치 2종만 적용해 agy-md 생성
@@ -142,13 +147,16 @@ AGY_CLI_DISABLE_AUTO_UPDATE = "true"
 - `~/.local/bin/<파일 이름>` 자리에 링크가 아닌 일반 파일·디렉토리가 있는 경우 (원래 쓰던 다른 프로그램을 지우지 않도록. `--preset`도 동일)
 - 결과물이 곧 `~/.local/bin/<파일 이름>`인 경우(agy가 `~/.local/bin`에 설치된 경우)에는 링크를 따로 만들지 않습니다.
 
-### `pro-tier`가 바꾸는 범위
+### 티어 고정 패치(`pro-tier`·`flash-tier`·`flash-lite-tier`)가 바꾸는 범위
 
-- `invoke_subagent`, 사용자 정의 에이전트 frontmatter의 `model:`, 훅의 model은 모두 티어(`inherit`/`flash_lite`/`flash`/`pro`)로만 모델을 받고, 실제 모델은 서버가 계정별로 내려주는 티어 목록에서 고릅니다. `pro-tier`는 그중 `pro` 티어가 고른 모델을 돌려주게 바꾸므로, 다른 기능(유틸리티 모델, PolicyGuardian 판정 등)이 `pro` 티어를 고를 때도 같은 모델을 씁니다.
-- 사고 수준(effort)은 모델 ID 끝(`-low`/`-medium`/`-high`/`-xhigh`)으로 정해집니다. `invoke_subagent`에는 effort 인자가 없어서 `pro` 티어로 뜨는 서브에이전트는 모두 고른 ID의 수준으로 돕니다(패치 전 서버 값 `gemini-4-hydrogen-tiered-xhigh`도 xhigh 하나로 고정). 카본은 `-high`가 가장 높습니다.
+- `invoke_subagent`, 사용자 정의 에이전트 frontmatter의 `model:`, 훅의 model은 모두 티어(`inherit`/`flash_lite`/`flash`/`pro`)로만 모델을 받고, 실제 모델은 서버가 계정별로 내려주는 티어 목록에서 고릅니다. 티어 고정 패치는 그 티어가 고른 모델을 돌려주게 바꾸므로, 같은 티어를 쓰는 다른 기능도 같은 모델을 씁니다.
+  - `inherit`(기본값)는 부르는 에이전트의 모델을 그대로 쓰므로 바뀌지 않습니다.
+  - agy 유틸리티 모델은 `flash_lite`, 없으면 `flash` 티어를 씁니다. 그래서 `flash-lite-tier`·`flash-tier`는 유틸리티 작업에도 적용되고, `pro-tier`는 적용되지 않습니다.
+  - PolicyGuardian 판정과 language server는 설정에서 읽은 티어를 쓰므로, 그 티어를 고정했다면 함께 바뀝니다(정적 분석 기준).
+- 사고 수준(effort)은 모델 ID 끝(`-low`/`-medium`/`-high`/`-xhigh`)으로 정해집니다. `invoke_subagent`에는 effort 인자가 없어서 같은 티어로 뜨는 서브에이전트는 모두 고른 ID의 수준으로 돕니다(패치 전 서버의 `pro` 값 `gemini-4-hydrogen-tiered-xhigh`도 xhigh 하나로 고정). 카본은 `-high`가 가장 높습니다.
 - 모델 ID는 바이너리에 문자열로 들어 있는 것만 쓸 수 있습니다(새 코드를 넣지 않고 기존 문자열을 가리키기 때문). 없는 ID를 주면 패치하지 않고 알립니다. 서버 모델 목록(`agy models`)에 없는 ID는 서브에이전트를 띄울 때 모델을 찾지 못해 실패할 수 있으니 `agy models`에 나오는 ID를 쓰세요.
 - PreToolUse 훅이 `invoke_subagent`의 `Model` 인자를 다른 티어로 바꾸면 그 티어가 쓰입니다. 실행 결과에 `A pre-tool hook changed the arguments of this tool call` 이 보이면 훅이 바꾼 것입니다.
-- 로컬 설정으로 티어를 바꾸는 장치(`admin_settings.json`의 `models.tiers`, `AGY_LLM_GATEWAY_TIER_PRO`)는 바이너리를 분석해 보면 LLM 게이트웨이 모드에서만 읽혀, 일반 로그인 환경에서는 효과가 없는 것으로 보입니다.
+- 로컬 설정으로 티어를 바꾸는 장치(`admin_settings.json`의 `models.tiers`, `AGY_LLM_GATEWAY_TIER_PRO`·`_FLASH`·`_FLASH_LITE`)는 바이너리를 분석해 보면 LLM 게이트웨이 모드에서만 읽혀, 일반 로그인 환경에서는 효과가 없는 것으로 보입니다.
 
 ### remote-control 데몬
 
