@@ -1424,6 +1424,8 @@ fn resolve_compact(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
 struct TierSpec {
     id: &'static str,
     flag: &'static str,
+    /// `--tiers` 출력과 decision 훅 AGY_TIER_MODELS 의 키
+    key: &'static str,
     /// 대화형 화면 알림 문구 ("pro 티어 모델: …", "pro 티어 모델이 '…'(으)로 …")
     label: &'static str,
     subject: &'static str,
@@ -1436,6 +1438,7 @@ const TIERS: [TierSpec; 3] = [
     TierSpec {
         id: "pro-tier",
         flag: "--pro-tier",
+        key: "pro",
         label: "pro 티어 모델",
         subject: "pro 티어 모델이",
         tier: 4,
@@ -1444,6 +1447,7 @@ const TIERS: [TierSpec; 3] = [
     TierSpec {
         id: "flash-tier",
         flag: "--flash-tier",
+        key: "flash",
         label: "flash 티어 모델",
         subject: "flash 티어 모델이",
         tier: 3,
@@ -1452,6 +1456,7 @@ const TIERS: [TierSpec; 3] = [
     TierSpec {
         id: "flash-lite-tier",
         flag: "--flash-lite-tier",
+        key: "flash_lite",
         label: "flash_lite 티어 모델",
         subject: "flash_lite 티어 모델이",
         tier: 2,
@@ -1643,6 +1648,17 @@ fn resolve_tier(ctx: &BinaryContext, ti: usize) -> Result<Vec<ByteEdit>, String>
     code.extend_from_slice(&[0x31, 0xc9, 0x31, 0xff, 0xc9, 0xc3]); // error = nil; leave; ret
     code.resize(len, 0xcc);
     Ok(vec![ByteEdit { offset: site, payload: code }])
+}
+
+/// `--tiers` 출력: 이 바이너리에 고정된 티어만 `pro=…,flash=…,flash_lite=…` 로 (없으면 빈 문자열).
+/// decision 훅이 AGY_TIER_MODELS 와 같은 문법으로 읽고, 빠진 티어는 서버 기본값으로 둔다.
+fn tier_query_line(ctx: &BinaryContext) -> String {
+    TIERS
+        .iter()
+        .enumerate()
+        .filter_map(|(ti, t)| detect_patched_tier(ctx, ti).map(|m| format!("{}={m}", t.key)))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn resolve_pro_tier(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
@@ -1971,7 +1987,7 @@ fn resolve_release_notes_a64(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, Strin
 fn resolve_banner(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
     match ctx.arch {
         Arch::X86_64 => {
-            // 제품명 옆 괄호 안에 표시: "Antigravity CLI 1.5.7 (patch v0.2.8)"
+            // 제품명 옆 괄호 안에 표시: "Antigravity CLI 1.5.7 (patch v0.2.9)"
             let chan = format!("patch v{}", env!("CARGO_PKG_VERSION")).into_bytes();
             assert!(chan.len() <= CAVE_NOTES_OFF - CAVE_CHAN_OFF);
 
@@ -2198,7 +2214,7 @@ const PATCH_REGISTRY: &[PatchSpec] = &[
     PatchSpec {
         id: "banner",
         title: "제품명 옆 패치 버전 표시 (Patch Version Tag)",
-        description: "상단 'Antigravity CLI 1.5.7' 옆에 '(patch v0.2.8)' 형태로 패치 버전 표시",
+        description: "상단 'Antigravity CLI 1.5.7' 옆에 '(patch v0.2.9)' 형태로 패치 버전 표시",
         symbol: "render.BannerWithInfo",
         default_on: true,
         resolver: resolve_banner,
@@ -4003,6 +4019,7 @@ fn print_help() {
   --in-place                원본 백업 후 기본 바이너리 덮어쓰기
   --restore                 --in-place 백업 복구
   --notes                   패치 릴리즈 노트 출력 (agy 화면에 넣으려면 -p all,release-notes)
+  --tiers                   바이너리에 고정된 서브에이전트 티어 표를 한 줄로 출력 (예: pro=gemini-4-carbon-high, 없으면 빈 줄)
   -h, --help                도움말 출력"
     );
 }
@@ -4018,6 +4035,7 @@ fn ensure_patch_selected(patches: &mut Vec<&'static PatchSpec>, id: &str) {
 fn run() -> Result<(), String> {
     let mut bin_arg: Option<PathBuf> = None;
     let mut list_mode = false;
+    let mut tiers_mode = false;
     let mut patches_arg: Option<String> = None;
     let mut output_arg: Option<String> = None;
     let mut cli_args = PatchArgs::default();
@@ -4033,6 +4051,7 @@ fn run() -> Result<(), String> {
                 return Ok(());
             }
             "--list" | "-l" => list_mode = true,
+            "--tiers" => tiers_mode = true,
             "--notes" => {
                 println!("{}", release_notes_text());
                 return Ok(());
@@ -4068,6 +4087,16 @@ fn run() -> Result<(), String> {
             }
             other => return Err(format!("알 수 없는 옵션: {other} (--help 참고)")),
         }
+    }
+
+    if tiers_mode {
+        // 읽기 전용 질의. 실행 중인 agy 의 /proc/<pid>/exe 처럼 링크이거나 교체돼 지워진 파일도 열 수 있게
+        // 경로를 canonicalize 하지 않고, 바이너리를 실행하거나 백업을 건드리지 않는다.
+        let path = bin_arg.take().unwrap_or_else(detect_default_binary);
+        let mmap = MmapFile::open(&path)?;
+        let ctx = BinaryContext::parse(mmap.as_slice())?;
+        println!("{}", tier_query_line(&ctx));
+        return Ok(());
     }
 
     if list_mode {
@@ -4370,7 +4399,12 @@ mod tests {
             let edits: Vec<ByteEdit> = resolvers.iter().flat_map(|r| r(&tier_ctx(buf, fn_start, fn_end, models)).unwrap()).collect();
             apply(buf, edits);
         };
+        assert_eq!(tier_query_line(&tier_ctx(&buf, fn_start, fn_end, defaults)), "");
         all(&mut buf, defaults);
+        assert_eq!(
+            tier_query_line(&tier_ctx(&buf, fn_start, fn_end, defaults)),
+            "pro=gemini-4-carbon-high,flash=gemini-4-neon-medium,flash_lite=gemini-4-hydrogen-low"
+        );
         for (ti, &(site, len)) in sites.iter().enumerate() {
             assert_eq!(lea_target(&buf, site), TIERS[ti].default_model);
             assert!(buf[site + 18..site + len].iter().all(|&c| c == 0xcc));

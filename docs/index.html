@@ -324,7 +324,7 @@ footer .links{display:flex;flex-wrap:wrap;gap:6px 18px;margin-top:12px}
 
 <div class="topbar" id="topbar">
   <div class="wrap in">
-    <div class="brand">agy-cli-patch <span>v0.2.8</span></div>
+    <div class="brand">agy-cli-patch <span>v0.2.9</span></div>
     <nav>
       <a class="opt" href="#patches">패치</a>
       <a class="opt" href="#how">원리</a>
@@ -407,10 +407,10 @@ footer .links{display:flex;flex-wrap:wrap;gap:6px 18px;margin-top:12px}
       <button class="mini" data-on="0" aria-label="flash-tier 패치 전후 보기"><span class="lab"><i></i></span><span class="c"><span class="c-before">flash → 서버 지정 모델</span><span class="c-after">flash<b> → gemini-4-neon-medium</b></span></span></button></div>
     <div class="p glow"><div class="id">flash-lite-tier</div><div><div class="d"><code>flash_lite</code> 티어를 고른 모델(기본 <code>gemini-4-hydrogen-low</code>)로 고정합니다. agy 유틸리티 작업도 이 티어를 먼저 씁니다.<span class="tag">x86_64 전용</span><span class="tag">Hydrogen 1.5.9+</span><span class="tag">기본 꺼짐</span></div><div class="sym">modelutils.modelIDForTier</div></div>
       <button class="mini" data-on="0" aria-label="flash-lite-tier 패치 전후 보기"><span class="lab"><i></i></span><span class="c"><span class="c-before">flash_lite → 서버 지정 모델</span><span class="c-after">flash_lite<b> → gemini-4-hydrogen-low</b></span></span></button></div>
-    <div class="p glow"><div class="id">banner</div><div><div class="d">상단 <code>Antigravity CLI 1.5.7</code> 옆에 <code>(patch v0.2.8)</code> 형태로 패치 버전을 표시합니다.<span class="tag">Linux ARM64 제외</span></div><div class="sym">render.BannerWithInfo</div></div>
-      <button class="mini" data-on="0" aria-label="banner 패치 전후 보기"><span class="lab"><i></i></span><span class="c">Antigravity CLI 1.5.7<span class="add"> (patch v0.2.8)</span></span></button></div>
+    <div class="p glow"><div class="id">banner</div><div><div class="d">상단 <code>Antigravity CLI 1.5.7</code> 옆에 <code>(patch v0.2.9)</code> 형태로 패치 버전을 표시합니다.<span class="tag">Linux ARM64 제외</span></div><div class="sym">render.BannerWithInfo</div></div>
+      <button class="mini" data-on="0" aria-label="banner 패치 전후 보기"><span class="lab"><i></i></span><span class="c">Antigravity CLI 1.5.7<span class="add"> (patch v0.2.9)</span></span></button></div>
     <div class="p glow"><div class="id">release-notes</div><div><div class="d">로고 아래에 패치 기능 요약과 저장소 정보를 표시합니다. <code>-p all,release-notes</code>처럼 명시해야 적용됩니다.<span class="tag">Linux ARM64 제외</span><span class="tag">기본 꺼짐</span></div><div class="sym">render.BuildHeader</div></div>
-      <button class="mini" data-on="0" aria-label="release-notes 패치 전후 보기"><span class="lab"><i></i></span><span class="c stt">로고 아래</span><span class="rn"><b>What's new in agy-cli-patch v0.2.8:</b><br><u>•</u> <b>code-theme</b>: readable code block theme (vs) …<br><u>•</u> <b>compact</b>: custom auto-compaction token limit …</span></button></div>
+      <button class="mini" data-on="0" aria-label="release-notes 패치 전후 보기"><span class="lab"><i></i></span><span class="c stt">로고 아래</span><span class="rn"><b>What's new in agy-cli-patch v0.2.9:</b><br><u>•</u> <b>code-theme</b>: readable code block theme (vs) …<br><u>•</u> <b>compact</b>: custom auto-compaction token limit …</span></button></div>
   </div>
 </section>
 
@@ -943,7 +943,7 @@ part('wizard', function(){
     {id: 'pro-tier', t: '서브에이전트 pro 티어 모델 고정 (Pro Tier Model)', d: "invoke_subagent 등에서 'pro' 티어가 서버 지정 모델 대신 고른 모델(기본 gemini-4-carbon-high)로 실행되도록 고정 (기본 꺼짐, x86_64 전용)", s: 'modelutils.modelIDForTier', def: false, off: '0x8939f0f'},
     {id: 'flash-tier', t: '서브에이전트 flash 티어 모델 고정 (Flash Tier Model)', d: "'flash' 티어를 고른 모델(기본 gemini-4-neon-medium)로 고정. flash_lite 가 없을 때 agy 유틸리티 작업도 이 티어를 씀 (기본 꺼짐, x86_64 전용)", s: 'modelutils.modelIDForTier', def: false, off: '0x8939ee5'},
     {id: 'flash-lite-tier', t: '서브에이전트 flash_lite 티어 모델 고정 (Flash-Lite Tier Model)', d: "'flash_lite' 티어를 고른 모델(기본 gemini-4-hydrogen-low)로 고정. agy 유틸리티 작업도 이 티어를 먼저 씀 (기본 꺼짐, x86_64 전용)", s: 'modelutils.modelIDForTier', def: false, off: '0x8939eb7'},
-    {id: 'banner', t: '제품명 옆 패치 버전 표시 (Patch Version Tag)', d: "상단 'Antigravity CLI 1.5.7' 옆에 '(patch v0.2.8)' 형태로 패치 버전 표시", s: 'render.BannerWithInfo', def: true, off: '0xa8a4287, 0xa326f90'},
+    {id: 'banner', t: '제품명 옆 패치 버전 표시 (Patch Version Tag)', d: "상단 'Antigravity CLI 1.5.7' 옆에 '(patch v0.2.9)' 형태로 패치 버전 표시", s: 'render.BannerWithInfo', def: true, off: '0xa8a4287, 0xa326f90'},
     {id: 'release-notes', t: '상단 배너 릴리즈 노트 표시 (Release Notes)', d: '로고 아래에 패치 기능 요약 및 GitHub 정보 표시 (기본 꺼짐, -p 로 명시해야 적용)', s: 'render.BuildHeader', def: false, off: '0xa8a42c7, 0xa8a4610, 0xa318180'}
   ];
   var N = P.length, B = 1, ND = 0, TI = 4, CI = 5;
@@ -1117,7 +1117,7 @@ part('wizard', function(){
   }
   function flashLines(){ return ln('') + (W.flash ? ln(sp(W.flash[0], W.flash[1])) + ln('') : ''); }
   function draw(){
-    var h = '<div class="hdr"><span><span class="ab">agy-cli-patch</span> <span class="dim">v0.2.8</span></span><span class="dim">ELF · x86_64</span></div>';
+    var h = '<div class="hdr"><span><span class="ab">agy-cli-patch</span> <span class="dim">v0.2.9</span></span><span class="dim">ELF · x86_64</span></div>';
     h += ln(sp('dim', '대상') + sp('gr', DIR + '/antigravity') + '<span class="dim" style="flex:none">1.5.7</span>');
     h += ln('');
     var names = ['패치 선택', '출력 방식', '확인'];
