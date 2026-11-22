@@ -4,7 +4,7 @@
 
 `agy`(Antigravity CLI — **Linux & macOS**, **x86_64 & ARM64/Apple Silicon**) 바이너리의 스트리밍 출력 방식, 마크다운 렌더링 결함, 서브에이전트 모델 티어를 동적 심볼/시그니처 탐색으로 패치하는 초고속 모듈형 도구(Rust)입니다.
 
-릴리즈마다 바뀌는 고정 주소에 의존하지 않고, `mmap` 제로카피 매핑으로 **ELF64**(Linux) 및 **Mach-O 64**(macOS)의 텍스트 섹션과 Go `.gopclntab` 심볼 테이블을 파싱하여 대상 함수를 찾고, 아키텍처별(`x86_64` / `ARM64`) 기계어 시그니처를 검증한 뒤 패치합니다(외부 크레이트 의존성 0, Linux `FICLONE` reflink 및 macOS `codesign -f -s -` 자동 서명 지원). 단, `banner`·`release-notes` 패치는 Linux ARM64에서 지원하지 않습니다(실행 세그먼트에 문자열·트램펄린을 넣을 여유 공간이 없음). macOS Apple Silicon에서는 티어 고정 패치(`pro-tier`·`flash-tier`·`flash-lite-tier`)를 포함한 모든 패치를 쓸 수 있습니다.
+릴리즈마다 바뀌는 고정 주소에 의존하지 않고, `mmap` 제로카피 매핑으로 **ELF64**(Linux) 및 **Mach-O 64**(macOS)의 텍스트 섹션과 Go `.gopclntab` 심볼 테이블을 파싱하여 대상 함수를 찾고, 아키텍처별(`x86_64` / `ARM64`) 기계어 시그니처를 검증한 뒤 패치합니다(외부 크레이트 의존성 0, Linux `FICLONE` reflink 및 macOS `codesign -f -s -` 자동 서명 지원). 단, `banner`·`release-notes` 패치는 Linux ARM64와 macOS Intel(x86_64)에서 지원하지 않습니다(실행 세그먼트에 문자열·트램펄린을 넣을 여유 공간이 없음). macOS Apple Silicon에서는 티어 고정 패치(`pro-tier`·`flash-tier`·`flash-lite-tier`)를 포함한 모든 패치를 쓸 수 있습니다.
 
 ## 지원하는 패치 목록 (`--list`)
 
@@ -19,8 +19,8 @@
 | `pro-tier` | `modelutils.modelIDForTier` | `invoke_subagent` 등에서 `pro` 티어가 서버가 계정별로 정한 모델(예: `gemini-4-hydrogen-tiered-xhigh`) 대신 고른 모델(기본 `gemini-4-carbon-high`)로 실행되도록 고정 (**기본 꺼짐**) |
 | `flash-tier` | `modelutils.modelIDForTier` | `flash` 티어를 고른 모델(기본 `gemini-4-neon-medium`)로 고정. `flash_lite`가 없을 때 agy 유틸리티 작업도 이 티어를 씀 (Neon은 1.5.12+, **기본 꺼짐**) |
 | `flash-lite-tier` | `modelutils.modelIDForTier` | `flash_lite` 티어를 고른 모델(기본 `gemini-4-hydrogen-low`)로 고정. agy 유틸리티 작업도 이 티어를 먼저 씀 (Hydrogen은 1.5.9+, **기본 꺼짐**) |
-| `banner` | `render.BannerWithInfo` | 상단 `Antigravity CLI 1.5.7` 옆에 `(patch v0.2.9)` 형태로 패치 버전 표시 (Linux ARM64 제외) |
-| `release-notes` | `render.BuildHeader` | 로고 아래에 패치 기능 요약 및 GitHub 저장소 정보 표시 (Linux ARM64 제외, **기본 꺼짐** — `-p all,release-notes`처럼 명시해야 적용) |
+| `banner` | `render.BannerWithInfo` | 상단 `Antigravity CLI 1.5.7` 옆에 `(patch v0.2.9)` 형태로 패치 버전 표시 (Linux ARM64·macOS Intel 제외) |
+| `release-notes` | `render.BuildHeader` | 로고 아래에 패치 기능 요약 및 GitHub 저장소 정보 표시 (Linux ARM64·macOS Intel 제외, **기본 꺼짐** — `-p all,release-notes`처럼 명시해야 적용) |
 
 ## 설치 및 빌드
 

@@ -1842,14 +1842,15 @@ fn find_banner_site_x86(ctx: &BinaryContext) -> Result<(usize, usize), String> {
     Ok(matches[0])
 }
 
-/// 이미 패치된 banner 가 쓰는 동굴. lea 가 가리키는 채널 문자열 자리에서 구한다.
-fn banner_cave_x86(ctx: &BinaryContext) -> Result<Option<usize>, String> {
+/// 이미 패치된 banner 가 쓰는 동굴과 기존 채널 문자열의 끝. lea 가 가리키는 채널 문자열 자리에서 구한다.
+fn banner_cave_x86(ctx: &BinaryContext) -> Result<Option<(usize, usize)>, String> {
     let Ok((site, 0)) = find_banner_site_x86(ctx) else {
         return Ok(None);
     };
+    let len = read_u32(ctx.data, site + 24) as usize; // mov $len,%edx
     x86_rel32_target(ctx.data, site + 19, site + 23)
         .filter(|&p| ctx.data.get(p..).is_some_and(|s| s.starts_with(b"patch v")))
-        .and_then(|p| p.checked_sub(CAVE_CHAN_OFF))
+        .and_then(|p| Some((p.checked_sub(CAVE_CHAN_OFF)?, p + len)))
         .map(Some)
         .ok_or_else(|| "BannerWithInfo 기존 패치가 가리키는 채널 문자열(\"patch v…\")을 찾을 수 없습니다.".into())
 }
@@ -1877,9 +1878,9 @@ fn find_build_header_call_x86(ctx: &BinaryContext) -> Result<usize, String> {
     Ok(call_site)
 }
 
-/// 이미 패치된 release-notes 가 쓰는 동굴. BuildHeader 가 부르는 트램펄린
+/// 이미 패치된 release-notes 가 쓰는 동굴과 기존 트램펄린의 끝. BuildHeader 가 부르는 트램펄린
 /// (`lea notes(%rip),%r8; mov $len,%r9d; jmp concatstring3`)의 노트 문자열 자리에서 구한다.
-fn release_notes_cave_x86(ctx: &BinaryContext) -> Result<Option<usize>, String> {
+fn release_notes_cave_x86(ctx: &BinaryContext) -> Result<Option<(usize, usize)>, String> {
     let call = find_build_header_call_x86(ctx)?;
     let (concat2, _) = ctx.get_func("runtime.concatstring2")?;
     let (concat3, _) = ctx.get_func("runtime.concatstring3")?;
@@ -1894,35 +1895,102 @@ fn release_notes_cave_x86(ctx: &BinaryContext) -> Result<Option<usize>, String> 
                 .is_some_and(|w| w[0..3] == [0x4c, 0x8d, 0x05] && w[7..9] == [0x41, 0xb9] && w[13] == 0xe9)
                 && x86_rel32_target(d, t + 14, t + 18) == Some(concat3)
         })
-        .and_then(|t| x86_rel32_target(d, t + 3, t + 7))
-        .filter(|&n| n >= CAVE_NOTES_OFF && d.get(n..).is_some_and(|s| s.starts_with(b"\n\n")))
-        .map(|n| Some(n - CAVE_NOTES_OFF))
+        .and_then(|t| Some((x86_rel32_target(d, t + 3, t + 7)?, t + 18)))
+        .filter(|&(n, _)| n >= CAVE_NOTES_OFF && d.get(n..).is_some_and(|s| s.starts_with(b"\n\n")))
+        .map(|(n, end)| Some((n - CAVE_NOTES_OFF, end)))
         .ok_or_else(|| "BuildHeader 가 concatstring2 도, 알아볼 수 있는 릴리즈 노트 트램펄린도 부르지 않습니다.".into())
 }
 
-/// x86_64 banner / release-notes 가 함께 쓸 동굴을 고른다:
-/// 자기 패치가 이미 쓴 동굴(`own`) → 다른 패치가 쓴 동굴(`other`) → 새 0xcc 패딩.
-/// 패치마다 새 동굴을 찾으면 0xcc 패딩이 한 곳뿐인 버전(1.5.9·1.5.10·1.5.12)에서 재패치가 실패한다.
-/// 자기 동굴이 아니면 자기 몫(`own_range`, 동굴 기준 오프셋)이 0xcc 로 비어 있어야 한다
-/// (배치가 다른 옛 패치본에서 동굴 밖을 덮어쓰지 않도록).
+/// banner(채널 문자열) / release-notes(노트 + 트램펄린) 몫
+#[derive(Clone, Copy, PartialEq)]
+enum CavePart {
+    Chan,
+    Notes,
+}
+
+impl CavePart {
+    /// 고정 배치에서 동굴 기준 자기 몫
+    fn range(self) -> std::ops::Range<usize> {
+        match self {
+            CavePart::Chan => CAVE_CHAN_OFF..CAVE_NOTES_OFF,
+            CavePart::Notes => CAVE_NOTES_OFF..CAVE_MIN,
+        }
+    }
+}
+
+/// `from` 부터 이어지는 0xcc 의 끝
+fn cc_run_end(data: &[u8], from: usize) -> usize {
+    from + data.get(from..).map_or(0, |s| s.iter().take_while(|&&b| b == 0xcc).count())
+}
+
+/// 코드 세그먼트(BuildHeader 가 있는 세그먼트) 안의 0xcc 구간 [시작, 끝), 파일 순서 (16바이트 이상만)
+fn code_cc_runs(ctx: &BinaryContext) -> Result<Vec<(usize, usize)>, String> {
+    let (anchor, _) = ctx.get_func("render.BuildHeader")?;
+    let (lo, hi) = ctx
+        .segments
+        .iter()
+        .find(|&&(off, _, size)| off <= anchor && anchor < off + size)
+        .map_or((0, ctx.data.len()), |&(off, _, size)| (off, (off + size).min(ctx.data.len())));
+    let d = &ctx.data[..hi];
+    let mut runs = Vec::new();
+    let mut i = lo;
+    while i < hi {
+        if d[i] != 0xcc {
+            i += 1;
+            continue;
+        }
+        let e = cc_run_end(d, i);
+        if e - i >= 16 {
+            runs.push((i, e));
+        }
+        i = e;
+    }
+    Ok(runs)
+}
+
+/// x86_64 banner / release-notes 가 쓸 자리를 고른다. 반환: (동굴 기준점, 자기 몫을 쓸 수 있는 끝)
+/// 1. 자기 패치가 이미 쓴 자리(`own` = 동굴, 그때 쓴 내용의 끝): 그 뒤로 이어지는 0xcc 까지, 고정 배치 몫을 넘지 않게.
+/// 2. 다른 패치가 쓴 동굴(`other` = 동굴, 그 패치 내용의 끝)에 자기 몫이 0xcc 로 비어 있으면 그 동굴 (고정 배치).
+///    패치마다 새 동굴을 찾으면 0xcc 패딩이 한 곳뿐인 버전(1.5.9·1.5.10·1.5.12)에서 재패치가 실패한다.
+/// 3. 새 1024바이트 0xcc 동굴 (고정 배치: 채널 +0, 노트 +64).
+/// 4. 그런 동굴이 없으면(1.5.14 linux_x64) 대체 배치: 함수 사이 0xcc 구간을 따로 쓴다.
+///    채널은 32~255바이트 구간 중 첫째, 노트는 256바이트 이상 중 가장 긴 것 — 크기대가 달라 서로의 구간을
+///    고르지 않고, 원본 바이트만 보고 각자 골라도 겹치지 않는다. 다른 패치 내용 바로 뒤에 남은 0xcc 꼬리는
+///    고르지 않아 적용 순서와 상관없이 같은 자리가 되고 그 패치의 재패치 여유도 줄지 않는다.
+///    배치가 다른 옛 패치본을 만나도 0xcc 만 쓴다.
+///    동굴 기준점은 자기 문자열 위치에서 고정 배치 오프셋을 뺀 값이라 재패치 때 같은 식으로 되찾는다.
 fn pick_cave_x86(
     ctx: &BinaryContext,
-    own: Option<usize>,
-    other: Option<usize>,
-    own_range: std::ops::Range<usize>,
-) -> Result<usize, String> {
-    if let Some(cave) = own {
-        return Ok(cave);
+    part: CavePart,
+    own: Option<(usize, usize)>,
+    other: Option<(usize, usize)>,
+) -> Result<(usize, usize), String> {
+    let r = part.range();
+    if let Some((cave, content_end)) = own {
+        return Ok((cave, (cave + r.end).min(cc_run_end(ctx.data, content_end).max(content_end))));
     }
-    let cave = match other {
-        Some(cave) => cave,
-        None => find_cave(ctx)?,
+    let free = |cave: usize| {
+        ctx.data
+            .get(cave + r.start..cave + r.end)
+            .is_some_and(|s| s.iter().all(|&b| b == 0xcc))
     };
-    let (start, end) = (cave + own_range.start, cave + own_range.end);
-    if !ctx.data.get(start..end).is_some_and(|s| s.iter().all(|&b| b == 0xcc)) {
-        return Err(format!("동굴 0x{start:x}..0x{end:x} 가 비어 있지 않습니다 (알아볼 수 없는 기존 패치)."));
+    match other {
+        Some((cave, _)) if free(cave) => return Ok((cave, cave + r.end)),
+        None => {
+            if let Ok(cave) = find_cave(ctx) {
+                return Ok((cave, cave + r.end));
+            }
+        }
+        Some(_) => {}
     }
-    Ok(cave)
+    let other_tail = other.map(|(_, end)| end);
+    let runs: Vec<_> = code_cc_runs(ctx)?.into_iter().filter(|&(s, _)| Some(s) != other_tail).collect();
+    let pick = match part {
+        CavePart::Chan => runs.iter().find(|&&(s, e)| (32..256).contains(&(e - s))).copied(),
+        CavePart::Notes => runs.iter().filter(|&&(s, e)| e - s >= 256).max_by_key(|&&(s, e)| e - s).copied(),
+    };
+    pick.and_then(|(s, e)| Some((s.checked_sub(r.start)?, e)))
+        .ok_or_else(|| format!("실행 파일 내 0xcc 여유 공간({CAVE_MIN}바이트, 또는 따로 쓸 구간)을 찾을 수 없습니다."))
 }
 
 /// Mach-O ARM64: `__TEXT` 세그먼트(r-x) 안, 마지막 섹션 뒤의 페이지 정렬 패딩을 동굴로 쓴다.
@@ -2115,16 +2183,25 @@ fn resolve_banner(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
             // 패치된 형태도 받아 패치본을 다시 패치할 수 있게 한다 (두 저장 명령의 위치만 다르다).
             let (chan_site, stores_off) = find_banner_site_x86(ctx)?;
             let chan_site_end = chan_site + 55;
-            let cave = pick_cave_x86(
+            let own = banner_cave_x86(ctx)?;
+            let (cave, limit) = pick_cave_x86(
                 ctx,
-                banner_cave_x86(ctx)?,
+                CavePart::Chan,
+                own,
                 release_notes_cave_x86(ctx).ok().flatten(),
-                CAVE_CHAN_OFF..CAVE_NOTES_OFF,
             )?;
             let chan_off = cave + CAVE_CHAN_OFF;
+            if chan_off + chan.len() > limit {
+                return Err("채널 문자열이 0xcc 여유 공간을 초과합니다.".into());
+            }
+            // 기존 문자열이 더 길었으면 남는 꼬리를 0xcc 로 되돌린다 (다음 재패치 때 쓸 자리를 줄이지 않게)
+            let mut chan_payload = chan.clone();
+            if let Some((_, old_end)) = own {
+                chan_payload.resize(chan.len().max(old_end.saturating_sub(chan_off)), 0xcc);
+            }
             let mut edits = vec![ByteEdit {
                 offset: chan_off,
-                payload: chan.clone(),
+                payload: chan_payload,
             }];
 
             // 원본은 채널 분기 진입 시 제품명 문자열(rax=ptr, rbx=len)을 스택 슬롯에 저장하고,
@@ -2191,11 +2268,12 @@ fn resolve_release_notes(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
             // 이미 패치된 바이너리면 그때 쓴 동굴을 다시 쓴다.
             let call_site = find_build_header_call_x86(ctx)?;
             let (concat3_start, _) = ctx.get_func("runtime.concatstring3")?;
-            let cave_offset = pick_cave_x86(
+            let own = release_notes_cave_x86(ctx)?;
+            let (cave_offset, limit) = pick_cave_x86(
                 ctx,
-                release_notes_cave_x86(ctx)?,
+                CavePart::Notes,
+                own,
                 banner_cave_x86(ctx).ok().flatten(),
-                CAVE_NOTES_OFF..CAVE_MIN,
             )?;
 
             let notes = format!("\n\n{}", release_notes_text()).into_bytes();
@@ -2228,10 +2306,16 @@ fn resolve_release_notes(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
             tramp.push(0xe9);
             tramp.extend_from_slice(&(rel_c3 as i32).to_le_bytes());
 
-            if tramp_va + tramp.len() > cave_offset + CAVE_MIN {
+            if tramp_va + tramp.len() > limit {
                 return Err("릴리즈 노트가 0xcc 여유 공간을 초과합니다.".into());
             }
 
+            // 노트와 트램펄린 사이, 그리고 기존 트램펄린이 더 뒤에 있었으면 그 자리까지 0xcc 로 채운다
+            let mut notes = notes;
+            notes.resize(tramp_va - notes_va, 0xcc);
+            if let Some((_, old_end)) = own {
+                tramp.resize(tramp.len().max(old_end.saturating_sub(tramp_va)), 0xcc);
+            }
             let mut edits = vec![
                 ByteEdit {
                     offset: notes_va,
@@ -5081,11 +5165,86 @@ mod tests {
             assert_eq!(b, expected);
         }
 
-        // 배치를 알아볼 수 없는 옛 패치본: release-notes 동굴의 banner 몫이 비어 있지 않으면 쓰지 않는다
+        // 배치를 알아볼 수 없는 옛 패치본: release-notes 동굴의 banner 몫이 비어 있지 않으면 그 몫에 덮어쓰지 않고
+        // 대체 배치로 다른 0xcc 구간에 쓴다 (노트 뒤에 남은 0xcc 꼬리는 고르지 않는다)
         let mut odd = buf.clone();
         apply_x86(&mut odd, &funcs, &[resolve_release_notes]).unwrap();
         odd[cave + CAVE_CHAN_OFF] = 0x00;
-        assert!(apply_x86(&mut odd, &funcs, &[resolve_banner]).is_err());
+        let before = odd.clone();
+        apply_x86(&mut odd, &funcs, &[resolve_banner]).unwrap();
+        let chan_off = (site as i64 + 23 + read_i32(&odd, site + 19) as i64) as usize;
+        assert_eq!(chan_off, cave + CAVE_CHAN_OFF + 1);
+        assert!((0..odd.len()).filter(|&i| odd[i] != before[i]).all(|i| (site..site + 55).contains(&i) || before[i] == 0xcc));
+    }
+
+    #[test]
+    fn x86_banner_and_release_notes_split_when_no_big_cave() {
+        // agy 1.5.14 linux_x64 처럼 1024바이트 0xcc 동굴이 없고, 함수 사이 0xcc 구간만 있는 합성 바이너리
+        let mut buf = vec![0u8; 16384];
+        let bwi = (64usize, 256usize);
+        let site = bwi.0 + 16;
+        buf[site..site + 9].copy_from_slice(&[0x48, 0x85, 0xd2, 0x0f, 0x84, 0x00, 0x01, 0x00, 0x00]);
+        buf[site + 9..site + 25].copy_from_slice(&[
+            0x48, 0x89, 0x9c, 0x24, 0xb0, 0x02, 0x00, 0x00, 0x48, 0x89, 0x84, 0x24, 0x20, 0x03, 0x00, 0x00,
+        ]);
+        buf[site + 25..site + 55].fill(0xaa);
+        let bh = (256usize, 448usize);
+        let (concat2, concat3) = (512usize, 576usize);
+        let pat = bh.0 + 16;
+        buf[pat..pat + 11].copy_from_slice(&[0x48, 0x89, 0xc7, 0x48, 0x89, 0xde, 0x31, 0xc0, 0x48, 0x8d, 0x1d]);
+        buf[pat + 11..pat + 17].fill(0xaa);
+        let call = pat + 17;
+        buf[call] = 0xe8;
+        buf[call + 1..call + 5].copy_from_slice(&((concat2 as i32) - (call as i32 + 5)).to_le_bytes());
+        let funcs = [
+            ("render.BannerWithInfo", bwi.0, bwi.1),
+            ("render.BuildHeader", bh.0, bh.1),
+            ("runtime.concatstring2", concat2, concat2 + 64),
+            ("runtime.concatstring3", concat3, concat3 + 64),
+        ];
+        // 노트+트램펄린이 딱 들어가는 큰 구간, 채널용 40바이트 구간, 너무 작은 구간들
+        let notes_len = 2 + release_notes_text().len();
+        let n = 8192usize;
+        let notes_end = ((n + notes_len + 15) & !15) + 18;
+        buf[1024..1044].fill(0xcc); // 20바이트: 채널에도 작다
+        buf[2048..2088].fill(0xcc); // 40바이트: 채널 자리
+        buf[3072..3112].fill(0xcc); // 40바이트: 둘째 후보 (첫째만 쓴다)
+        let original = buf.clone();
+        let both: &[Resolver] = &[resolve_banner, resolve_release_notes];
+
+        let with_notes_run = |end: usize| {
+            let mut b = original.clone();
+            b[n..end].fill(0xcc);
+            b
+        };
+        let fresh = with_notes_run(notes_end);
+        let mut expected = fresh.clone();
+        apply_x86(&mut expected, &funcs, both).unwrap();
+        let chan_off = (site as i64 + 23 + read_i32(&expected, site + 19) as i64) as usize;
+        assert_eq!(chan_off, 2048);
+        assert!(expected[n..].starts_with(b"\n\n"));
+        // 호출 자리 밖에서 바뀐 바이트는 모두 원래 0xcc 였다
+        assert!((0..expected.len())
+            .filter(|&i| expected[i] != fresh[i])
+            .all(|i| (site..site + 55).contains(&i) || (call..call + 5).contains(&i) || fresh[i] == 0xcc));
+
+        let mut again = expected.clone();
+        apply_x86(&mut again, &funcs, both).unwrap();
+        assert_eq!(again, expected);
+        for order in [[resolve_banner as Resolver, resolve_release_notes], [resolve_release_notes, resolve_banner]] {
+            let mut b = fresh.clone();
+            for r in order {
+                apply_x86(&mut b, &funcs, &[r]).unwrap();
+                apply_x86(&mut b, &funcs, &[r]).unwrap();
+            }
+            assert_eq!(b, expected);
+        }
+
+        // 노트 구간이 1바이트 모자라면 release-notes 만 실패하고 banner 는 그대로 된다
+        let mut short = with_notes_run(notes_end - 1);
+        assert!(apply_x86(&mut short.clone(), &funcs, &[resolve_release_notes]).is_err());
+        apply_x86(&mut short, &funcs, &[resolve_banner]).unwrap();
+        assert_eq!((site as i64 + 23 + read_i32(&short, site + 19) as i64) as usize, 2048);
     }
 
     fn put_words(buf: &mut [u8], off: usize, insns: &[u32]) {
