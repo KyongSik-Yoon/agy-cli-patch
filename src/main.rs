@@ -1894,6 +1894,7 @@ fn release_notes_text() -> String {
         ("tilde-strike", "only '~~' strikes through, single '~' stays"),
         ("code-theme", "readable code block theme for terminal colorScheme (--code-theme vs)"),
         ("compact", "custom auto-compaction token limit (--compact 180k)"),
+        ("pro-tier", "'pro' subagent tier pinned to a chosen model (--pro-tier gemini-4-carbon-high)"),
         ("banner", "patch version shown next to the product name"),
     ];
     let mut out = format!(
