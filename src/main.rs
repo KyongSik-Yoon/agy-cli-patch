@@ -386,6 +386,7 @@ impl<'a> BinaryContext<'a> {
             "store.cutAtRuneBoundary",
             "render.renderPlannerBody",
             "render.glamourStyleForScheme",
+            "render.glamourStyle", // 1.5.14+ 에서 glamourStyleForScheme 이 이 이름으로 바뀜
             "parser.ScanDelimiter",
             "extension.(*strikethroughParser).Parse",
             "utils.GetCheckpointConfig",
@@ -949,8 +950,15 @@ struct A64CodeThemeSite {
 
 const A64_ORR_IMM6: u32 = 0xb27f_07e0; // orr xL, xzr, #0x6 (원본 "native" 길이)
 
+/// 코드 블록 테마를 정하는 함수: 1.5.13 까지 `render.glamourStyleForScheme`, 1.5.14+ `render.glamourStyle`
+fn code_theme_func(ctx: &BinaryContext) -> Result<(usize, usize), String> {
+    ctx.get_func("render.glamourStyleForScheme")
+        .or_else(|_| ctx.get_func("render.glamourStyle"))
+        .map_err(|_| "심볼 테이블에서 함수를 찾을 수 없습니다: render.glamourStyleForScheme / render.glamourStyle".to_string())
+}
+
 fn find_code_theme_site_a64(ctx: &BinaryContext) -> Result<A64CodeThemeSite, String> {
-    let (start, end) = ctx.get_func("render.glamourStyleForScheme")?;
+    let (start, end) = code_theme_func(ctx)?;
     let d = ctx.data;
     // "terminal" = 0x6c61_6e69_6d72_6574 (little-endian 8바이트)
     let chunks = [0x6574u32, 0x6d72, 0x6e69, 0x6c61];
@@ -1060,8 +1068,17 @@ fn skip_x86_nops(body: &[u8], mut pos: usize) -> usize {
     pos
 }
 
+/// `mov r64, [rsp+disp8|disp32]` 이면 그 길이 (1.5.14 는 "terminal" 상수와 비교 사이에 문자열 포인터를 다시 읽는다)
+fn x86_rsp_load_len(b: &[u8]) -> Option<usize> {
+    match b {
+        [0x48 | 0x4c, 0x8b, m, 0x24, ..] if m & 0xc7 == 0x44 => Some(5),
+        [0x48 | 0x4c, 0x8b, m, 0x24, ..] if m & 0xc7 == 0x84 => Some(8),
+        _ => None,
+    }
+}
+
 fn find_code_theme_site(ctx: &BinaryContext) -> Result<CodeThemeSite, String> {
-    let (start, end) = ctx.get_func("render.glamourStyleForScheme")?;
+    let (start, end) = code_theme_func(ctx)?;
     let body = &ctx.data[start..end];
     let mut matches = Vec::new();
     for i in 0..body.len().saturating_sub(42) {
@@ -1072,7 +1089,10 @@ fn find_code_theme_site(ctx: &BinaryContext) -> Result<CodeThemeSite, String> {
             continue;
         }
         // Go 어셈블러가 Intel JCC Erratum 완화를 위해 cmp/jne 경계에 정렬용 NOP을 삽입할 수 있다.
-        let cmp_rel = skip_x86_nops(body, i + 10);
+        let mut cmp_rel = skip_x86_nops(body, i + 10);
+        if let Some(n) = x86_rsp_load_len(&body[cmp_rel..]) {
+            cmp_rel = skip_x86_nops(body, cmp_rel + n);
+        }
         if cmp_rel + 3 >= body.len() || body[cmp_rel] != 0x48 || body[cmp_rel + 1] != 0x39 {
             continue;
         }
@@ -4846,6 +4866,62 @@ mod tests {
         apply(&mut buf, edits);
         assert_eq!(read_i32(&buf, lea_off + 3), (vs_off as i64 - lea_next as i64) as i32);
         assert_eq!(read_u32(&buf, mov_len_off + 8), 2);
+    }
+
+    #[test]
+    fn resolve_code_theme_accepts_agy_1_5_14_glamour_style() {
+        // agy 1.5.14: 함수 이름이 render.glamourStyle 로 바뀌고, "terminal" 상수와 비교 사이에
+        // 비교할 문자열 포인터를 스택에서 다시 읽는다 (mov 0x19f0(%rsp),%rcx; cmp %rax,(%rcx)).
+        let mut buf = vec![0x90u8; 512];
+        let native_tag = b"<style name=\"native\">";
+        let vs_tag = b"<style name=\"vs\">";
+        buf[16..16 + native_tag.len()].copy_from_slice(native_tag);
+        let native_off = 16 + 13;
+        buf[64..64 + vs_tag.len()].copy_from_slice(vs_tag);
+        let vs_off = 64 + 13;
+
+        let (fn_start, fn_end) = (160usize, 320usize);
+        let site = fn_start + 12;
+        buf[site..site + 2].copy_from_slice(&[0x48, 0xb8]);
+        buf[site + 2..site + 10].copy_from_slice(b"terminal");
+        buf[site + 10..site + 18].copy_from_slice(&[0x48, 0x8b, 0x8c, 0x24, 0xf0, 0x19, 0x00, 0x00]);
+        buf[site + 18..site + 21].copy_from_slice(&[0x48, 0x39, 0x01]);
+        buf[site + 21..site + 27].copy_from_slice(&[0x0f, 0x85, 0xe9, 0x00, 0x00, 0x00]);
+        let lea_off = site + 27;
+        let lea_next = lea_off + 7;
+        buf[lea_off..lea_off + 3].copy_from_slice(&[0x48, 0x8d, 0x05]);
+        buf[lea_off + 3..lea_next].copy_from_slice(&((native_off as i64 - lea_next as i64) as i32).to_le_bytes());
+        buf[lea_next..lea_next + 8].copy_from_slice(&[0x48, 0x89, 0x84, 0x24, 0x10, 0x15, 0x00, 0x00]);
+        let mov_len_off = lea_next + 8;
+        buf[mov_len_off..mov_len_off + 8].copy_from_slice(&[0x48, 0xc7, 0x84, 0x24, 0x18, 0x15, 0x00, 0x00]);
+        buf[mov_len_off + 8..mov_len_off + 12].copy_from_slice(&6u32.to_le_bytes());
+
+        fn ctx_at<'a>(buf: &'a [u8], theme: &str, range: (usize, usize)) -> BinaryContext<'a> {
+            let mut funcs = HashMap::new();
+            funcs.insert("render.glamourStyle", range);
+            BinaryContext {
+                data: buf,
+                format: Format::Elf64,
+                arch: Arch::X86_64,
+                segments: Vec::new(),
+                funcs,
+                compact_tokens: DEFAULT_COMPACT_TOKENS,
+                code_theme: theme.to_string(),
+                tier_models: default_tier_models(),
+            }
+        }
+        let ctx_for = |buf, theme| ctx_at(buf, theme, (fn_start, fn_end));
+        let owned = buf.clone();
+        assert_eq!(detect_patched_code_theme(&ctx_for(&owned, "vs")), None);
+        let edits = resolve_code_theme(&ctx_for(&owned, "vs")).expect("1.5.14 형태도 매칭돼야 함");
+        apply(&mut buf, edits);
+        assert_eq!(read_i32(&buf, lea_off + 3), (vs_off as i64 - lea_next as i64) as i32);
+        assert_eq!(read_u32(&buf, mov_len_off + 8), 2);
+        assert_eq!(detect_patched_code_theme(&ctx_for(&buf, "vs")).as_deref(), Some("vs"));
+        // 스택 읽기가 없는 1.5.13 이하 이름만 있으면 그 이름으로 찾는다 (위 테스트들) — 둘 다 없으면 오류
+        let mut ctx = ctx_for(&owned, "vs");
+        ctx.funcs.clear();
+        assert!(resolve_code_theme(&ctx).err().is_some_and(|e| e.contains("render.glamourStyle")));
     }
 
     #[test]
