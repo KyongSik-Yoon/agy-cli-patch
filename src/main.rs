@@ -204,18 +204,215 @@ fn elf_go_text_va(data: &[u8], segments: &[(usize, usize, usize)], pcln_off: usi
     Some(text as usize)
 }
 
+/// Go 심볼 전체 이름에서 제네릭 인자(`[...]`) 안의 `/`에 흔들리지 않고 `pkg.Func` 접미사만 떼어낸다.
+fn short_go_symbol(full_name: &str) -> &str {
+    let head = full_name.split('[').next().unwrap_or(full_name);
+    match head.rfind('/') {
+        Some(pos) => &full_name[pos + 1..],
+        None => full_name,
+    }
+}
+
+/// Go 1.20+ `.gopclntab` 메타데이터 오프셋.
+/// `ftab` 이진 탐색으로 임의 `CALL`/`BL` 목적지의 심볼을 O(log nfunc)으로 역조회하고,
+/// 함수 이름이 바뀐 릴리즈에서는 `pcfile` -> `cutab` -> `filetab`으로 원본 `.go` 파일 경로를 역추적한다.
+#[derive(Clone, Copy)]
+struct PclnTab {
+    nfunc: usize,
+    go_text_off: usize,
+    funcname_base: usize,
+    cu_base: usize,
+    filetab_base: usize,
+    pctab_base: usize,
+    ftab_base: usize,
+}
+
+impl PclnTab {
+    fn func_name_at<'a>(&self, data: &'a [u8], idx: usize) -> Option<&'a str> {
+        if idx >= self.nfunc {
+            return None;
+        }
+        let ftab_entry = self.ftab_base.checked_add(idx.checked_mul(8)?)?;
+        if ftab_entry + 8 > data.len() {
+            return None;
+        }
+        let func_off = read_u32(data, ftab_entry + 4) as usize;
+        let meta = self.ftab_base.checked_add(func_off)?;
+        if meta + 8 > data.len() {
+            return None;
+        }
+        let name_off = usize::try_from(read_i32(data, meta + 4)).ok()?;
+        let name_start = self.funcname_base.checked_add(name_off)?;
+        let s = data.get(name_start..)?;
+        let len = s.iter().position(|&b| b == 0)?;
+        std::str::from_utf8(&s[..len]).ok()
+    }
+
+    fn func_range(&self, data: &[u8], idx: usize) -> Option<(usize, usize)> {
+        if idx >= self.nfunc {
+            return None;
+        }
+        let ftab_entry = self.ftab_base.checked_add(idx.checked_mul(8)?)?;
+        if ftab_entry + 12 > data.len() {
+            return None;
+        }
+        let entry_off = read_u32(data, ftab_entry) as usize;
+        let next_entry_off = read_u32(data, ftab_entry + 8) as usize;
+        let start = self.go_text_off.checked_add(entry_off)?;
+        let end = self.go_text_off.checked_add(next_entry_off)?;
+        (start <= end && end <= data.len()).then_some((start, end))
+    }
+
+    /// 함수 진입점 파일 오프셋에서 Go 심볼 전체 이름을 O(log nfunc) 이진 탐색으로 찾는다.
+    fn func_at_entry<'a>(&self, data: &'a [u8], target_file_off: usize) -> Option<&'a str> {
+        let rel = u32::try_from(target_file_off.checked_sub(self.go_text_off)?).ok()?;
+        let (mut lo, mut hi) = (0usize, self.nfunc);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let pos = self.ftab_base.checked_add(mid * 8)?;
+            if pos + 4 > data.len() {
+                return None;
+            }
+            if read_u32(data, pos) < rel {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if lo < self.nfunc {
+            let pos = self.ftab_base.checked_add(lo * 8)?;
+            if pos + 4 <= data.len() && read_u32(data, pos) == rel {
+                return self.func_name_at(data, lo);
+            }
+        }
+        None
+    }
+
+    fn func_first_file_off(&self, data: &[u8], idx: usize, max_cu_idx: usize) -> Option<u32> {
+        if idx >= self.nfunc {
+            return None;
+        }
+        let ftab_entry = self.ftab_base.checked_add(idx.checked_mul(8)?)?;
+        if ftab_entry + 8 > data.len() {
+            return None;
+        }
+        let func_off = read_u32(data, ftab_entry + 4) as usize;
+        let meta = self.ftab_base.checked_add(func_off)?;
+        if meta + 36 > data.len() {
+            return None;
+        }
+        let pcfile = read_u32(data, meta + 20);
+        let cu_offset = read_u32(data, meta + 32);
+        if pcfile == 0 || (cu_offset as usize) > max_cu_idx {
+            return None;
+        }
+        let mut pos = self.pctab_base.checked_add(pcfile as usize)?;
+        let (mut uvdelta, mut shift) = (0u32, 0u32);
+        loop {
+            let b = *data.get(pos)?;
+            pos += 1;
+            uvdelta |= u32::from(b & 0x7f) << shift;
+            if b & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+            if shift >= 35 {
+                return None;
+            }
+        }
+        let sdelta = -((uvdelta & 1) as i32) ^ ((uvdelta >> 1) as i32);
+        let fno = u32::try_from(-1i32 + sdelta).ok()?;
+        let cu_idx = cu_offset.checked_add(fno)? as usize;
+        if cu_idx > max_cu_idx {
+            return None;
+        }
+        let cutab_pos = self.cu_base.checked_add(cu_idx.checked_mul(4)?)?;
+        if cutab_pos + 4 > data.len() {
+            return None;
+        }
+        let file_off = read_u32(data, cutab_pos);
+        (file_off != u32::MAX).then_some(file_off)
+    }
+
+    /// `_func`의 `pcfile`(pctab zigzag varint) + `cuOffset`(cutab) + `filetab`을 디코드해
+    /// 함수 진입점이 속한 원본 `.go` 소스 파일 경로를 돌려준다.
+    #[cfg(test)]
+    fn func_first_file<'a>(&self, data: &'a [u8], idx: usize) -> Option<&'a str> {
+        let file_off = self.func_first_file_off(data, idx, usize::MAX)?;
+        let fstart = self.filetab_base.checked_add(file_off as usize)?;
+        let s = data.get(fstart..)?;
+        let len = s.iter().position(|&b| b == 0)?;
+        std::str::from_utf8(&s[..len]).ok()
+    }
+
+    fn funcs_in_file(&self, data: &[u8], file_suffix: &str) -> Vec<(usize, usize)> {
+        let filetab_end = [self.funcname_base, self.cu_base, self.pctab_base, self.ftab_base, data.len()]
+            .into_iter()
+            .filter(|&b| b > self.filetab_base && b <= data.len())
+            .min()
+            .unwrap_or(data.len());
+        let Some(ft_slice) = data.get(self.filetab_base..filetab_end) else {
+            return Vec::new();
+        };
+        let mut needle = Vec::with_capacity(file_suffix.len() + 1);
+        needle.extend_from_slice(file_suffix.as_bytes());
+        needle.push(0);
+
+        let mut target_offs = Vec::new();
+        for rel_hit in find_all(ft_slice, &needle) {
+            if rel_hit == 0 || matches!(ft_slice[rel_hit - 1], 0 | b'/') {
+                let mut start = rel_hit;
+                while start > 0 && ft_slice[start - 1] != 0 {
+                    start -= 1;
+                }
+                if let Ok(off32) = u32::try_from(start) {
+                    target_offs.push(off32);
+                }
+            }
+        }
+        if target_offs.is_empty() {
+            return Vec::new();
+        }
+
+        let cutab_end = [self.funcname_base, self.filetab_base, self.pctab_base, self.ftab_base, data.len()]
+            .into_iter()
+            .filter(|&b| b > self.cu_base && b <= data.len())
+            .min()
+            .unwrap_or(data.len());
+        let max_cu_idx = data
+            .get(self.cu_base..cutab_end)
+            .map(|cu| {
+                (0..cu.len() / 4)
+                    .rfind(|&i| target_offs.contains(&read_u32(cu, i * 4)))
+                    .unwrap_or(usize::MAX)
+            })
+            .unwrap_or(usize::MAX);
+
+        (0..self.nfunc)
+            .filter(|&i| {
+                self.func_first_file_off(data, i, max_cu_idx)
+                    .is_some_and(|fo| target_offs.contains(&fo))
+            })
+            .filter_map(|i| self.func_range(data, i))
+            .collect()
+    }
+}
+
 struct BinaryContext<'a> {
     data: &'a [u8],
     format: Format,
     arch: Arch,
     segments: Vec<(usize, usize, usize)>, // (file_off, va, file_size)
     funcs: HashMap<&'a str, (usize, usize)>,
+    pcln: Option<PclnTab>,
     compact_tokens: u32,
     code_theme: String,
     /// TIERS 순서 (pro, flash, flash_lite)
     tier_models: [String; 3],
     /// Go 코드가 든 코드 섹션(ELF `.text`, Mach-O `__text`)의 파일 범위 [시작, 끝)
     text_section: Option<(usize, usize)>,
+    /// 이번 빌드에 선택된 패치 ID 목록 (`patch-info` 배너 요약 생성용)
+    selected_patches: Vec<&'static str>,
 }
 
 impl<'a> BinaryContext<'a> {
@@ -339,10 +536,16 @@ impl<'a> BinaryContext<'a> {
         };
         let pcln_off = find_subslice(data, pcln_magic)
             .ok_or_else(|| "Go .gopclntab 헤더를 찾을 수 없습니다.".to_string())?;
+        if pcln_off + 72 > data.len() {
+            return Err("Go .gopclntab 헤더가 손상되었습니다.".into());
+        }
 
         let nfunc = read_u64(data, pcln_off + 8) as usize;
         let text_start = read_u64(data, pcln_off + 24) as usize;
         let funcname_off = read_u64(data, pcln_off + 32) as usize;
+        let cu_off = read_u64(data, pcln_off + 40) as usize;
+        let filetab_off = read_u64(data, pcln_off + 48) as usize;
+        let pctab_off = read_u64(data, pcln_off + 56) as usize;
         let ftab_off = read_u64(data, pcln_off + 64) as usize;
 
         let pie_text_off = (text_start == 0 && format == Format::Elf64)
@@ -361,7 +564,7 @@ impl<'a> BinaryContext<'a> {
             off
         } else if format == Format::Elf64 && arch == Arch::X86_64 {
             // Linux ELF64 CGO/PIE: .text 앞쪽 glibc CRT 패딩(0xcc) 직후 첫 Go 함수 프롤로그 탐색
-            let window = &data[text_off..text_off + 0x1000];
+            let window = &data[text_off..(text_off + 0x1000).min(data.len())];
             let mut found = None;
             let mut i = 0;
             while i + 12 < window.len() {
@@ -385,8 +588,15 @@ impl<'a> BinaryContext<'a> {
             text_off
         };
 
-        let ftab_base = pcln_off + ftab_off;
-        let funcname_base = pcln_off + funcname_off;
+        let pcln = PclnTab {
+            nfunc,
+            go_text_off,
+            funcname_base: pcln_off + funcname_off,
+            cu_base: pcln_off + cu_off,
+            filetab_base: pcln_off + filetab_off,
+            pctab_base: pcln_off + pctab_off,
+            ftab_base: pcln_off + ftab_off,
+        };
 
         let target_suffixes = [
             "store.cutAtRuneBoundary",
@@ -406,25 +616,15 @@ impl<'a> BinaryContext<'a> {
 
         let mut funcs = HashMap::with_capacity(target_suffixes.len());
         for i in 0..nfunc {
-            let entry_off = read_u32(data, ftab_base + i * 8) as usize;
-            let func_off = read_u32(data, ftab_base + i * 8 + 4) as usize;
-            let name_off = read_i32(data, ftab_base + func_off + 4) as usize;
-            let name_start = funcname_base + name_off;
-            let s = &data[name_start..];
-            let len = s.iter().position(|&b| b == 0).unwrap_or(0);
-            if let Ok(full_name) = std::str::from_utf8(&s[..len]) {
-                for &target in &target_suffixes {
-                    if full_name.ends_with(target) && {
-                        let prefix_len = full_name.len() - target.len();
-                        prefix_len == 0 || full_name.as_bytes()[prefix_len - 1] == b'/'
-                    } {
-                        let next_entry_off = read_u32(data, ftab_base + (i + 1) * 8) as usize;
-                        funcs.insert(target, (go_text_off + entry_off, go_text_off + next_entry_off));
-                        break;
+            if let Some(full_name) = pcln.func_name_at(data, i) {
+                let short = short_go_symbol(full_name);
+                if let Some(&target) = target_suffixes.iter().find(|&&t| t == short) {
+                    if let Some(range) = pcln.func_range(data, i) {
+                        funcs.insert(target, range);
+                        if funcs.len() == target_suffixes.len() {
+                            break;
+                        }
                     }
-                }
-                if funcs.len() == target_suffixes.len() {
-                    break;
                 }
             }
         }
@@ -435,10 +635,12 @@ impl<'a> BinaryContext<'a> {
             arch,
             segments,
             funcs,
+            pcln: Some(pcln),
             compact_tokens: DEFAULT_COMPACT_TOKENS,
             code_theme: DEFAULT_CODE_THEME.to_string(),
             tier_models: default_tier_models(),
             text_section: Some((text_off, (text_off + text_size).min(data.len()))),
+            selected_patches: Vec::new(),
         })
     }
 
@@ -468,10 +670,134 @@ impl<'a> BinaryContext<'a> {
             .copied()
             .ok_or_else(|| format!("심볼 테이블에서 함수를 찾을 수 없습니다: {name}"))
     }
+
+    /// x86_64 `CALL rel32` (`0xe8`) 목적지의 파일 오프셋
+    fn x86_call_target_off(&self, call_off: usize) -> Option<usize> {
+        if self.data.get(call_off) != Some(&0xe8) || call_off + 5 > self.data.len() {
+            return None;
+        }
+        let pc_va = self.off_to_va(call_off + 5)? as i64;
+        let target_va = usize::try_from(pc_va + read_i32(self.data, call_off + 1) as i64).ok()?;
+        self.va_to_off(target_va)
+    }
+
+    /// ARM64 `BL imm26` 목적지의 파일 오프셋
+    fn a64_bl_target_off(&self, bl_off: usize) -> Option<usize> {
+        if bl_off + 4 > self.data.len() {
+            return None;
+        }
+        let w = word(self.data, bl_off);
+        if !a64::is_bl(w) {
+            return None;
+        }
+        let pc_va = self.off_to_va(bl_off)?;
+        self.va_to_off(a64::branch26_target(w, pc_va))
+    }
+
+    /// 함수 진입점 파일 오프셋에 대응하는 짧은 Go 심볼(`pkg.Func`).
+    /// `.gopclntab`이 있으면 `ftab` 이진 탐색으로 전체 심볼을 조회하고, 없는 합성 테스트에서는 `funcs`에서 찾는다.
+    fn symbol_at_entry(&self, target_off: usize) -> Option<&'a str> {
+        self.pcln
+            .and_then(|p| p.func_at_entry(self.data, target_off))
+            .map(short_go_symbol)
+            .or_else(|| {
+                self.funcs
+                    .iter()
+                    .find_map(|(&name, &(s, _))| (s == target_off).then_some(name))
+            })
+    }
+
+    /// 현재 아키텍처의 직접 함수 호출(`CALL` / `BL`)이 가리키는 대상 Go 심볼 이름
+    fn call_target_symbol(&self, insn_off: usize) -> Option<&'a str> {
+        let target = match self.arch {
+            Arch::X86_64 => self.x86_call_target_off(insn_off)?,
+            Arch::Arm64 => self.a64_bl_target_off(insn_off)?,
+        };
+        self.symbol_at_entry(target)
+    }
+
+    /// x86_64 `LEA disp32(%rip), r64`가 가리키는 (레지스터 번호 0..15, 대상 파일 오프셋)
+    fn x86_lea_target_off(&self, lea_off: usize) -> Option<(u8, usize)> {
+        let w = self.data.get(lea_off..lea_off + 7)?;
+        if !matches!(w[0], 0x48 | 0x4c) || w[1] != 0x8d || (w[2] & 0xc7) != 0x05 {
+            return None;
+        }
+        let reg = ((w[0] & 0x04) << 1) | ((w[2] >> 3) & 7);
+        let pc_va = self.off_to_va(lea_off + 7)? as i64;
+        let target_va = usize::try_from(pc_va + read_i32(self.data, lea_off + 3) as i64).ok()?;
+        Some((reg, self.va_to_off(target_va)?))
+    }
+
+    /// ARM64 `ADRP xP, page; ADD xP, xP, #imm12` 쌍이 가리키는 (레지스터 번호 0..31, 대상 파일 오프셋)
+    fn a64_adrp_add_target_off(&self, adrp_off: usize) -> Option<(u32, usize)> {
+        if adrp_off + 8 > self.data.len() {
+            return None;
+        }
+        let (w0, w1) = (word(self.data, adrp_off), word(self.data, adrp_off + 4));
+        if !a64::is_adrp(w0) || !a64::is_add_imm(w1) {
+            return None;
+        }
+        let p = a64::rd(w0);
+        if a64::rd(w1) != p || a64::add_rn(w1) != p {
+            return None;
+        }
+        let pc_va = self.off_to_va(adrp_off)?;
+        let target_va = a64::adrp_target(w0, pc_va) + a64::add_imm12(w1);
+        Some((p, self.va_to_off(target_va)?))
+    }
+
+    /// 등록된 후보 심볼에서 먼저 매칭을 시도하고, 함수 이름이 바뀐 미래 버전에서는
+    /// `.gopclntab`의 `filetab`에서 같은 원본 `.go` 소스 파일에 속한 함수들로 자동 폴백한다.
+    fn resolve_in_funcs<T, F>(
+        &self,
+        symbols: &[&str],
+        file_suffix: &str,
+        label: &str,
+        mut scan: F,
+    ) -> Result<T, String>
+    where
+        F: FnMut(usize, usize) -> Vec<T>,
+    {
+        let mut named_ranges = Vec::new();
+        for &sym in symbols {
+            if let Some(&range) = self.funcs.get(sym) {
+                if !named_ranges.contains(&range) {
+                    named_ranges.push(range);
+                }
+            }
+        }
+        if !named_ranges.is_empty() {
+            let mut matches: Vec<T> = named_ranges.iter().flat_map(|&(s, e)| scan(s, e)).collect();
+            if matches.len() == 1 {
+                return Ok(matches.pop().unwrap());
+            }
+            if matches.len() > 1 {
+                return Err(format!("{label} 패턴 매칭 실패 (매칭 수: {})", matches.len()));
+            }
+        }
+        if let Some(pcln) = self.pcln {
+            let file_ranges = pcln.funcs_in_file(self.data, file_suffix);
+            if !file_ranges.is_empty() {
+                let mut matches: Vec<T> = file_ranges.into_iter().flat_map(|(s, e)| scan(s, e)).collect();
+                if matches.len() == 1 {
+                    return Ok(matches.pop().unwrap());
+                }
+                return Err(format!("{label} 패턴 매칭 실패 (매칭 수: {})", matches.len()));
+            }
+        }
+        if named_ranges.is_empty() {
+            return Err(format!(
+                "심볼 테이블에서 함수를 찾을 수 없습니다: {}",
+                symbols.join(" / ")
+            ));
+        }
+        Err(format!("{label} 패턴 매칭 실패 (매칭 수: 0)"))
+    }
 }
 
 // --- 패치 명세 및 아키텍처별(x86_64 / ARM64) 리졸버 ---
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ByteEdit {
     offset: usize,
     payload: Vec<u8>,
@@ -486,7 +812,7 @@ struct PatchSpec {
     resolver: fn(&BinaryContext) -> Result<Vec<ByteEdit>, String>,
 }
 
-// --- ARM64 명령어 인코딩/디코딩 (code-theme / compact / banner / release-notes 공용) ---
+// --- ARM64 명령어 인코딩/디코딩 (code-theme / compact / banner / patch-info 공용) ---
 
 mod a64 {
     pub const NOP: u32 = 0xd503201f;
@@ -572,8 +898,10 @@ mod a64 {
         let imm = ((((w >> 5) & 0x7ffff) as i64) << 45) >> 43;
         (pc as i64 + imm) as usize
     }
+    pub const COND_EQ: u32 = 0;
     pub const COND_NE: u32 = 1;
     pub const COND_LO: u32 = 3;
+    pub const COND_LS: u32 = 9;
     pub const COND_GT: u32 = 12;
     pub const BR_X16: u32 = 0xd61f_0200;
     pub const X16: u32 = 16;
@@ -598,26 +926,188 @@ fn a64_mov32_pair_bytes(reg: u32, value: u32) -> Vec<u8> {
     words(&[a64::movz(reg, value & 0xffff), a64::movk16(reg, value >> 16)])
 }
 
+/// x86_64 분기/경계 정렬용 NOP 패딩(`0x90`, `66 90`, `0f 1f ...`)을 건너뛴다.
+fn skip_x86_nops(body: &[u8], mut pos: usize) -> usize {
+    loop {
+        let rest = &body[pos..];
+        let step = if rest.first() == Some(&0x90) {
+            1
+        } else if rest.starts_with(&[0x66, 0x90]) {
+            2
+        } else if rest.starts_with(&[0x0f, 0x1f, 0x00]) {
+            3
+        } else if rest.starts_with(&[0x0f, 0x1f, 0x40, 0x00]) {
+            4
+        } else if rest.starts_with(&[0x0f, 0x1f, 0x44, 0x00, 0x00]) {
+            5
+        } else if rest.starts_with(&[0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00]) {
+            6
+        } else if rest.starts_with(&[0x0f, 0x1f, 0x80, 0x00, 0x00, 0x00, 0x00]) {
+            7
+        } else if rest.starts_with(&[0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00]) {
+            8
+        } else if rest.starts_with(&[0x66, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00]) {
+            9
+        } else {
+            break;
+        };
+        pos += step;
+    }
+    pos
+}
+
+/// x86_64 `cmp $imm8, r32/r64` -> `(명령 길이, imm8)`
+fn x86_cmp_imm8(b: &[u8]) -> Option<(usize, u8)> {
+    match b {
+        [0x83, m, imm, ..] if (0xf8..=0xff).contains(m) => Some((3, *imm)),
+        [0x41 | 0x48 | 0x49, 0x83, m, imm, ..] if (0xf8..=0xff).contains(m) => Some((4, *imm)),
+        _ => None,
+    }
+}
+
+/// x86_64 조건 분기(`70..7f rel8` 또는 `0f 80..8f rel32`) -> `(조건 코드 0..15, 다음 오프셋, 목적지 오프셋)`
+fn x86_jcc_target(body: &[u8], pos: usize) -> Option<(u8, usize, usize)> {
+    let rest = body.get(pos..)?;
+    if let &[op @ 0x70..=0x7f, disp, ..] = rest {
+        let next = pos + 2;
+        let target = usize::try_from(next as isize + (disp as i8 as isize)).ok()?;
+        Some((op - 0x70, next, target))
+    } else if rest.len() >= 6 && rest[0] == 0x0f && (0x80..=0x8f).contains(&rest[1]) {
+        let next = pos + 6;
+        let target = usize::try_from(next as isize + (read_i32(body, pos + 2) as isize)).ok()?;
+        Some((rest[1] - 0x80, next, target))
+    } else {
+        None
+    }
+}
+
+/// x86_64 `mov r64, [rsp + disp8|disp32]` -> `(명령 길이, 소스 레지스터 0..15, 스택 변위)`
+fn x86_rsp_store_info(b: &[u8]) -> Option<(usize, u8, i32)> {
+    match b {
+        [rex @ (0x48 | 0x4c), 0x89, m, 0x24, d, ..] if m & 0xc7 == 0x44 => {
+            Some((5, ((*rex & 4) << 1) | ((m >> 3) & 7), *d as i8 as i32))
+        }
+        [rex @ (0x48 | 0x4c), 0x89, m, 0x24, ..] if b.len() >= 8 && m & 0xc7 == 0x84 => {
+            Some((8, ((*rex & 4) << 1) | ((m >> 3) & 7), read_i32(b, 4)))
+        }
+        _ => None,
+    }
+}
+
+/// x86_64 `movq $imm32, [rsp + disp8|disp32]` -> `(명령 길이, 스택 변위, imm32 상대 오프셋, imm32 값)`
+fn x86_rsp_imm_store_info(b: &[u8]) -> Option<(usize, i32, usize, u32)> {
+    match b {
+        [0x48, 0xc7, 0x44, 0x24, d, ..] if b.len() >= 9 => {
+            Some((9, *d as i8 as i32, 5, read_u32(b, 5)))
+        }
+        [0x48, 0xc7, 0x84, 0x24, ..] if b.len() >= 12 => {
+            Some((12, read_i32(b, 4), 8, read_u32(b, 8)))
+        }
+        _ => None,
+    }
+}
+
+/// `mov r64, [rsp+disp8|disp32]` 이면 그 길이
+fn x86_rsp_load_len(b: &[u8]) -> Option<usize> {
+    match b {
+        [0x48 | 0x4c, 0x8b, m, 0x24, ..] if m & 0xc7 == 0x44 => Some(5),
+        [0x48 | 0x4c, 0x8b, m, 0x24, ..] if b.len() >= 8 && m & 0xc7 == 0x84 => Some(8),
+        _ => None,
+    }
+}
+
 const X86_CUT_ORIG: &[u8] = &[0x55, 0x48, 0x89, 0xe5];
 const X86_CUT_NEW: &[u8] = &[0x48, 0x89, 0xd8, 0xc3];
 
 const ARM64_CUT_ORIG: &[u8] = &[0x90, 0x0b, 0x40, 0xf9, 0xff, 0x63, 0x30, 0xeb];
 const ARM64_CUT_NEW: &[u8] = &[0xe0, 0x03, 0x01, 0xaa, 0xc0, 0x03, 0x5f, 0xd6]; // mov x0, x1; ret
 
+fn is_valid_x86_cut_prologue(b: &[u8]) -> bool {
+    b.starts_with(X86_CUT_ORIG)
+        || b.starts_with(&[0x49, 0x3b, 0x66, 0x10]) // cmp 0x10(%r14), %rsp
+        || matches!(b, [0x4c, 0x8d, 0x64 | 0xa4, 0x24, ..]) // lea disp(%rsp), %r12 (스택 가드)
+        || b.starts_with(&[0x48, 0x39, 0xcb]) // 프레임 없는 리프: cmp %rcx, %rbx
+}
+
+fn is_valid_a64_cut_prologue(b: &[u8]) -> bool {
+    if b.len() < 8 {
+        return false;
+    }
+    let w0 = word(b, 0);
+    b.starts_with(ARM64_CUT_ORIG)
+        || (w0 & 0xffc0_03ff) == 0xd100_03ff // sub sp, sp, #imm
+        || (w0 & 0xffc0_03ff) == 0xd100_03f0 // sub x16, sp, #imm (큰 프레임 스택 가드)
+        || (w0 & 0xffc0_7fff) == 0xa980_7bfd // stp x29, x30, [sp, #-N]!
+        || w0 == 0xeb02_003f // 프레임 없는 리프: cmp x1, x2
+}
+
+/// Go 표준 `unicode/utf8.first` 256바이트 테이블(0x00..0x7f = 0xf0, 0x80..0xc1 = 0xf1) 여부 확인
+fn is_utf8_first_table(data: &[u8], off: usize) -> bool {
+    let Some(tbl) = data.get(off..off + 194) else {
+        return false;
+    };
+    tbl[..128].iter().all(|&b| b == 0xf0) && tbl[128..194].iter().all(|&b| b == 0xf1)
+}
+
+fn find_cut_func(ctx: &BinaryContext) -> Result<(usize, usize), String> {
+    if let Some(&range) = ctx.funcs.get("store.cutAtRuneBoundary") {
+        return Ok(range);
+    }
+    if let Some(pcln) = ctx.pcln {
+        let mut hits = Vec::new();
+        for (s, e) in pcln.funcs_in_file(ctx.data, "cli/store/text_drip.go") {
+            let body = &ctx.data[s..e];
+            let matched = match ctx.arch {
+                Arch::X86_64 => {
+                    body.starts_with(X86_CUT_NEW)
+                        || (0..body.len().saturating_sub(7)).any(|p| {
+                            ctx.x86_lea_target_off(s + p)
+                                .is_some_and(|(_, toff)| is_utf8_first_table(ctx.data, toff))
+                                || ctx
+                                    .call_target_symbol(s + p)
+                                    .is_some_and(|sym| sym.starts_with("utf8."))
+                        })
+                }
+                Arch::Arm64 => {
+                    body.starts_with(ARM64_CUT_NEW)
+                        || (0..body.len().saturating_sub(8)).step_by(4).any(|p| {
+                            ctx.a64_adrp_add_target_off(s + p)
+                                .is_some_and(|(_, toff)| is_utf8_first_table(ctx.data, toff))
+                                || ctx
+                                    .call_target_symbol(s + p)
+                                    .is_some_and(|sym| sym.starts_with("utf8."))
+                        })
+                }
+            };
+            if matched {
+                hits.push((s, e));
+            }
+        }
+        if hits.len() == 1 {
+            return Ok(hits[0]);
+        }
+        if hits.len() > 1 {
+            return Err(format!("cutAtRuneBoundary 폴백 매칭 모호함 (매칭 수: {})", hits.len()));
+        }
+    }
+    Err("심볼 테이블에서 함수를 찾을 수 없습니다: store.cutAtRuneBoundary".to_string())
+}
+
 fn is_unpatched_cut(ctx: &BinaryContext) -> Result<bool, String> {
-    let (start, _) = ctx.get_func("store.cutAtRuneBoundary")?;
+    let (start, end) = find_cut_func(ctx)?;
+    let body = &ctx.data[start..end];
     Ok(match ctx.arch {
-        Arch::X86_64 => &ctx.data[start..start + 4] == X86_CUT_ORIG,
-        Arch::Arm64 => &ctx.data[start..start + 8] == ARM64_CUT_ORIG,
+        Arch::X86_64 => !body.starts_with(X86_CUT_NEW) && is_valid_x86_cut_prologue(body),
+        Arch::Arm64 => !body.starts_with(ARM64_CUT_NEW) && is_valid_a64_cut_prologue(body),
     })
 }
 
 fn resolve_nodrip(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
-    let (start, _) = ctx.get_func("store.cutAtRuneBoundary")?;
+    let (start, end) = find_cut_func(ctx)?;
+    let body = &ctx.data[start..end];
     match ctx.arch {
         Arch::X86_64 => {
-            let cur = &ctx.data[start..start + 4];
-            if cur != X86_CUT_ORIG && cur != X86_CUT_NEW {
+            if body.len() < 4 || (!body.starts_with(X86_CUT_NEW) && !is_valid_x86_cut_prologue(body)) {
                 return Err(format!("cutAtRuneBoundary x86_64 프롤로그 불일치 (@0x{start:x})"));
             }
             Ok(vec![ByteEdit {
@@ -626,8 +1116,7 @@ fn resolve_nodrip(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
             }])
         }
         Arch::Arm64 => {
-            let cur = &ctx.data[start..start + 8];
-            if cur != ARM64_CUT_ORIG && cur != ARM64_CUT_NEW {
+            if body.len() < 8 || (!body.starts_with(ARM64_CUT_NEW) && !is_valid_a64_cut_prologue(body)) {
                 return Err(format!("cutAtRuneBoundary ARM64 프롤로그 불일치 (@0x{start:x})"));
             }
             Ok(vec![ByteEdit {
@@ -639,256 +1128,395 @@ fn resolve_nodrip(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
 }
 
 fn resolve_batch(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
-    let (start, end) = ctx.get_func("render.renderPlannerBody")?;
-    let body = &ctx.data[start..end];
-    let mut edits = Vec::new();
-
-    match ctx.arch {
-        Arch::X86_64 => {
-            for i in 0..body.len().saturating_sub(19) {
-                if body[i] != 0x83 || !(0xf8..=0xff).contains(&body[i + 1]) || body[i + 2] != 0x01 {
-                    continue;
-                }
-                // Go 어셈블러가 Intel JCC Erratum 완화를 위해 cmp/jcc 경계에 정렬용 NOP을 삽입할 수 있다.
-                let jbe = skip_x86_nops(body, i + 3);
-                if jbe + 2 > body.len() || body[jbe] != 0x76 {
-                    continue;
-                }
-                let jbe_disp = body[jbe + 1] as i8;
-                if jbe_disp <= 0 {
-                    continue;
-                }
-                let jbe_target = jbe + 2 + jbe_disp as usize;
-
-                let cmp8 = skip_x86_nops(body, jbe + 2);
-                if cmp8 + 3 > body.len()
-                    || body[cmp8] != 0x83
-                    || !(0xf8..=0xff).contains(&body[cmp8 + 1])
-                    || body[cmp8 + 2] != 0x08
-                {
-                    continue;
-                }
-                let je = skip_x86_nops(body, cmp8 + 3);
-                if je + 2 > body.len() || body[je] != 0x74 {
-                    continue;
-                }
-                let je_disp = body[je + 1] as i8;
-                if je_disp <= 0 {
-                    continue;
-                }
-                let je_target = je + 2 + je_disp as usize;
-                if je_target != jbe_target {
-                    continue;
-                }
-
-                let cmp11 = skip_x86_nops(body, je + 2);
-                if cmp11 + 3 > body.len()
-                    || body[cmp11] != 0x83
-                    || !(0xf8..=0xff).contains(&body[cmp11 + 1])
-                    || body[cmp11 + 2] != 0x0b
-                {
-                    continue;
-                }
-                let jne = skip_x86_nops(body, cmp11 + 3);
-                let after_jne = if jne + 6 <= body.len() && body[jne] == 0x0f && body[jne + 1] == 0x85 {
-                    jne + 6
-                } else if jne + 2 <= body.len() && body[jne] == 0x75 {
-                    jne + 2
-                } else {
-                    continue;
-                };
-
-                if (jbe_target == after_jne || jbe_target == skip_x86_nops(body, after_jne))
-                    && jbe_target + 8 <= body.len()
-                {
-                    edits.push(ByteEdit {
-                        offset: start + jbe_target,
-                        payload: vec![0x31, 0xc0, 0x31, 0xdb, 0x31, 0xc9, 0xc9, 0xc3],
-                    });
-                }
-            }
-        }
-        Arch::Arm64 => {
-            for off in (0..body.len().saturating_sub(28)).step_by(4) {
-                let i0 = read_u32(body, off);
-                let i1 = read_u32(body, off + 4);
-                let i2 = read_u32(body, off + 8);
-                let i3 = read_u32(body, off + 12);
-                let i4 = read_u32(body, off + 16);
-                let i5 = read_u32(body, off + 20);
-                if (i0 & 0xffff_fc1f) == 0x7100_041f
-                    && i1 == 0x5400_00a9
-                    && (i2 & 0xffff_fc1f) == 0x7100_201f
-                    && i3 == 0x5400_0060
-                    && (i4 & 0xffff_fc1f) == 0x7100_2c1f
-                    && (i5 & 0xff00_001f) == 0x5400_0001
-                {
-                    let mut imm19 = ((i5 >> 5) & 0x7ffff) as i32;
-                    if (imm19 & 0x40000) != 0 {
-                        imm19 -= 0x80000;
+    ctx.resolve_in_funcs(
+        &["render.renderPlannerBody"],
+        "cli/render/planner_body.go",
+        "renderPlannerBody 분기",
+        |start, end| {
+            let body = &ctx.data[start..end];
+            let mut edits = Vec::new();
+            match ctx.arch {
+                Arch::X86_64 => {
+                    for i in 0..body.len().saturating_sub(14) {
+                        let Some((cmp0_len, 1)) = x86_cmp_imm8(&body[i..]) else {
+                            continue;
+                        };
+                        let jbe_pos = skip_x86_nops(body, i + cmp0_len);
+                        let Some((6, mut next, stream_target)) = x86_jcc_target(body, jbe_pos) else {
+                            continue;
+                        };
+                        if stream_target <= next || stream_target + 8 > body.len() {
+                            continue;
+                        }
+                        let mut mid_count = 0usize;
+                        loop {
+                            let cur = skip_x86_nops(body, next);
+                            let Some((cmp_len, imm)) = x86_cmp_imm8(body.get(cur..).unwrap_or(&[])) else {
+                                break;
+                            };
+                            if imm >= 0x40 {
+                                break;
+                            }
+                            let jcc_pos = skip_x86_nops(body, cur + cmp_len);
+                            let Some((cc, jcc_next, target)) = x86_jcc_target(body, jcc_pos) else {
+                                break;
+                            };
+                            if matches!(cc, 4 | 6) && target == stream_target {
+                                mid_count += 1;
+                                next = jcc_next;
+                                continue;
+                            }
+                            if cc == 5
+                                && mid_count >= 1
+                                && (stream_target == jcc_next || stream_target == skip_x86_nops(body, jcc_next))
+                            {
+                                let candidate = vec![ByteEdit {
+                                    offset: start + stream_target,
+                                    payload: vec![0x31, 0xc0, 0x31, 0xdb, 0x31, 0xc9, 0xc9, 0xc3],
+                                }];
+                                if !edits.contains(&candidate) {
+                                    edits.push(candidate);
+                                }
+                            }
+                            break;
+                        }
                     }
-                    // mov x0, xzr (0xaa1f03e0); mov x1, xzr (0xaa1f03e1); b <done_epilogue>
-                    let b_insn = 0x1400_0000u32 | (((imm19 - 3) as u32) & 0x03ff_ffff);
-                    let mut payload = Vec::with_capacity(12);
-                    payload.extend_from_slice(&0xaa1f_03e0u32.to_le_bytes());
-                    payload.extend_from_slice(&0xaa1f_03e1u32.to_le_bytes());
-                    payload.extend_from_slice(&b_insn.to_le_bytes());
-                    edits.push(ByteEdit {
-                        offset: start + off + 24,
-                        payload,
-                    });
+                }
+                Arch::Arm64 => {
+                    let is_cmp_imm = |w: u32| (w & 0xffc0_001f) == 0x7100_001f;
+                    let cmp_imm = |w: u32| (w >> 10) & 0xfff;
+                    for off in (0..body.len().saturating_sub(24)).step_by(4) {
+                        let i0 = read_u32(body, off);
+                        let i1 = read_u32(body, off + 4);
+                        if !is_cmp_imm(i0) || cmp_imm(i0) != 1 || a64::bcond(i1) != Some(a64::COND_LS) {
+                            continue;
+                        }
+                        let stream_rel = a64::bcond_target(i1, off + 4);
+                        if stream_rel <= off + 8 || stream_rel + 12 > body.len() {
+                            continue;
+                        }
+                        let mut cur = off + 8;
+                        let mut mid_count = 0usize;
+                        while cur + 8 <= stream_rel {
+                            let cw = read_u32(body, cur);
+                            if cw == a64::NOP {
+                                cur += 4;
+                                continue;
+                            }
+                            let bw = read_u32(body, cur + 4);
+                            if !is_cmp_imm(cw) || cmp_imm(cw) >= 0x40 {
+                                break;
+                            }
+                            match a64::bcond(bw) {
+                                Some(a64::COND_EQ | a64::COND_LS)
+                                    if a64::bcond_target(bw, cur + 4) == stream_rel =>
+                                {
+                                    mid_count += 1;
+                                    cur += 8;
+                                }
+                                Some(a64::COND_NE) if mid_count >= 1 => {
+                                    let mut fall = cur + 8;
+                                    while fall + 4 <= body.len() && read_u32(body, fall) == a64::NOP {
+                                        fall += 4;
+                                    }
+                                    if fall == stream_rel {
+                                        let done_rel = a64::bcond_target(bw, cur + 4);
+                                        if let Ok(b_insn) = a64::b(stream_rel + 8, done_rel) {
+                                            edits.push(vec![ByteEdit {
+                                                offset: start + stream_rel,
+                                                payload: words(&[0xaa1f_03e0, 0xaa1f_03e1, b_insn]),
+                                            }]);
+                                        }
+                                    }
+                                    break;
+                                }
+                                _ => break,
+                            }
+                        }
+                    }
                 }
             }
+            edits
+        },
+    )
+}
+
+fn x86_test_reg8_len(b: &[u8]) -> Option<usize> {
+    match b {
+        [0x84, m, ..] if (0xc0..=0xff).contains(m) => Some(2),
+        [0x40..=0x45, 0x84, m, ..] if (0xc0..=0xff).contains(m) => Some(3),
+        _ => None,
+    }
+}
+
+fn x86_movzbl_rsp_len(b: &[u8]) -> Option<usize> {
+    match b {
+        [0x0f, 0xb6, m, 0x24, ..] if b.len() >= 5 && m & 0xc7 == 0x44 => Some(5),
+        [0x0f, 0xb6, m, 0x24, ..] if b.len() >= 8 && m & 0xc7 == 0x84 => Some(8),
+        [0x44, 0x0f, 0xb6, m, 0x24, ..] if b.len() >= 6 && m & 0xc7 == 0x44 => Some(6),
+        [0x44, 0x0f, 0xb6, m, 0x24, ..] if b.len() >= 9 && m & 0xc7 == 0x84 => Some(9),
+        _ => None,
+    }
+}
+
+fn x86_mov_imm1_len(b: &[u8]) -> Option<usize> {
+    match b {
+        [0xb8..=0xbf, 1, 0, 0, 0, ..] => Some(5),
+        [0x41, 0xb8..=0xbf, 1, 0, 0, 0, ..] => Some(6),
+        _ => None,
+    }
+}
+
+fn match_cjk_bold_x86(body: &[u8], i: usize) -> Option<(usize, usize)> {
+    let t1_len = x86_test_reg8_len(body.get(i..)?)?;
+    let br1 = skip_x86_nops(body, i + t1_len);
+    let &op1 = body.get(br1)?;
+    if op1 != 0x74 && op1 != 0xeb {
+        return None;
+    }
+    let d1 = *body.get(br1 + 1)? as i8;
+    if d1 <= 0 {
+        return None;
+    }
+    let else1 = br1 + 2 + d1 as usize;
+    if else1 >= body.len() {
+        return None;
+    }
+    // leftFlanking then-블록: 스택 바이트 로드 후 조건/무조건 분기로 after_mov1 합류
+    let first_load = skip_x86_nops(body, br1 + 2);
+    x86_movzbl_rsp_len(body.get(first_load..)?)?;
+
+    let mut mov1 = skip_x86_nops(body, else1);
+    if let Some(n) = x86_movzbl_rsp_len(body.get(mov1..)?) {
+        mov1 = skip_x86_nops(body, mov1 + n);
+    }
+    let m1_len = x86_mov_imm1_len(body.get(mov1..)?)?;
+    let after_mov1 = skip_x86_nops(body, mov1 + m1_len);
+
+    // then-블록 끝의 jmp rel8 이 after_mov1 로 합류하는지 확인
+    let has_join_jmp = (br1 + 2..else1.saturating_sub(1)).any(|p| {
+        body[p] == 0xeb && {
+            let d = body[p + 1] as i8;
+            d > 0 && {
+                let t = p + 2 + d as usize;
+                t == mov1 + m1_len || t == after_mov1
+            }
         }
+    });
+    if !has_join_jmp {
+        return None;
     }
 
-    if edits.len() != 1 {
-        return Err(format!(
-            "renderPlannerBody 분기 패턴 매칭 실패 (매칭 수: {})",
-            edits.len()
-        ));
+    let tm_len = x86_test_reg8_len(body.get(after_mov1..)?)?;
+    let je2 = skip_x86_nops(body, after_mov1 + tm_len);
+    if body.get(je2) != Some(&0x74) {
+        return None;
     }
-    Ok(edits)
+    let d2 = *body.get(je2 + 1)? as i8;
+    if d2 <= 0 {
+        return None;
+    }
+    let right_else = je2 + 2 + d2 as usize;
+    if right_else >= body.len() {
+        return None;
+    }
+    let mut test2 = skip_x86_nops(body, right_else);
+    if let Some(n) = x86_movzbl_rsp_len(body.get(test2..)?) {
+        test2 = skip_x86_nops(body, test2 + n);
+    }
+    let t2_len = x86_test_reg8_len(body.get(test2..)?)?;
+    let br2 = skip_x86_nops(body, test2 + t2_len);
+    let &op2 = body.get(br2)?;
+    if op2 != 0x74 && op2 != 0xeb {
+        return None;
+    }
+    let d3 = *body.get(br2 + 1)? as i8;
+    if d3 <= 0 {
+        return None;
+    }
+    let else2 = br2 + 2 + d3 as usize;
+    let lim = (else2 + 8).min(body.len());
+    let has_mov2 = (else2..lim).any(|p| x86_mov_imm1_len(&body[p..]).is_some());
+    has_mov2.then_some((br1, br2))
+}
+
+/// ARM64 `tbz wR, #0, +words` 또는 이미 패치된 `b +words`에서 양수 워드 변위 추출
+fn a64_tbz_bit0_or_b_words(w: u32) -> Option<u32> {
+    if (w & 0xfff8_0000) == 0x3600_0000 {
+        let imm14 = (w >> 5) & 0x3fff;
+        (3..=10).contains(&imm14).then_some(imm14)
+    } else if a64::is_b(w) {
+        let imm26 = w & 0x03ff_ffff;
+        (3..=10).contains(&imm26).then_some(imm26)
+    } else {
+        None
+    }
+}
+
+fn a64_is_mov_imm1(w: u32) -> bool {
+    (w & 0xffff_ffe0) == 0xb240_03e0
+        || (w & 0xffff_ffe0) == 0x3200_03e0
+        || (w & 0xffff_ffe0) == 0x5280_0020
+        || (w & 0xffff_ffe0) == 0xd280_0020
 }
 
 fn resolve_cjk_bold(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
-    let (start, end) = ctx.get_func("parser.ScanDelimiter")?;
-    let body = &ctx.data[start..end];
+    let label = match ctx.arch {
+        Arch::X86_64 => "ScanDelimiter x86_64 플랭킹",
+        Arch::Arm64 => "ScanDelimiter ARM64 플랭킹",
+    };
+    ctx.resolve_in_funcs(
+        &["parser.ScanDelimiter"],
+        "goldmark/parser/delimiter.go",
+        label,
+        |start, end| {
+            let body = &ctx.data[start..end];
+            // `.gopclntab`에서 `unicode.IsSpace` 호출이 보이면 마지막 호출 직후 192바이트 창으로 좁힌다.
+            let scan_lo = match ctx.arch {
+                Arch::X86_64 => (0..body.len().saturating_sub(5))
+                    .rfind(|&p| ctx.call_target_symbol(start + p) == Some("unicode.IsSpace"))
+                    .map_or(0, |p| p + 5),
+                Arch::Arm64 => (0..body.len().saturating_sub(4))
+                    .step_by(4)
+                    .rfind(|&p| ctx.call_target_symbol(start + p) == Some("unicode.IsSpace"))
+                    .map_or(0, |p| p + 4),
+            };
+            let scan_hi = if scan_lo > 0 { (scan_lo + 192).min(body.len()) } else { body.len() };
 
-    match ctx.arch {
-        Arch::X86_64 => {
-            let mut matches = Vec::new();
-            for i in 0..body.len().saturating_sub(54) {
-                let w = &body[i..i + 54];
-                if w[0] == 0x84
-                    && w[1] == 0xc0
-                    && (w[2] == 0x74 || w[2] == 0xeb)
-                    && w[3] == 0x10
-                    && &w[4..8] == &[0x0f, 0xb6, 0x54, 0x24]
-                    && &w[9..13] == &[0x84, 0xd2, 0x75, 0x0c]
-                    && &w[13..17] == &[0x0f, 0xb6, 0x5c, 0x24]
-                    && &w[18..20] == &[0xeb, 0x0a]
-                    && &w[25..36]
-                        == &[0xbb, 0x01, 0x00, 0x00, 0x00, 0x84, 0xd2, 0x74, 0x0b, 0x89, 0xc1]
-                    && &w[41..45] == &[0x31, 0xc0, 0xeb, 0x18]
-                    && &w[50..52] == &[0x84, 0xd2]
-                    && (w[52] == 0x74 || w[52] == 0xeb)
-                    && w[53] == 0x08
-                {
-                    matches.push(start + i);
+            let mut out = Vec::new();
+            match ctx.arch {
+                Arch::X86_64 => {
+                    for i in scan_lo..scan_hi.saturating_sub(32) {
+                        if let Some((br1, br2)) = match_cjk_bold_x86(body, i) {
+                            let pair = vec![
+                                ByteEdit { offset: start + br1, payload: vec![0xeb] },
+                                ByteEdit { offset: start + br2, payload: vec![0xeb] },
+                            ];
+                            if !out.contains(&pair) {
+                                out.push(pair);
+                            }
+                        }
+                    }
+                }
+                Arch::Arm64 => {
+                    for off in (scan_lo..scan_hi.saturating_sub(48)).step_by(4) {
+                        let Some(d1) = a64_tbz_bit0_or_b_words(read_u32(body, off)) else {
+                            continue;
+                        };
+                        let else1 = off + (d1 as usize) * 4;
+                        if else1 + 24 > body.len() || !a64::is_b(read_u32(body, else1 - 4)) {
+                            continue;
+                        }
+                        let Some(mov1_rel) = (0..=8)
+                            .step_by(4)
+                            .find(|&k| else1 + k + 4 <= body.len() && a64_is_mov_imm1(read_u32(body, else1 + k)))
+                        else {
+                            continue;
+                        };
+                        let after_mov1 = else1 + mov1_rel + 4;
+                        for off2 in (after_mov1..(after_mov1 + 40).min(body.len().saturating_sub(16))).step_by(4) {
+                            let Some(d2) = a64_tbz_bit0_or_b_words(read_u32(body, off2)) else {
+                                continue;
+                            };
+                            let else2 = off2 + (d2 as usize) * 4;
+                            if else2 + 4 <= body.len()
+                                && a64::is_b(read_u32(body, else2 - 4))
+                                && (0..=8).step_by(4).any(|k| {
+                                    else2 + k + 4 <= body.len() && a64_is_mov_imm1(read_u32(body, else2 + k))
+                                })
+                            {
+                                out.push(vec![
+                                    ByteEdit {
+                                        offset: start + off,
+                                        payload: (0x1400_0000u32 | d1).to_le_bytes().to_vec(),
+                                    },
+                                    ByteEdit {
+                                        offset: start + off2,
+                                        payload: (0x1400_0000u32 | d2).to_le_bytes().to_vec(),
+                                    },
+                                ]);
+                            }
+                        }
+                    }
                 }
             }
-            if matches.len() != 1 {
-                return Err(format!(
-                    "ScanDelimiter x86_64 플랭킹 패턴 매칭 실패 (매칭 수: {})",
-                    matches.len()
-                ));
-            }
-            let base = matches[0];
-            Ok(vec![
-                ByteEdit {
-                    offset: base + 2,
-                    payload: vec![0xeb],
-                },
-                ByteEdit {
-                    offset: base + 52,
-                    payload: vec![0xeb],
-                },
-            ])
-        }
-        Arch::Arm64 => {
-            let mut matches = Vec::new();
-            for off in (0..body.len().saturating_sub(60)).step_by(4) {
-                let i0 = read_u32(body, off);
-                let i4 = read_u32(body, off + 16);
-                let i6 = read_u32(body, off + 24);
-                let i13 = read_u32(body, off + 52);
-                if (i0 == 0x3600_00a0 || i0 == 0x1400_0005)
-                    && i4 == 0x1400_0003
-                    && i6 == 0xb240_03e3
-                    && (i13 == 0x3600_0082 || i13 == 0x1400_0004)
-                {
-                    matches.push(start + off);
-                }
-            }
-            if matches.len() != 1 {
-                return Err(format!(
-                    "ScanDelimiter ARM64 플랭킹 패턴 매칭 실패 (매칭 수: {})",
-                    matches.len()
-                ));
-            }
-            let base = matches[0];
-            Ok(vec![
-                ByteEdit {
-                    offset: base,
-                    payload: 0x1400_0005u32.to_le_bytes().to_vec(), // b +0x14
-                },
-                ByteEdit {
-                    offset: base + 52,
-                    payload: 0x1400_0004u32.to_le_bytes().to_vec(), // b +0x10
-                },
-            ])
-        }
-    }
+            out
+        },
+    )
 }
 
 fn resolve_tilde_strike(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
-    let (start, end) = ctx.get_func("extension.(*strikethroughParser).Parse")?;
-    let body = &ctx.data[start..end];
-
-    match ctx.arch {
-        Arch::X86_64 => {
-            let mut matches = Vec::new();
-            for i in 0..body.len().saturating_sub(21) {
-                let w = &body[i..i + 21];
-                if &w[0..3] == &[0x8b, 0x7c, 0x24]
-                    && w[4] == 0xbe
-                    && (w[5] == 0x01 || w[5] == 0x02)
-                    && &w[6..9] == &[0x00, 0x00, 0x00]
-                    && &w[9..12] == &[0x4c, 0x8d, 0x05]
-                    && w[16] == 0xe8
-                {
-                    matches.push(start + i + 5);
+    let label = match ctx.arch {
+        Arch::X86_64 => "strikethroughParser.Parse x86_64",
+        Arch::Arm64 => "strikethroughParser.Parse ARM64",
+    };
+    let require_sym = ctx.pcln.is_some() || ctx.funcs.contains_key("parser.ScanDelimiter");
+    ctx.resolve_in_funcs(
+        &["extension.(*strikethroughParser).Parse"],
+        "goldmark/extension/strikethrough.go",
+        label,
+        |start, end| {
+            let body = &ctx.data[start..end];
+            let mut out = Vec::new();
+            match ctx.arch {
+                Arch::X86_64 => {
+                    for call_rel in 5..body.len().saturating_sub(4) {
+                        if body[call_rel] != 0xe8 {
+                            continue;
+                        }
+                        if require_sym && ctx.call_target_symbol(start + call_rel) != Some("parser.ScanDelimiter") {
+                            continue;
+                        }
+                        let win_lo = call_rel.saturating_sub(32);
+                        if let Some(mov_rel) = (win_lo..call_rel.saturating_sub(4)).rfind(|&p| {
+                            body[p] == 0xbe
+                                && (body[p + 1] == 0x01 || body[p + 1] == 0x02)
+                                && body[p + 2..p + 5] == [0x00, 0x00, 0x00]
+                        }) {
+                            out.push(vec![ByteEdit {
+                                offset: start + mov_rel + 1,
+                                payload: vec![0x02],
+                            }]);
+                        }
+                    }
+                }
+                Arch::Arm64 => {
+                    let is_min_arg = |w: u32| {
+                        matches!(
+                            w,
+                            0xb240_03e4
+                                | 0x3200_03e4
+                                | 0xd280_0024
+                                | 0x5280_0024
+                                | 0xb27f_03e4
+                                | 0x321f_03e4
+                                | 0xd280_0044
+                                | 0x5280_0044
+                        )
+                    };
+                    for call_rel in (4..body.len().saturating_sub(3)).step_by(4) {
+                        if !a64::is_bl(read_u32(body, call_rel)) {
+                            continue;
+                        }
+                        if require_sym && ctx.call_target_symbol(start + call_rel) != Some("parser.ScanDelimiter") {
+                            continue;
+                        }
+                        let win_lo = call_rel.saturating_sub(32);
+                        if let Some(mov_rel) = (win_lo..call_rel)
+                            .step_by(4)
+                            .rfind(|&p| is_min_arg(read_u32(body, p)))
+                        {
+                            out.push(vec![ByteEdit {
+                                offset: start + mov_rel,
+                                payload: 0xb27f_03e4u32.to_le_bytes().to_vec(), // orr x4, xzr, #2
+                            }]);
+                        }
+                    }
                 }
             }
-            if matches.len() != 1 {
-                return Err(format!(
-                    "strikethroughParser.Parse x86_64 패턴 매칭 실패 (매칭 수: {})",
-                    matches.len()
-                ));
-            }
-            Ok(vec![ByteEdit {
-                offset: matches[0],
-                payload: vec![0x02],
-            }])
-        }
-        Arch::Arm64 => {
-            let mut matches = Vec::new();
-            for off in (0..body.len().saturating_sub(16)).step_by(4) {
-                let i0 = read_u32(body, off);
-                let i1 = read_u32(body, off + 4);
-                let i2 = read_u32(body, off + 8);
-                let i3 = read_u32(body, off + 12);
-                if (i0 == 0xb240_03e4 || i0 == 0xb27f_03e4 || i0 == 0xd280_0044)
-                    && (i1 & 0x9f00_001f) == 0x9000_0005
-                    && (i2 & 0xffc0_03ff) == 0x9100_00a5
-                    && (i3 >> 26) == 0x25
-                {
-                    matches.push(start + off);
-                }
-            }
-            if matches.len() != 1 {
-                return Err(format!(
-                    "strikethroughParser.Parse ARM64 패턴 매칭 실패 (매칭 수: {})",
-                    matches.len()
-                ));
-            }
-            Ok(vec![ByteEdit {
-                offset: matches[0],
-                payload: 0xb27f_03e4u32.to_le_bytes().to_vec(), // orr x4, xzr, #2
-            }])
-        }
-    }
+            out
+        },
+    )
 }
 
 const DEFAULT_CODE_THEME: &str = "vs";
@@ -941,13 +1569,30 @@ fn find_chroma_theme_offset(data: &[u8], theme: &str) -> Result<usize, String> {
     ))
 }
 
+/// 문자열 VA 역추적 결과: 원본 `"native"` 이거나 이미 패치되어 `<style name="..."` 안을 가리키는 경우만 참
+fn is_code_theme_target(data: &[u8], str_off: usize, str_len: usize) -> bool {
+    if !(1..=64).contains(&str_len) {
+        return false;
+    }
+    let Some(bytes) = data.get(str_off..str_off + str_len) else {
+        return false;
+    };
+    if bytes == b"native" {
+        return true;
+    }
+    const PREFIX: &[u8] = b"<style name=\"";
+    str_off >= PREFIX.len()
+        && &data[str_off - PREFIX.len()..str_off] == PREFIX
+        && data.get(str_off + str_len) == Some(&b'"')
+        && std::str::from_utf8(bytes).is_ok()
+}
+
 struct CodeThemeSite {
     lea_disp_off: usize,
     lea_next_off: usize,
     len_imm_off: usize,
 }
 
-/// ARM64: `"terminal"` 비교 직후 `adrp xP; add xP, xP, #lo; (orr|movz) xL, #len; ... stp xP, xL, [..]`
 struct A64CodeThemeSite {
     adrp_off: usize,
     ptr_reg: u32,
@@ -957,66 +1602,62 @@ struct A64CodeThemeSite {
 
 const A64_ORR_IMM6: u32 = 0xb27f_07e0; // orr xL, xzr, #0x6 (원본 "native" 길이)
 
-/// 코드 블록 테마를 정하는 함수: 1.5.13 까지 `render.glamourStyleForScheme`, 1.5.14+ `render.glamourStyle`
-fn code_theme_func(ctx: &BinaryContext) -> Result<(usize, usize), String> {
-    ctx.get_func("render.glamourStyleForScheme")
-        .or_else(|_| ctx.get_func("render.glamourStyle"))
-        .map_err(|_| "심볼 테이블에서 함수를 찾을 수 없습니다: render.glamourStyleForScheme / render.glamourStyle".to_string())
-}
-
 fn find_code_theme_site_a64(ctx: &BinaryContext) -> Result<A64CodeThemeSite, String> {
-    let (start, end) = code_theme_func(ctx)?;
     let d = ctx.data;
-    // "terminal" = 0x6c61_6e69_6d72_6574 (little-endian 8바이트)
-    let chunks = [0x6574u32, 0x6d72, 0x6e69, 0x6c61];
-    let mut matches = Vec::new();
-    let mut off = start;
-    while off + 12 * 4 <= end {
-        let w = |k: usize| word(d, off + k * 4);
-        let r = a64::rd(w(0));
-        let is_terminal = a64::is_movz(w(0))
-            && a64::imm16(w(0)) == chunks[0]
-            && (1..4).all(|k| a64::is_movk(w(k), k as u32) && a64::rd(w(k)) == r && a64::imm16(w(k)) == chunks[k]);
-        let cmp_ok = w(4) & 0xffe0_fc1f == 0xeb00_001f && (w(4) >> 16) & 31 == r;
-        if !(is_terminal && cmp_ok && a64::bcond(w(5)) == Some(a64::COND_NE)) {
-            off += 4;
-            continue;
-        }
-        let (adrp, add, len) = (w(6), w(7), w(8));
-        let p = a64::rd(adrp);
-        let l = a64::rd(len);
-        let len_ok = (a64::is_movz(len) || len & !31 == A64_ORR_IMM6) && l != p;
-        let stp_ok = (9..12).any(|k| {
-            let s = w(k);
-            s & 0xffc0_0000 == 0xa900_0000 && s & 31 == p && (s >> 10) & 31 == l
-        });
-        if a64::is_adrp(adrp) && a64::is_add_imm(add) && a64::rd(add) == p && a64::add_rn(add) == p && len_ok && stp_ok {
-            matches.push(A64CodeThemeSite {
-                adrp_off: off + 24,
-                ptr_reg: p,
-                len_off: off + 32,
-                len_reg: l,
-            });
-        }
-        off += 4;
-    }
-    if matches.len() != 1 {
-        return Err(format!(
-            "glamourStyleForScheme ARM64 terminal 테마 패턴 매칭 실패 (매칭 수: {})",
-            matches.len()
-        ));
-    }
-    Ok(matches.into_iter().next().unwrap())
+    ctx.resolve_in_funcs(
+        &["render.glamourStyleForScheme", "render.glamourStyle"],
+        "cli/render/markdown.go",
+        "glamourStyleForScheme ARM64 terminal 테마",
+        |start, end| {
+            let mut matches = Vec::new();
+            let mut off = start;
+            while off + 16 <= end {
+                let Some((p, str_off)) = ctx.a64_adrp_add_target_off(off) else {
+                    off += 4;
+                    continue;
+                };
+                let scan_end = (off + 28).min(end);
+                let mut len_hit = None;
+                let mut k = off + 8;
+                while k + 4 <= scan_end {
+                    let lw = word(d, k);
+                    let l = a64::rd(lw);
+                    if l != p && a64::is_movz(lw) {
+                        len_hit = Some((k, l, a64::imm16(lw) as usize));
+                        break;
+                    } else if l != p && (lw & !31) == A64_ORR_IMM6 {
+                        len_hit = Some((k, l, 6usize));
+                        break;
+                    }
+                    k += 4;
+                }
+                if let Some((len_off, l, cur_len)) = len_hit {
+                    let stp_ok = ((off + 8)..scan_end).step_by(4).any(|pos| {
+                        let s = word(d, pos);
+                        s & 0xffc0_0000 == 0xa900_0000 && (s & 31) == p && ((s >> 10) & 31) == l
+                    });
+                    if stp_ok && is_code_theme_target(d, str_off, cur_len) {
+                        matches.push(A64CodeThemeSite {
+                            adrp_off: off,
+                            ptr_reg: p,
+                            len_off,
+                            len_reg: l,
+                        });
+                    }
+                }
+                off += 4;
+            }
+            matches
+        },
+    )
 }
 
 fn detect_patched_code_theme_a64(ctx: &BinaryContext) -> Option<String> {
     let site = find_code_theme_site_a64(ctx).ok()?;
     let d = ctx.data;
-    let pc = ctx.off_to_va(site.adrp_off)?;
-    let str_va = a64::adrp_target(word(d, site.adrp_off), pc) + a64::add_imm12(word(d, site.adrp_off + 4));
+    let (_, str_off) = ctx.a64_adrp_add_target_off(site.adrp_off)?;
     let len_w = word(d, site.len_off);
     let len = if a64::is_movz(len_w) { a64::imm16(len_w) as usize } else { 6 };
-    let str_off = ctx.va_to_off(str_va)?;
     let s = std::str::from_utf8(d.get(str_off..str_off + len)?).ok()?;
     (s != "native").then(|| s.to_string())
 }
@@ -1045,102 +1686,46 @@ fn resolve_code_theme_a64(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> 
     ])
 }
 
-/// x86_64 분기/경계 정렬용 NOP 패딩(`0x90`, `66 90`, `0f 1f ...`)을 건너뛴다.
-fn skip_x86_nops(body: &[u8], mut pos: usize) -> usize {
-    loop {
-        let rest = &body[pos..];
-        let step = if rest.first() == Some(&0x90) {
-            1
-        } else if rest.starts_with(&[0x66, 0x90]) {
-            2
-        } else if rest.starts_with(&[0x0f, 0x1f, 0x00]) {
-            3
-        } else if rest.starts_with(&[0x0f, 0x1f, 0x40, 0x00]) {
-            4
-        } else if rest.starts_with(&[0x0f, 0x1f, 0x44, 0x00, 0x00]) {
-            5
-        } else if rest.starts_with(&[0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00]) {
-            6
-        } else if rest.starts_with(&[0x0f, 0x1f, 0x80, 0x00, 0x00, 0x00, 0x00]) {
-            7
-        } else if rest.starts_with(&[0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00]) {
-            8
-        } else if rest.starts_with(&[0x66, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00]) {
-            9
-        } else {
-            break;
-        };
-        pos += step;
-    }
-    pos
-}
-
-/// `mov r64, [rsp+disp8|disp32]` 이면 그 길이 (1.5.14 는 "terminal" 상수와 비교 사이에 문자열 포인터를 다시 읽는다)
-fn x86_rsp_load_len(b: &[u8]) -> Option<usize> {
-    match b {
-        [0x48 | 0x4c, 0x8b, m, 0x24, ..] if m & 0xc7 == 0x44 => Some(5),
-        [0x48 | 0x4c, 0x8b, m, 0x24, ..] if m & 0xc7 == 0x84 => Some(8),
-        _ => None,
-    }
-}
-
 fn find_code_theme_site(ctx: &BinaryContext) -> Result<CodeThemeSite, String> {
-    let (start, end) = code_theme_func(ctx)?;
-    let body = &ctx.data[start..end];
-    let mut matches = Vec::new();
-    for i in 0..body.len().saturating_sub(42) {
-        if body[i] != 0x48
-            || !(0xb8..=0xbf).contains(&body[i + 1])
-            || &body[i + 2..i + 10] != b"terminal"
-        {
-            continue;
-        }
-        // Go 어셈블러가 Intel JCC Erratum 완화를 위해 cmp/jne 경계에 정렬용 NOP을 삽입할 수 있다.
-        let mut cmp_rel = skip_x86_nops(body, i + 10);
-        if let Some(n) = x86_rsp_load_len(&body[cmp_rel..]) {
-            cmp_rel = skip_x86_nops(body, cmp_rel + n);
-        }
-        if cmp_rel + 3 >= body.len() || body[cmp_rel] != 0x48 || body[cmp_rel + 1] != 0x39 {
-            continue;
-        }
-        let jne_rel = skip_x86_nops(body, cmp_rel + 3);
-        let after_jne = if jne_rel + 6 <= body.len() && body[jne_rel] == 0x0f && body[jne_rel + 1] == 0x85 {
-            jne_rel + 6
-        } else if jne_rel + 2 <= body.len() && body[jne_rel] == 0x75 {
-            jne_rel + 2
-        } else {
-            continue;
-        };
-        let lea_rel = skip_x86_nops(body, after_jne);
-        if lea_rel + 27 > body.len() {
-            continue;
-        }
-        let mov_ptr = lea_rel + 7;
-        let mov_len = lea_rel + 15;
-        if &body[lea_rel..lea_rel + 3] != &[0x48, 0x8d, 0x05]
-            || &body[mov_ptr..mov_ptr + 4] != &[0x48, 0x89, 0x84, 0x24]
-            || &body[mov_len..mov_len + 4] != &[0x48, 0xc7, 0x84, 0x24]
-        {
-            continue;
-        }
-        let sp_ptr = read_u32(body, mov_ptr + 4);
-        let sp_len = read_u32(body, mov_len + 4);
-        let cur_len = read_u32(body, mov_len + 8);
-        if sp_ptr.saturating_add(8) == sp_len && (1..=64).contains(&cur_len) {
-            matches.push(CodeThemeSite {
-                lea_disp_off: start + lea_rel + 3,
-                lea_next_off: start + lea_rel + 7,
-                len_imm_off: start + mov_len + 8,
-            });
-        }
-    }
-    if matches.len() != 1 {
-        return Err(format!(
-            "glamourStyleForScheme terminal 테마 패턴 매칭 실패 (매칭 수: {})",
-            matches.len()
-        ));
-    }
-    Ok(matches.into_iter().next().unwrap())
+    ctx.resolve_in_funcs(
+        &["render.glamourStyleForScheme", "render.glamourStyle"],
+        "cli/render/markdown.go",
+        "glamourStyleForScheme terminal 테마",
+        |start, end| {
+            let body = &ctx.data[start..end];
+            let mut matches = Vec::new();
+            for lea_rel in 0..body.len().saturating_sub(20) {
+                let Some((ptr_reg, str_off)) = ctx.x86_lea_target_off(start + lea_rel) else {
+                    continue;
+                };
+                let s1 = skip_x86_nops(body, lea_rel + 7);
+                // (ptr 저장 -> len 저장) 또는 (len 저장 -> ptr 저장) 모두 허용
+                let hit = if let Some((n1, reg, sp_ptr)) = x86_rsp_store_info(&body[s1..]) {
+                    let s2 = skip_x86_nops(body, s1 + n1);
+                    x86_rsp_imm_store_info(&body[s2..])
+                        .filter(|&(_, sp_len, _, _)| reg == ptr_reg && sp_ptr.saturating_add(8) == sp_len)
+                        .map(|(_, _, imm_rel, cur_len)| (s2 + imm_rel, cur_len as usize))
+                } else if let Some((n1, sp_len, imm_rel, cur_len)) = x86_rsp_imm_store_info(&body[s1..]) {
+                    let s2 = skip_x86_nops(body, s1 + n1);
+                    x86_rsp_store_info(&body[s2..])
+                        .filter(|&(_, reg, sp_ptr)| reg == ptr_reg && sp_ptr.saturating_add(8) == sp_len)
+                        .map(|_| (s1 + imm_rel, cur_len as usize))
+                } else {
+                    None
+                };
+                if let Some((len_imm_rel, cur_len)) = hit {
+                    if is_code_theme_target(ctx.data, str_off, cur_len) {
+                        matches.push(CodeThemeSite {
+                            lea_disp_off: start + lea_rel + 3,
+                            lea_next_off: start + lea_rel + 7,
+                            len_imm_off: start + len_imm_rel,
+                        });
+                    }
+                }
+            }
+            matches
+        },
+    )
 }
 
 fn detect_patched_code_theme(ctx: &BinaryContext) -> Option<String> {
@@ -1148,11 +1733,8 @@ fn detect_patched_code_theme(ctx: &BinaryContext) -> Option<String> {
         return detect_patched_code_theme_a64(ctx);
     }
     let site = find_code_theme_site(ctx).ok()?;
-    let disp = read_i32(ctx.data, site.lea_disp_off) as i64;
+    let (_, str_off) = ctx.x86_lea_target_off(site.lea_disp_off - 3)?;
     let len = read_u32(ctx.data, site.len_imm_off) as usize;
-    let pc_va = ctx.off_to_va(site.lea_next_off)? as i64;
-    let str_va = usize::try_from(pc_va + disp).ok()?;
-    let str_off = ctx.va_to_off(str_va)?;
     let s = std::str::from_utf8(ctx.data.get(str_off..str_off + len)?).ok()?;
     (s != "native").then(|| s.to_string())
 }
@@ -1240,164 +1822,286 @@ struct CompactSites {
     current_tokens: u32,
 }
 
+fn x86_indirect_call_len(b: &[u8]) -> Option<usize> {
+    match b {
+        [0xff, m, ..] if (0xd0..=0xd7).contains(m) => Some(2),
+        [0x41, 0xff, m, ..] if (0xd0..=0xd7).contains(m) => Some(3),
+        _ => None,
+    }
+}
+
+/// `cmp $imm32, r32` -> `(명령 길이, imm32 상대 오프셋, imm32 값)`
+fn x86_cmp_imm32(b: &[u8]) -> Option<(usize, usize, u32)> {
+    match b {
+        [0x3d, ..] if b.len() >= 5 => Some((5, 1, read_u32(b, 1))),
+        [0x81, m, ..] if b.len() >= 6 && (0xf8..=0xff).contains(m) => Some((6, 2, read_u32(b, 2))),
+        [0x41, 0x81, m, ..] if b.len() >= 7 && (0xf8..=0xff).contains(m) => Some((7, 3, read_u32(b, 3))),
+        _ => None,
+    }
+}
+
+/// `mov $imm32, r32` -> `(명령 길이, imm32 상대 오프셋, imm32 값)`
+fn x86_mov_imm32(b: &[u8]) -> Option<(usize, usize, u32)> {
+    match b {
+        [0xb8..=0xbf, ..] if b.len() >= 5 => Some((5, 1, read_u32(b, 1))),
+        [0x41, 0xb8..=0xbf, ..] if b.len() >= 6 => Some((6, 2, read_u32(b, 2))),
+        _ => None,
+    }
+}
+
+fn x86_is_cmov_limit(b: &[u8]) -> bool {
+    match b {
+        [0x0f, op @ (0x42 | 0x46 | 0x4c | 0x4e), m, ..] => (0xc0..=0xff).contains(m) && {
+            let _ = op;
+            true
+        },
+        [0x41 | 0x44 | 0x45, 0x0f, 0x42 | 0x46 | 0x4c | 0x4e, m, ..] => (0xc0..=0xff).contains(m),
+        _ => false,
+    }
+}
+
+/// `cmpl $0, disp(rPtr)` -> 명령 길이
+fn x86_cmp_mem_zero_len(b: &[u8]) -> Option<usize> {
+    let (p, rest) = if matches!(b.first(), Some(0x41)) { (1usize, &b[1..]) } else { (0usize, b) };
+    if rest.first() != Some(&0x83) || rest.len() < 4 {
+        return None;
+    }
+    let m = rest[1];
+    if ((m >> 3) & 7) != 7 {
+        return None;
+    }
+    let sib = usize::from((m & 7) == 4);
+    let len = match m & 0xc0 {
+        0x40 => 3 + sib + 1,
+        0x80 => 2 + sib + 4 + 1,
+        _ => return None,
+    };
+    (rest.get(len - 1) == Some(&0x00)).then_some(p + len)
+}
+
+/// `movl $imm32, 0xc(rCfg)` -> `(명령 길이, imm32 상대 오프셋, imm32 값)`
+fn x86_mov_mem_0c_imm32(b: &[u8]) -> Option<(usize, usize, u32)> {
+    let (p, rest) = if matches!(b.first(), Some(0x41)) { (1usize, &b[1..]) } else { (0usize, b) };
+    if rest.len() < 7 || rest[0] != 0xc7 || (rest[1] & 0xf8) != 0x40 || (rest[1] & 7) == 4 || rest[2] != 0x0c {
+        return None;
+    }
+    Some((p + 7, p + 3, read_u32(rest, 3)))
+}
+
 fn find_compact_sites(ctx: &BinaryContext) -> Result<CompactSites, String> {
     if ctx.arch == Arch::Arm64 {
         return find_compact_sites_a64(ctx);
     }
 
-    let (ov_start, ov_end) = ctx.get_func("config.applyFeatureProviderCheckpointOverrideConfig")?;
-    let ov_body = &ctx.data[ov_start..ov_end];
-    let mut ov_matches = Vec::new();
-    for i in 0..ov_body.len().saturating_sub(10) {
-        let w = &ov_body[i..i + 10];
-        if &w[0..4] == &[0xff, 0xd2, 0x84, 0xc0]
-            && (&w[4..6] == &[0x75, 0x08] || &w[4..6] == &[0x90, 0x90])
-            && &w[6..10] == &[0x48, 0x8b, 0x44, 0x24]
-        {
-            ov_matches.push((ov_start + i + 4, &w[4..6] == &[0x90, 0x90]));
-        }
-    }
-    if ov_matches.len() != 1 {
-        return Err(format!(
-            "applyFeatureProviderCheckpointOverrideConfig 분기 패턴 매칭 실패 (매칭 수: {})",
-            ov_matches.len()
-        ));
-    }
-    let (override_branch_off, is_override_patched) = ov_matches[0];
-
-    let (gc_start, gc_end) = ctx.get_func("utils.GetCheckpointConfig")?;
-    let gc_body = &ctx.data[gc_start..gc_end];
-
-    let mut limit_matches = Vec::new();
-    for i in 0..gc_body.len().saturating_sub(14) {
-        let w = &gc_body[i..i + 14];
-        if &w[0..2] == &[0x81, 0xfa] && w[6] == 0xbe && &w[11..14] == &[0x0f, 0x42, 0xf2] {
-            let v1 = read_u32(w, 2);
-            let v2 = read_u32(w, 7);
-            if v1 == v2 && (MIN_COMPACT_TOKENS..=MAX_COMPACT_TOKENS).contains(&v1) {
-                limit_matches.push((gc_start + i + 2, gc_start + i + 7, v1));
+    let need_checkpoint_callee =
+        !ctx.funcs.contains_key("config.applyFeatureProviderCheckpointOverrideConfig") && ctx.pcln.is_some();
+    let (override_branch_off, is_override_patched, override_patch) = ctx.resolve_in_funcs(
+        &["config.applyFeatureProviderCheckpointOverrideConfig"],
+        "cortex/config/experiments.go",
+        "applyFeatureProviderCheckpointOverrideConfig 분기",
+        |ov_start, ov_end| {
+            let ov_body = &ctx.data[ov_start..ov_end];
+            if need_checkpoint_callee
+                && !(0..ov_body.len().saturating_sub(5)).any(|p| {
+                    ctx.call_target_symbol(ov_start + p)
+                        .is_some_and(|sym| sym.contains("Checkpoint"))
+                })
+            {
+                return Vec::new();
             }
-        }
-    }
-    if limit_matches.len() != 1 {
-        return Err(format!(
-            "GetCheckpointConfig 상한 패턴 매칭 실패 (매칭 수: {})",
-            limit_matches.len()
-        ));
-    }
-    let (slot1_off, slot2_off, current_tokens) = limit_matches[0];
+            let mut ov_matches = Vec::new();
+            for i in 0..ov_body.len().saturating_sub(8) {
+                let Some(call_len) = x86_indirect_call_len(&ov_body[i..]) else {
+                    continue;
+                };
+                let test_pos = skip_x86_nops(ov_body, i + call_len);
+                if ov_body.get(test_pos..test_pos + 2) != Some(&[0x84, 0xc0]) {
+                    continue;
+                }
+                let test_end = test_pos + 2;
+                let jcc = skip_x86_nops(ov_body, test_end);
+                if let Some(&0x75) = ov_body.get(jcc) {
+                    let d = ov_body.get(jcc + 1).copied().unwrap_or(0) as usize;
+                    let after = jcc + 2;
+                    let target = (after + d).min(ov_body.len());
+                    let false_blk = ov_body.get(after..target).unwrap_or(&[]);
+                    let valid = (2..=32).contains(&d)
+                        && (x86_rsp_load_len(false_blk).is_some()
+                            || false_blk.contains(&0xeb)
+                            || false_blk.contains(&0xe9));
+                    if valid {
+                        ov_matches.push((ov_start + jcc, false, vec![0x90, 0x90]));
+                    }
+                } else if jcc >= test_end + 2
+                    && ov_body.get(jcc - 2..jcc) == Some(&[0x90, 0x90])
+                    && ov_body.get(jcc..).is_some_and(|r| {
+                        x86_rsp_load_len(r).is_some() || matches!(r.first(), Some(0xeb | 0xe9))
+                    })
+                {
+                    ov_matches.push((ov_start + jcc - 2, true, vec![0x90, 0x90]));
+                }
+            }
+            ov_matches.dedup();
+            ov_matches
+        },
+    )?;
 
-    let mut fallback_matches = Vec::new();
-    for i in 0..gc_body.len().saturating_sub(13) {
-        let w = &gc_body[i..i + 13];
-        if &w[0..2] == &[0x83, 0x7a]
-            && &w[3..9] == &[0x00, 0x7f, 0x07, 0xc7, 0x40, 0x0c]
-            && read_u32(w, 9) == current_tokens
-        {
-            fallback_matches.push(gc_start + i + 9);
-        }
-    }
-    if fallback_matches.len() != 1 {
-        return Err(format!(
-            "GetCheckpointConfig fallback 패턴 매칭 실패 (매칭 수: {})",
-            fallback_matches.len()
-        ));
-    }
+    let (slot1_off, slot2_off, slot3_off, current_tokens) = ctx.resolve_in_funcs(
+        &["utils.GetCheckpointConfig"],
+        "cortex/utils/checkpoint_utils.go",
+        "GetCheckpointConfig 상한/폴백",
+        |gc_start, gc_end| {
+            let gc_body = &ctx.data[gc_start..gc_end];
+            let mut limit_matches = Vec::new();
+            for i in 0..gc_body.len().saturating_sub(13) {
+                let Some((c_len, c_imm_rel, v1)) = x86_cmp_imm32(&gc_body[i..]) else {
+                    continue;
+                };
+                if !(MIN_COMPACT_TOKENS..=MAX_COMPACT_TOKENS).contains(&v1) {
+                    continue;
+                }
+                let mov_pos = skip_x86_nops(gc_body, i + c_len);
+                let Some((m_len, m_imm_rel, v2)) = x86_mov_imm32(gc_body.get(mov_pos..).unwrap_or(&[])) else {
+                    continue;
+                };
+                let cmov_pos = skip_x86_nops(gc_body, mov_pos + m_len);
+                if v1 == v2 && x86_is_cmov_limit(gc_body.get(cmov_pos..).unwrap_or(&[])) {
+                    limit_matches.push((gc_start + i + c_imm_rel, gc_start + mov_pos + m_imm_rel, v1));
+                }
+            }
+            limit_matches.dedup();
+            if limit_matches.len() != 1 {
+                return Vec::new();
+            }
+            let (s1, s2, cur_tok) = limit_matches[0];
+
+            let mut fb_matches = Vec::new();
+            for i in 0..gc_body.len().saturating_sub(12) {
+                let Some(cmp_len) = x86_cmp_mem_zero_len(&gc_body[i..]) else {
+                    continue;
+                };
+                let jg_pos = skip_x86_nops(gc_body, i + cmp_len);
+                let Some(&jg_op) = gc_body.get(jg_pos) else {
+                    continue;
+                };
+                if jg_op != 0x7f && jg_op != 0x7d {
+                    continue;
+                }
+                let skip = gc_body.get(jg_pos + 1).copied().unwrap_or(0) as usize;
+                let jg_target = jg_pos + 2 + skip;
+                let mov_pos = skip_x86_nops(gc_body, jg_pos + 2);
+                if let Some((mov_len, imm_rel, v3)) = x86_mov_mem_0c_imm32(gc_body.get(mov_pos..).unwrap_or(&[])) {
+                    let mov_end = mov_pos + mov_len;
+                    if v3 == cur_tok && (jg_target == mov_end || jg_target == skip_x86_nops(gc_body, mov_end)) {
+                        fb_matches.push((s1, s2, gc_start + mov_pos + imm_rel, cur_tok));
+                    }
+                }
+            }
+            fb_matches.dedup();
+            fb_matches
+        },
+    )?;
 
     Ok(CompactSites {
         override_branch_off,
-        override_patch: vec![0x90, 0x90],
+        override_patch,
         is_override_patched,
         slots: [
             CompactSlot::Imm32(slot1_off),
             CompactSlot::Imm32(slot2_off),
-            CompactSlot::Imm32(fallback_matches[0]),
+            CompactSlot::Imm32(slot3_off),
         ],
         current_tokens,
     })
 }
 
-const A64_TBNZ_W0_BIT0_SKIP2: u32 = 0x3700_0060; // tbnz w0, #0, +12
+fn a64_is_ov_branch(w: u32) -> bool {
+    // tbnz w0, #0, +2..8워드 또는 cbnz w0, +2..8워드
+    ((w & 0xfff8_001f) == 0x3700_0000 && (2..=8).contains(&((w >> 5) & 0x3fff)))
+        || ((w & 0xff00_001f) == 0x3500_0000 && (2..=8).contains(&((w >> 5) & 0x7ffff)))
+}
 
 fn find_compact_sites_a64(ctx: &BinaryContext) -> Result<CompactSites, String> {
     let d = ctx.data;
 
-    // blr xN; tbnz w0,#0,+12 (패치 후 nop); ldr x0,[sp,#..]; b ..
-    // tbnz 를 지우면 feature provider 의 체크포인트 덮어쓰기를 건너뛰고 로컬 설정을 쓴다 (x86 jne → nop 과 같음).
-    let (ov_start, ov_end) = ctx.get_func("config.applyFeatureProviderCheckpointOverrideConfig")?;
-    let mut ov_matches = Vec::new();
-    let mut off = ov_start;
-    while off + 16 <= ov_end {
-        let (w0, w1, w2, w3) = (word(d, off), word(d, off + 4), word(d, off + 8), word(d, off + 12));
-        if w0 & 0xffff_fc1f == 0xd63f_0000
-            && (w1 == A64_TBNZ_W0_BIT0_SKIP2 || w1 == a64::NOP)
-            && w2 & 0xffc0_03ff == 0xf940_03e0
-            && a64::is_b(w3)
-        {
-            ov_matches.push((off + 4, w1 == a64::NOP));
-        }
-        off += 4;
-    }
-    if ov_matches.len() != 1 {
-        return Err(format!(
-            "applyFeatureProviderCheckpointOverrideConfig ARM64 분기 패턴 매칭 실패 (매칭 수: {})",
-            ov_matches.len()
-        ));
-    }
-    let (override_branch_off, is_override_patched) = ov_matches[0];
-
-    let (gc_start, gc_end) = ctx.get_func("utils.GetCheckpointConfig")?;
-
-    // 상한: movz/movk xR=N; cmp wA, wR; movz/movk xR=N; csel x?, x?, xR, lo
-    let mut limit_matches = Vec::new();
-    let mut off = gc_start;
-    while off + 24 <= gc_end {
-        if let (Some((r1, v1)), Some((r2, v2))) = (a64_mov32_pair(d, off), a64_mov32_pair(d, off + 12)) {
-            let cmp = word(d, off + 8);
-            let csel = word(d, off + 20);
-            if r1 == r2
-                && v1 == v2
-                && (MIN_COMPACT_TOKENS..=MAX_COMPACT_TOKENS).contains(&v1)
-                && cmp & 0xffe0_fc1f == 0x6b00_001f
-                && (cmp >> 16) & 31 == r1
-                && csel & 0xffe0_0c00 == 0x9a80_0000
-                && (csel >> 12) & 0xf == a64::COND_LO
-                && (csel >> 16) & 31 == r1
+    let need_checkpoint_callee =
+        !ctx.funcs.contains_key("config.applyFeatureProviderCheckpointOverrideConfig") && ctx.pcln.is_some();
+    let (override_branch_off, is_override_patched) = ctx.resolve_in_funcs(
+        &["config.applyFeatureProviderCheckpointOverrideConfig"],
+        "cortex/config/experiments.go",
+        "applyFeatureProviderCheckpointOverrideConfig ARM64 분기",
+        |ov_start, ov_end| {
+            if need_checkpoint_callee
+                && !(ov_start..ov_end.saturating_sub(4)).step_by(4).any(|p| {
+                    ctx.call_target_symbol(p)
+                        .is_some_and(|sym| sym.contains("Checkpoint"))
+                })
             {
-                limit_matches.push((off, off + 12, r1, v1));
+                return Vec::new();
             }
-        }
-        off += 4;
-    }
-    if limit_matches.len() != 1 {
-        return Err(format!(
-            "GetCheckpointConfig ARM64 상한 패턴 매칭 실패 (매칭 수: {})",
-            limit_matches.len()
-        ));
-    }
-    let (slot1_off, slot2_off, limit_reg, current_tokens) = limit_matches[0];
+            let mut ov_matches = Vec::new();
+            let mut off = ov_start;
+            while off + 16 <= ov_end {
+                let (w0, w1) = (word(d, off), word(d, off + 4));
+                if w0 & 0xffff_fc1f == 0xd63f_0000 && (a64_is_ov_branch(w1) || w1 == a64::NOP) {
+                    let scan_end = (off + 28).min(ov_end);
+                    let has_b = ((off + 8)..scan_end).step_by(4).any(|p| a64::is_b(word(d, p)));
+                    if has_b {
+                        ov_matches.push((off + 4, w1 == a64::NOP));
+                    }
+                }
+                off += 4;
+            }
+            ov_matches
+        },
+    )?;
 
-    // 폴백: b.gt +16; movz/movk xR=N; str wR, [x?, #0xc]
-    let mut fallback_matches = Vec::new();
-    let mut off = gc_start + 4;
-    while off + 12 <= gc_end {
-        let prev = word(d, off - 4);
-        let skip_ok = a64::bcond(prev) == Some(a64::COND_GT) && a64::bcond_target(prev, off - 4) == off + 12;
-        if let Some((r, v)) = a64_mov32_pair(d, off) {
-            let st = word(d, off + 8);
-            if skip_ok && v == current_tokens && st & 0xffff_fc00 == 0xb900_0c00 && st & 31 == r {
-                fallback_matches.push((off, r));
+    let (slot1_off, slot2_off, limit_reg, slot3_off, fallback_reg, current_tokens) = ctx.resolve_in_funcs(
+        &["utils.GetCheckpointConfig"],
+        "cortex/utils/checkpoint_utils.go",
+        "GetCheckpointConfig ARM64 상한/폴백",
+        |gc_start, gc_end| {
+            let mut limit_matches = Vec::new();
+            let mut off = gc_start;
+            while off + 24 <= gc_end {
+                if let (Some((r1, v1)), Some((r2, v2))) = (a64_mov32_pair(d, off), a64_mov32_pair(d, off + 12)) {
+                    let cmp = word(d, off + 8);
+                    let csel = word(d, off + 20);
+                    if r1 == r2
+                        && v1 == v2
+                        && (MIN_COMPACT_TOKENS..=MAX_COMPACT_TOKENS).contains(&v1)
+                        && cmp & 0xffe0_fc1f == 0x6b00_001f
+                        && (cmp >> 16) & 31 == r1
+                        && csel & 0xffe0_0c00 == 0x9a80_0000
+                        && (csel >> 12) & 0xf == a64::COND_LO
+                        && (csel >> 16) & 31 == r1
+                    {
+                        limit_matches.push((off, off + 12, r1, v1));
+                    }
+                }
+                off += 4;
             }
-        }
-        off += 4;
-    }
-    if fallback_matches.len() != 1 {
-        return Err(format!(
-            "GetCheckpointConfig ARM64 fallback 패턴 매칭 실패 (매칭 수: {})",
-            fallback_matches.len()
-        ));
-    }
-    let (slot3_off, fallback_reg) = fallback_matches[0];
+            if limit_matches.len() != 1 {
+                return Vec::new();
+            }
+            let (s1, s2, lreg, cur_tok) = limit_matches[0];
+
+            let mut fb_matches = Vec::new();
+            let mut off = gc_start + 4;
+            while off + 12 <= gc_end {
+                let prev = word(d, off - 4);
+                let skip_ok = a64::bcond(prev) == Some(a64::COND_GT) && a64::bcond_target(prev, off - 4) == off + 12;
+                if let Some((r, v)) = a64_mov32_pair(d, off) {
+                    let st = word(d, off + 8);
+                    if skip_ok && v == cur_tok && st & 0xffff_fc00 == 0xb900_0c00 && st & 31 == r {
+                        fb_matches.push((s1, s2, lreg, off, r, cur_tok));
+                    }
+                }
+                off += 4;
+            }
+            fb_matches
+        },
+    )?;
 
     Ok(CompactSites {
         override_branch_off,
@@ -1543,7 +2247,14 @@ fn parse_model_id(raw: &str) -> Result<String, String> {
 
 /// 모델 ID 를 찾을 범위. 패치한 코드가 가리킬 것이므로 modelIDForTier 와 같은 (실행) 세그먼트로 한정한다.
 fn model_id_search_range(ctx: &BinaryContext) -> Result<(usize, usize), String> {
-    let (func, _) = ctx.get_func("modelutils.modelIDForTier")?;
+    let func = ctx
+        .get_func("modelutils.modelIDForTier")
+        .map(|(s, _)| s)
+        .or_else(|e| {
+            ctx.pcln
+                .and_then(|p| p.funcs_in_file(ctx.data, "cortex/modelutils/model_tier.go").first().map(|&(s, _)| s))
+                .ok_or(e)
+        })?;
     Ok(ctx
         .segments
         .iter()
@@ -1597,58 +2308,84 @@ fn available_model_ids(ctx: &BinaryContext) -> Vec<&'static str> {
     KNOWN_MODEL_IDS.iter().zip(found).filter_map(|(id, ok)| ok.then_some(*id)).collect()
 }
 
-/// modelIDForTier 의 티어 분기 본문 (`cmp $tier,%ebx; jne ..` 바로 뒤). 분기 모양은 두 가지다.
-///   PRO(맨 끝 티어, 24바이트): test %rax,%rax; je ..; mov X(%rax),%rdx; mov X+8(%rax),%rsi; jmp ..;
-///                            xor %esi,%esi; xor %edx,%edx; test %rsi,%rsi; jne ok   — 뒤따르는 공용 빈 반환 블록은 다른 티어도 쓴다
-///   그 밖(37바이트):          위와 같되 je empty; mov (%rdx),%rax; mov 8(%rdx),%rbx; xor %ecx,%ecx; xor %edi,%edi; leave; ret
-///   패치 후(같은 길이):       lea model(%rip),%rax; mov $len,%ebx; xor %ecx,%ecx; xor %edi,%edi; leave; ret; int3...
+/// modelIDForTier 의 티어 분기 본문 (`cmp $tier, r32; jne ..` 바로 뒤).
 /// 반환값: (본문 시작, 본문 길이, 이미 패치됐는지)
 fn find_tier_site_x86(ctx: &BinaryContext, tier: u8) -> Result<(usize, usize, bool), String> {
-    const HEAD: [u8; 5] = [0x48, 0x85, 0xc0, 0x74, 0x0a];
-    const MID: [u8; 9] = [0xeb, 0x04, 0x31, 0xf6, 0x31, 0xd2, 0x48, 0x85, 0xf6]; // jmp; xor; xor; test %rsi,%rsi
+    const NIL_BLOCK: [u8; 7] = [0x31, 0xf6, 0x31, 0xd2, 0x48, 0x85, 0xf6]; // xor %esi,%esi; xor %edx,%edx; test %rsi,%rsi
     const LOAD: [u8; 7] = [0x48, 0x8b, 0x02, 0x48, 0x8b, 0x5a, 0x08]; // mov (%rdx),%rax; mov 8(%rdx),%rbx
     const RET: [u8; 6] = [0x31, 0xc9, 0x31, 0xff, 0xc9, 0xc3]; // error = nil; leave; ret
-    let (start, end) = ctx.get_func("modelutils.modelIDForTier")?;
-    let body = &ctx.data[start..end];
-    let mut matches = Vec::new();
-    for i in 0..body.len().saturating_sub(5 + 24) {
-        if body[i..i + 4] != [0x83, 0xfb, tier, 0x75] {
-            continue;
-        }
-        let b = i + 5;
-        let w = &body[b..];
-        let loads = w[0..5] == HEAD
-            && w[5..8] == [0x48, 0x8b, 0x50]
-            && w[9..12] == [0x48, 0x8b, 0x70]
-            && w[8].wrapping_add(8) == w[12]
-            && w[13..22] == MID;
-        let found = if loads && w[22..24] == [0x75, 0x0a] && w.get(34..41) == Some(&LOAD[..]) {
-            Some((24, false))
-        } else if loads && w[22] == 0x74 && w.get(24..31) == Some(&LOAD[..]) && w.get(31..37) == Some(&RET[..]) {
-            Some((37, false))
-        } else if w[0..3] == [0x48, 0x8d, 0x05] && w[7] == 0xbb && w[12..18] == RET {
-            // 이미 패치됨: 원래 본문 길이는 뒤따르는 int3 개수로 되찾는다
-            let n = 18 + w[18..].iter().take_while(|&&c| c == 0xcc).count();
-            matches!(n, 24 | 37).then_some((n, true))
-        } else {
-            None
-        };
-        if let Some((n, patched)) = found {
-            matches.push((start + b, n, patched));
-        }
-    }
-    if matches.len() != 1 {
-        return Err(format!("modelIDForTier 티어 {tier} 분기 패턴 매칭 실패 (매칭 수: {})", matches.len()));
-    }
-    Ok(matches[0])
+    let label = format!("modelIDForTier 티어 {tier} 분기");
+    ctx.resolve_in_funcs(
+        &["modelutils.modelIDForTier"],
+        "cortex/modelutils/model_tier.go",
+        &label,
+        |start, end| {
+            let body = &ctx.data[start..end];
+            let mut matches = Vec::new();
+            for i in 0..body.len().saturating_sub(24) {
+                let Some((cmp_len, imm)) = x86_cmp_imm8(&body[i..]) else {
+                    continue;
+                };
+                if imm != tier {
+                    continue;
+                }
+                let jne_pos = skip_x86_nops(body, i + cmp_len);
+                let Some((5, jne_next, _)) = x86_jcc_target(body, jne_pos) else {
+                    continue;
+                };
+                let b = skip_x86_nops(body, jne_next);
+                if b + 18 > body.len() {
+                    continue;
+                }
+                let w = &body[b..];
+                let unpatched_nil = if w.starts_with(&[0x48, 0x85, 0xc0, 0x74]) {
+                    let nil_off = 5 + w[4] as usize;
+                    let fields_ok = if nil_off == 15 {
+                        w.get(5..8) == Some(&[0x48, 0x8b, 0x50])
+                            && w.get(9..12) == Some(&[0x48, 0x8b, 0x70])
+                            && w[8].wrapping_add(8) == w[12]
+                    } else if nil_off == 21 && w.len() >= 21 {
+                        w[5..8] == [0x48, 0x8b, 0x90]
+                            && w[12..15] == [0x48, 0x8b, 0xb0]
+                            && read_i32(w, 8).wrapping_add(8) == read_i32(w, 15)
+                    } else {
+                        false
+                    };
+                    (fields_ok
+                        && nil_off >= 7
+                        && w.get(nil_off - 2..nil_off) == Some(&[0xeb, 0x04])
+                        && w.get(nil_off..nil_off + 7) == Some(&NIL_BLOCK))
+                    .then_some(nil_off + 7)
+                } else {
+                    None
+                };
+                let found = if let Some(chk) = unpatched_nil.map(|p| skip_x86_nops(w, p)) {
+                    if let Some((5, after_jne, ok)) = x86_jcc_target(w, chk) {
+                        (w.get(ok..ok + 7) == Some(&LOAD[..])).then_some((after_jne, false))
+                    } else if let Some((4, after_je, _)) = x86_jcc_target(w, chk) {
+                        let ld = skip_x86_nops(w, after_je);
+                        (w.get(ld..ld + 7) == Some(&LOAD[..]) && w.get(ld + 7..ld + 13) == Some(&RET[..]))
+                            .then_some((ld + 13, false))
+                    } else {
+                        None
+                    }
+                } else if w[0..3] == [0x48, 0x8d, 0x05] && w[7] == 0xbb && w[12..18] == RET {
+                    // 이미 패치됨: 원래 본문 길이는 뒤따르는 int3 개수로 되찾는다
+                    let n = 18 + w[18..].iter().take_while(|&&c| c == 0xcc).count();
+                    (18..=64).contains(&n).then_some((n, true))
+                } else {
+                    None
+                };
+                if let Some((n, patched)) = found {
+                    matches.push((start + b, n, patched));
+                }
+            }
+            matches
+        },
+    )
 }
 
-/// ARM64 modelIDForTier 의 티어 분기 (`cmp w1, #tier; b.ne ..` 바로 뒤). macOS·Linux 빌드가 같다.
-///   공통 머리: cbz x0,+12; ldp x4,x5,[x0,#X]; b +12; mov x5,xzr; mov x4,xzr
-///   flash 계열: cbz x5,empty; ldp x0,x1,[x4]; <반환 꼬리>
-///   PRO:        cbnz x5,ok   (뒤따르는 공용 빈 반환 블록은 다른 티어도 쓴다), ok: ldp x0,x1,[x4]; <반환 꼬리>
-///   반환 꼬리:  mov x2,xzr; mov x3,xzr; ldur x29,[sp,#-8]; ldr x30,[sp],#N; ret   (error = nil 후 복귀)
-///   패치 후(앞 4워드): adrp x0,model; add x0,x0,#lo; movz x1,#len; b <반환 꼬리>
+/// ARM64 modelIDForTier 의 티어 분기 (`cmp wR, #tier; b.ne ..` 바로 뒤).
 /// 반환값: (본문 시작, 반환 꼬리 위치, 이미 패치됐는지)
 fn find_tier_site_a64(ctx: &BinaryContext, tier: u8) -> Result<(usize, usize, bool), String> {
     const LDP_X0_X1_X4: u32 = 0xa940_0480;
@@ -1661,54 +2398,60 @@ fn find_tier_site_a64(ctx: &BinaryContext, tier: u8) -> Result<(usize, usize, bo
             && word(d, t + 12) & 0xffe0_0fff == 0xf840_07fe
             && word(d, t + 16) == 0xd65f_03c0
     };
-    let (start, end) = ctx.get_func("modelutils.modelIDForTier")?;
-    let cmp = 0x7100_003f | (u32::from(tier) << 10); // cmp w1, #tier
-    let mut matches = Vec::new();
-    let mut off = start;
-    while off + 8 + 24 <= end {
-        if word(d, off) != cmp || a64::bcond(word(d, off + 4)) != Some(a64::COND_NE) {
-            off += 4;
-            continue;
-        }
-        let body = off + 8;
-        let w = |k: usize| word(d, body + k * 4);
-        let head = w(0) == 0xb400_0060
-            && w(1) & 0xffc0_7fff == 0xa940_1404
-            && w(2) == 0x1400_0003
-            && w(3) == 0xaa1f_03e5
-            && w(4) == 0xaa1f_03e4;
-        let found = if head && w(5) & 0xff00_001f == 0xb400_0005 && w(6) == LDP_X0_X1_X4 && is_ret_tail(body + 28) {
-            Some((body + 28, false))
-        } else if head && w(5) & 0xff00_001f == 0xb500_0005 {
-            let ok = a64::bcond_target(w(5), body + 20); // cbnz 도 imm19 위치가 b.cond 와 같다
-            (word(d, ok) == LDP_X0_X1_X4 && is_ret_tail(ok + 4)).then_some((ok + 4, false))
-        } else if a64::is_adrp(w(0))
-            && a64::rd(w(0)) == 0
-            && a64::is_add_imm(w(1))
-            && a64::rd(w(1)) == 0
-            && a64::add_rn(w(1)) == 0
-            && a64::is_movz(w(2))
-            && a64::rd(w(2)) == 1
-            && a64::is_b(w(3))
-        {
-            // 이미 패치됨: b 의 목적지가 반환 꼬리
-            ctx.off_to_va(body + 12)
-                .map(|pc| a64::branch26_target(w(3), pc))
-                .and_then(|t| ctx.va_to_off(t))
-                .filter(|&t| is_ret_tail(t))
-                .map(|t| (t, true))
-        } else {
-            None
-        };
-        if let Some((tail, patched)) = found {
-            matches.push((body, tail, patched));
-        }
-        off += 4;
-    }
-    if matches.len() != 1 {
-        return Err(format!("modelIDForTier ARM64 티어 {tier} 분기 패턴 매칭 실패 (매칭 수: {})", matches.len()));
-    }
-    Ok(matches[0])
+    let cmp_mask = 0x7100_001f | (u32::from(tier) << 10);
+    let label = format!("modelIDForTier ARM64 티어 {tier} 분기");
+    ctx.resolve_in_funcs(
+        &["modelutils.modelIDForTier"],
+        "cortex/modelutils/model_tier.go",
+        &label,
+        |start, end| {
+            let mut matches = Vec::new();
+            let mut off = start;
+            while off + 8 + 24 <= end {
+                if (word(d, off) & 0xffff_fc1f) != cmp_mask || a64::bcond(word(d, off + 4)) != Some(a64::COND_NE) {
+                    off += 4;
+                    continue;
+                }
+                let body = off + 8;
+                let w = |k: usize| word(d, body + k * 4);
+                let head = w(0) == 0xb400_0060
+                    && w(1) & 0xffc0_7fff == 0xa940_1404
+                    && w(2) == 0x1400_0003
+                    && w(3) == 0xaa1f_03e5
+                    && w(4) == 0xaa1f_03e4;
+                let found =
+                    if head && w(5) & 0xff00_001f == 0xb400_0005 && w(6) == LDP_X0_X1_X4 && is_ret_tail(body + 28) {
+                        Some((body + 28, false))
+                    } else if head && w(5) & 0xff00_001f == 0xb500_0005 {
+                        let ok = a64::bcond_target(w(5), body + 20); // cbnz 도 imm19 위치가 b.cond 와 같다
+                        (ok + 4 <= d.len() && word(d, ok) == LDP_X0_X1_X4 && is_ret_tail(ok + 4))
+                            .then_some((ok + 4, false))
+                    } else if a64::is_adrp(w(0))
+                        && a64::rd(w(0)) == 0
+                        && a64::is_add_imm(w(1))
+                        && a64::rd(w(1)) == 0
+                        && a64::add_rn(w(1)) == 0
+                        && a64::is_movz(w(2))
+                        && a64::rd(w(2)) == 1
+                        && a64::is_b(w(3))
+                    {
+                        // 이미 패치됨: b 의 목적지가 반환 꼬리
+                        ctx.off_to_va(body + 12)
+                            .map(|pc| a64::branch26_target(w(3), pc))
+                            .and_then(|t| ctx.va_to_off(t))
+                            .filter(|&t| is_ret_tail(t))
+                            .map(|t| (t, true))
+                    } else {
+                        None
+                    };
+                if let Some((tail, patched)) = found {
+                    matches.push((body, tail, patched));
+                }
+                off += 4;
+            }
+            matches
+        },
+    )
 }
 
 /// 이 바이너리에서 티어 분기를 찾을 수 있는지 (아키텍처별)
@@ -1800,11 +2543,11 @@ fn resolve_flash_lite_tier(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String>
     resolve_tier(ctx, 2)
 }
 
-// banner / release-notes 패치가 공유하는 0xcc 패딩 공간(cave) 배치.
+// banner / patch-info 패치가 공유하는 0xcc 패딩 공간(cave) 배치.
 // 두 패치를 따로 적용해도 겹치지 않도록 고정 오프셋을 쓴다.
 const CAVE_MIN: usize = 1024;
 const CAVE_CHAN_OFF: usize = 0; // "patch v{ver}" (≤ 32바이트)
-const CAVE_NOTES_OFF: usize = 64; // 릴리즈 노트 문자열 + 트램펄린
+const CAVE_INFO_OFF: usize = 64; // 적용 패치 정보 문자열 + 트램펄린
 
 fn find_cave(ctx: &BinaryContext) -> Result<usize, String> {
     let needle = [0xccu8; CAVE_MIN];
@@ -1819,108 +2562,235 @@ fn x86_rel32_target(data: &[u8], disp_off: usize, next_off: usize) -> Option<usi
     usize::try_from(next_off as i64 + read_i32(data, disp_off) as i64).ok()
 }
 
-/// BannerWithInfo 채널 검사 자리와, 보존할 두 저장 명령이 그 안 어디에 있는지(원본 9 / 패치 후 0).
-///   원본:   test %rdx,%rdx; je ..; mov %rbx,0x2b0(%rsp); mov %rax,..(%rsp); ... (55바이트)
-///   패치 후: mov %rbx,0x2b0(%rsp); mov %rax,..(%rsp); lea chan(%rip),%rcx; mov $len,%edx; jmp +55; nop...
-fn find_banner_site_x86(ctx: &BinaryContext) -> Result<(usize, usize), String> {
-    const STORE_RBX: [u8; 8] = [0x48, 0x89, 0x9c, 0x24, 0xb0, 0x02, 0x00, 0x00];
-    const STORE_RAX: [u8; 4] = [0x48, 0x89, 0x84, 0x24];
-    let (start, end) = ctx.get_func("render.BannerWithInfo")?;
-    let body = &ctx.data[start..end];
-    let mut matches = Vec::new();
-    for i in 0..body.len().saturating_sub(55) {
-        let w = &body[i..i + 55];
-        if w[0..5] == [0x48, 0x85, 0xd2, 0x0f, 0x84] && w[9..17] == STORE_RBX && w[17..21] == STORE_RAX {
-            matches.push((start + i, 9));
-        } else if w[0..8] == STORE_RBX
-            && w[8..12] == STORE_RAX
-            && w[16..19] == [0x48, 0x8d, 0x0d]
-            && w[23] == 0xba
-            && w[28] == 0xe9
-            && read_i32(w, 29) == 55 - 33
-            && w[33..].iter().all(|&b| b == 0x90)
-        {
-            matches.push((start + i, 0));
-        }
-    }
-    if matches.len() != 1 {
-        return Err(format!("BannerWithInfo 채널 검사 패턴 매칭 실패 (매칭 수: {})", matches.len()));
-    }
-    Ok(matches[0])
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct X86BannerSite {
+    site: usize,
+    site_end: usize,
+    stores_off: usize,
+    stores_len: usize,
+    patched: bool,
+}
+
+fn x86_two_rsp_stores_len(b: &[u8]) -> Option<usize> {
+    let (n1, _, _) = x86_rsp_store_info(b)?;
+    let (n2, _, _) = x86_rsp_store_info(&b[n1..])?;
+    Some(n1 + n2)
+}
+
+/// BannerWithInfo 채널 검사 자리와 보존할 두 스택 저장 명령의 위치·길이, 그리고 분기 끝(`fmt_off`).
+/// - 원본: `test r64, r64; je skip; mov r64, disp(%rsp); mov r64, disp(%rsp); ... cmp $6; jne fmt; cmpl "stab"`
+/// - 패치 후: `mov r64, disp(%rsp); mov r64, disp(%rsp); lea chan(%rip), %rcx; mov $len, %edx; jmp fmt; nop...`
+fn find_banner_site_x86(ctx: &BinaryContext) -> Result<X86BannerSite, String> {
+    ctx.resolve_in_funcs(
+        &["render.BannerWithInfo"],
+        "cli/render/product_name.go",
+        "BannerWithInfo 채널 검사",
+        |start, end| {
+            let body = &ctx.data[start..end];
+            let mut matches = Vec::new();
+            let mut i = 0usize;
+            while i + 28 <= body.len() {
+                // 1) 원본 형태 ("stable" 6글자 + "stab" 리터럴 검사 블록의 jne 목적지까지 동적 측정)
+                if matches!(body[i], 0x48 | 0x4d) && body[i + 1] == 0x85 && (0xc0..=0xff).contains(&body[i + 2]) {
+                    let je_pos = skip_x86_nops(body, i + 3);
+                    if let Some((4, je_next, _)) = x86_jcc_target(body, je_pos) {
+                        let stores_rel = skip_x86_nops(body, je_next);
+                        if let Some(stores_len) = body.get(stores_rel..).and_then(x86_two_rsp_stores_len) {
+                            let after_stores = stores_rel + stores_len;
+                            let search_end = (after_stores + 24).min(body.len());
+                            let mut fmt_found = None;
+                            for k in after_stores..search_end {
+                                if let Some((cmp_len, 6)) = x86_cmp_imm8(&body[k..]) {
+                                    let jne_pos = skip_x86_nops(body, k + cmp_len);
+                                    if let Some((5, jne_next, fmt_rel)) = x86_jcc_target(body, jne_pos) {
+                                        if fmt_rel > jne_next
+                                            && fmt_rel <= body.len()
+                                            && fmt_rel >= i + stores_len + 17
+                                            && find_subslice(&body[jne_next..fmt_rel], b"stab").is_some()
+                                        {
+                                            fmt_found = Some(fmt_rel);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(fmt_rel) = fmt_found {
+                                matches.push(X86BannerSite {
+                                    site: start + i,
+                                    site_end: start + fmt_rel,
+                                    stores_off: stores_rel - i,
+                                    stores_len,
+                                    patched: false,
+                                });
+                                i += 1;
+                                continue;
+                            }
+                        }
+                    }
+                }
+                // 2) 이미 패치된 형태 (두 스택 저장 + lea %rcx + mov $len,%edx + jmp rel32 + nop 패딩)
+                if let Some(stores_len) = x86_two_rsp_stores_len(&body[i..]) {
+                    let lea_rel = i + stores_len;
+                    if lea_rel + 17 <= body.len()
+                        && body[lea_rel..lea_rel + 3] == [0x48, 0x8d, 0x0d]
+                        && body[lea_rel + 7] == 0xba
+                        && (1..=64).contains(&read_u32(body, lea_rel + 8))
+                        && body[lea_rel + 12] == 0xe9
+                    {
+                        let rel_skip = read_i32(body, lea_rel + 13);
+                        let jmp_next = lea_rel + 17;
+                        if (0..=128).contains(&rel_skip) {
+                            let end_rel = jmp_next + rel_skip as usize;
+                            let target_is_chan = ctx
+                                .x86_lea_target_off(start + lea_rel)
+                                .and_then(|(_, p)| ctx.data.get(p..))
+                                .is_some_and(|s| s.starts_with(b"patch v"));
+                            if end_rel <= body.len()
+                                && body[jmp_next..end_rel].iter().all(|&b| b == 0x90)
+                                && (target_is_chan || rel_skip >= 4)
+                            {
+                                matches.push(X86BannerSite {
+                                    site: start + i,
+                                    site_end: start + end_rel,
+                                    stores_off: 0,
+                                    stores_len,
+                                    patched: true,
+                                });
+                                // 패치 끝의 0x90 패딩과 그 직후 코드에서 겹쳐 잡히지 않게 건너뛴다
+                                i = end_rel.max(i + 1);
+                                continue;
+                            }
+                        }
+                    }
+                }
+                i += 1;
+            }
+            // `.gopclntab` 없는 합성 단위 테스트(뒷부분을 더미 바이트로 채운 55바이트 고정 레이아웃) 호환 폴백
+            if matches.is_empty() && ctx.pcln.is_none() {
+                for k in 0..body.len().saturating_sub(55) {
+                    if body[k..k + 5] == [0x48, 0x85, 0xd2, 0x0f, 0x84] {
+                        if let Some(stores_len) = body.get(k + 9..).and_then(x86_two_rsp_stores_len) {
+                            matches.push(X86BannerSite {
+                                site: start + k,
+                                site_end: start + k + 55,
+                                stores_off: 9,
+                                stores_len,
+                                patched: false,
+                            });
+                        }
+                    }
+                }
+            }
+            matches
+        },
+    )
 }
 
 /// 이미 패치된 banner 가 쓰는 동굴과 기존 채널 문자열의 끝. lea 가 가리키는 채널 문자열 자리에서 구한다.
 fn banner_cave_x86(ctx: &BinaryContext) -> Result<Option<(usize, usize)>, String> {
-    let Ok((site, 0)) = find_banner_site_x86(ctx) else {
+    let Ok(bs) = find_banner_site_x86(ctx) else {
         return Ok(None);
     };
-    let len = read_u32(ctx.data, site + 24) as usize; // mov $len,%edx
-    x86_rel32_target(ctx.data, site + 19, site + 23)
+    if !bs.patched {
+        return Ok(None);
+    }
+    let lea_off = bs.site + bs.stores_len;
+    let len = read_u32(ctx.data, lea_off + 8) as usize; // mov $len,%edx
+    ctx.x86_lea_target_off(lea_off)
+        .map(|(_, p)| p)
         .filter(|&p| ctx.data.get(p..).is_some_and(|s| s.starts_with(b"patch v")))
         .and_then(|p| Some((p.checked_sub(CAVE_CHAN_OFF)?, p + len)))
         .map(Some)
         .ok_or_else(|| "BannerWithInfo 기존 패치가 가리키는 채널 문자열(\"patch v…\")을 찾을 수 없습니다.".into())
 }
 
-/// BuildHeader 끝의 `"\n" + strings.Join(lines, "\n")` concatstring2 호출 자리 (패치 후엔 트램펄린 호출)
-fn find_build_header_call_x86(ctx: &BinaryContext) -> Result<usize, String> {
-    let (start, end) = ctx.get_func("render.BuildHeader")?;
-    let pat = [0x48, 0x89, 0xc7, 0x48, 0x89, 0xde, 0x31, 0xc0, 0x48, 0x8d, 0x1d];
-    let matches: Vec<_> = ctx.data[start..end]
-        .windows(pat.len())
-        .enumerate()
-        .filter(|(_, w)| *w == pat)
-        .map(|(i, _)| start + i)
-        .collect();
-    if matches.len() != 1 {
-        return Err(format!("BuildHeader concatstring2 패턴 매칭 실패 (매칭 수: {})", matches.len()));
+/// x86_64 patch-info 트램펄린(`lea info(%rip),%r8; mov $len,%r9d; jmp concatstring3`)이면 `(본문 오프셋, 트램펄린 끝)` 반환
+fn decode_x86_info_tramp(ctx: &BinaryContext, tramp: usize, concat3: usize) -> Option<(usize, usize)> {
+    let d = ctx.data;
+    let w = d.get(tramp..tramp + 18)?;
+    if w[0..3] != [0x4c, 0x8d, 0x05] || w[7..9] != [0x41, 0xb9] || w[13] != 0xe9 {
+        return None;
     }
-    let call_site = matches[0] + 17;
-    if ctx.data[call_site] != 0xe8 {
-        return Err(format!(
-            "BuildHeader call site op 불일치 (기대: 0xe8, 실제: 0x{:02x})",
-            ctx.data[call_site]
-        ));
+    if x86_rel32_target(d, tramp + 14, tramp + 18) != Some(concat3) {
+        return None;
     }
-    Ok(call_site)
+    let info_off = x86_rel32_target(d, tramp + 3, tramp + 7)?;
+    (info_off >= CAVE_INFO_OFF && d.get(info_off..).is_some_and(|s| s.starts_with(b"\n\n")))
+        .then_some((info_off, tramp + 18))
 }
 
-/// 이미 패치된 release-notes 가 쓰는 동굴과 기존 트램펄린의 끝. BuildHeader 가 부르는 트램펄린
-/// (`lea notes(%rip),%r8; mov $len,%r9d; jmp concatstring3`)의 노트 문자열 자리에서 구한다.
-fn release_notes_cave_x86(ctx: &BinaryContext) -> Result<Option<(usize, usize)>, String> {
+/// BuildHeader 끝의 `"\n" + strings.Join(lines, "\n")` concatstring2 호출 자리 (패치 후엔 트램펄린 호출).
+/// `.gopclntab`에서 `strings.Join` 호출이 보이면 그 직후(≤64바이트) 이어지는 `concatstring2`/트램펄린 호출을 고르고,
+/// 합성 테스트처럼 `strings.Join`이 없으면 인자 준비 시퀀스가 앞선 `concatstring2`/트램펄린 호출을 고른다.
+fn find_build_header_call_x86(ctx: &BinaryContext) -> Result<usize, String> {
+    let (concat2, _) = ctx.get_func("runtime.concatstring2")?;
+    let concat3 = ctx.get_func("runtime.concatstring3").ok().map(|(s, _)| s);
+    let is_target_call = |call_abs: usize| -> bool {
+        let Some(dest) = ctx.x86_call_target_off(call_abs) else {
+            return false;
+        };
+        dest == concat2 || concat3.and_then(|c3| decode_x86_info_tramp(ctx, dest, c3)).is_some()
+    };
+    ctx.resolve_in_funcs(
+        &["render.BuildHeader"],
+        "cli/render/header.go",
+        "BuildHeader concatstring2",
+        |start, end| {
+            let body = &ctx.data[start..end];
+            let join_calls: Vec<usize> = (0..body.len().saturating_sub(5))
+                .filter(|&p| ctx.call_target_symbol(start + p) == Some("strings.Join"))
+                .collect();
+            if !join_calls.is_empty() {
+                return (0..body.len().saturating_sub(5))
+                    .filter(|&p| {
+                        is_target_call(start + p)
+                            && join_calls.iter().any(|&jp| p > jp && p - jp <= 64)
+                    })
+                    .map(|p| start + p)
+                    .collect();
+            }
+            // strings.Join 심볼이 없는 합성 테스트 폴백: 고정 오프셋 없이 앞 32바이트 내 인자 세팅 확인
+            (0..body.len().saturating_sub(5))
+                .filter(|&p| {
+                    let win = &body[p.saturating_sub(32)..p];
+                    (is_target_call(start + p) || ctx.pcln.is_none() && body[p] == 0xe8)
+                        && find_subslice(win, &[0x48, 0x89, 0xc7]).is_some()
+                        && find_subslice(win, &[0x48, 0x8d, 0x1d]).is_some()
+                })
+                .map(|p| start + p)
+                .collect()
+        },
+    )
+}
+
+/// 이미 패치된 patch-info 가 쓰는 동굴과 기존 트램펄린의 끝.
+fn patch_info_cave_x86(ctx: &BinaryContext) -> Result<Option<(usize, usize)>, String> {
     let call = find_build_header_call_x86(ctx)?;
     let (concat2, _) = ctx.get_func("runtime.concatstring2")?;
     let (concat3, _) = ctx.get_func("runtime.concatstring3")?;
-    let d = ctx.data;
-    let tramp = x86_rel32_target(d, call + 1, call + 5);
+    let tramp = ctx.x86_call_target_off(call);
     if tramp == Some(concat2) {
         return Ok(None);
     }
     tramp
-        .filter(|&t| {
-            d.get(t..t + 18)
-                .is_some_and(|w| w[0..3] == [0x4c, 0x8d, 0x05] && w[7..9] == [0x41, 0xb9] && w[13] == 0xe9)
-                && x86_rel32_target(d, t + 14, t + 18) == Some(concat3)
-        })
-        .and_then(|t| Some((x86_rel32_target(d, t + 3, t + 7)?, t + 18)))
-        .filter(|&(n, _)| n >= CAVE_NOTES_OFF && d.get(n..).is_some_and(|s| s.starts_with(b"\n\n")))
-        .map(|(n, end)| Some((n - CAVE_NOTES_OFF, end)))
-        .ok_or_else(|| "BuildHeader 가 concatstring2 도, 알아볼 수 있는 릴리즈 노트 트램펄린도 부르지 않습니다.".into())
+        .and_then(|t| decode_x86_info_tramp(ctx, t, concat3))
+        .map(|(n, end)| Some((n - CAVE_INFO_OFF, end)))
+        .ok_or_else(|| "BuildHeader 가 concatstring2 도, 알아볼 수 있는 패치 정보 트램펄린도 부르지 않습니다.".into())
 }
 
-/// banner(채널 문자열) / release-notes(노트 + 트램펄린) 몫
+/// banner(채널 문자열) / patch-info(패치 정보 + 트램펄린) 몫
 #[derive(Clone, Copy, PartialEq)]
 enum CavePart {
     Chan,
-    Notes,
+    Info,
 }
 
 impl CavePart {
     /// 고정 배치에서 동굴 기준 자기 몫
     fn range(self) -> std::ops::Range<usize> {
         match self {
-            CavePart::Chan => CAVE_CHAN_OFF..CAVE_NOTES_OFF,
-            CavePart::Notes => CAVE_NOTES_OFF..CAVE_MIN,
+            CavePart::Chan => CAVE_CHAN_OFF..CAVE_INFO_OFF,
+            CavePart::Info => CAVE_INFO_OFF..CAVE_MIN,
         }
     }
 }
@@ -1954,13 +2824,13 @@ fn code_cc_runs(ctx: &BinaryContext) -> Result<Vec<(usize, usize)>, String> {
     Ok(runs)
 }
 
-/// x86_64 banner / release-notes 가 쓸 자리를 고른다. 반환: (동굴 기준점, 자기 몫을 쓸 수 있는 끝)
+/// x86_64 banner / patch-info 가 쓸 자리를 고른다. 반환: (동굴 기준점, 자기 몫을 쓸 수 있는 끝)
 /// 1. 자기 패치가 이미 쓴 자리(`own` = 동굴, 그때 쓴 내용의 끝): 그 뒤로 이어지는 0xcc 까지, 고정 배치 몫을 넘지 않게.
 /// 2. 다른 패치가 쓴 동굴(`other` = 동굴, 그 패치 내용의 끝)에 자기 몫이 0xcc 로 비어 있으면 그 동굴 (고정 배치).
 ///    패치마다 새 동굴을 찾으면 0xcc 패딩이 한 곳뿐인 버전(1.5.9·1.5.10·1.5.12)에서 재패치가 실패한다.
-/// 3. 새 1024바이트 0xcc 동굴 (고정 배치: 채널 +0, 노트 +64).
+/// 3. 새 1024바이트 0xcc 동굴 (고정 배치: 채널 +0, 패치 정보 +64).
 /// 4. 그런 동굴이 없으면(1.5.14 linux_x64) 대체 배치: 함수 사이 0xcc 구간을 따로 쓴다.
-///    채널은 32~255바이트 구간 중 첫째, 노트는 256바이트 이상 중 가장 긴 것 — 크기대가 달라 서로의 구간을
+///    채널은 32~255바이트 구간 중 첫째, 패치 정보는 256바이트 이상 중 가장 긴 것 — 크기대가 달라 서로의 구간을
 ///    고르지 않고, 원본 바이트만 보고 각자 골라도 겹치지 않는다. 다른 패치 내용 바로 뒤에 남은 0xcc 꼬리는
 ///    고르지 않아 적용 순서와 상관없이 같은 자리가 되고 그 패치의 재패치 여유도 줄지 않는다.
 ///    배치가 다른 옛 패치본을 만나도 0xcc 만 쓴다.
@@ -1993,7 +2863,7 @@ fn pick_cave_x86(
     let runs: Vec<_> = code_cc_runs(ctx)?.into_iter().filter(|&(s, _)| Some(s) != other_tail).collect();
     let pick = match part {
         CavePart::Chan => runs.iter().find(|&&(s, e)| (32..256).contains(&(e - s))).copied(),
-        CavePart::Notes => runs.iter().filter(|&&(s, e)| e - s >= 256).max_by_key(|&&(s, e)| e - s).copied(),
+        CavePart::Info => runs.iter().filter(|&&(s, e)| e - s >= 256).max_by_key(|&&(s, e)| e - s).copied(),
     };
     pick.and_then(|(s, e)| Some((s.checked_sub(r.start)?, e)))
         .ok_or_else(|| format!("실행 파일 내 0xcc 여유 공간({CAVE_MIN}바이트, 또는 따로 쓸 구간)을 찾을 수 없습니다."))
@@ -2004,7 +2874,7 @@ fn pick_cave_x86(
 /// Linux ELF ARM64 는 실행 세그먼트 바로 뒤에 RW 세그먼트가 붙어 있어 쓸 수 있는 패딩이 없다.
 fn find_cave_a64(ctx: &BinaryContext) -> Result<usize, String> {
     if ctx.format != Format::MachO64 {
-        return Err("ARM64 banner/release-notes 패치는 macOS(Mach-O)에서만 지원됩니다 (Linux ARM64 는 여유 공간 없음).".into());
+        return Err("ARM64 banner/patch-info 패치는 macOS(Mach-O)에서만 지원됩니다 (Linux ARM64 는 여유 공간 없음).".into());
     }
     let d = ctx.data;
     let ncmds = read_u32(d, 16) as usize;
@@ -2042,52 +2912,59 @@ fn a64_va(ctx: &BinaryContext, off: usize) -> Result<usize, String> {
 }
 
 /// BannerWithInfo 채널 검사 (원본):
-///   add x27, sp, #0xfff; add x27, x27, #..; ldp xP, xL, [x27]; cbz xL, skip
+///   ldp xP, xL, [xBase, #..]; cbz xL, skip
 ///   str x1, [sp, #..]; str x0, [sp, #..]; cmp xL, #6; b.ne fmt   ("stable" 검사)
 /// 패치 후:
-///   (같은 add 두 줄); adrp xP, chan; add xP, xP, #lo; (str 두 줄 유지); movz xL, #len; b fmt
+///   adrp xP, chan; add xP, xP, #lo; (str 두 줄 유지); movz xL, #len; b fmt
 /// 두 str 는 Sprintf 뒤 concatstring2 가 다시 읽는 제품명 슬롯이므로 반드시 남긴다(x86 과 같은 이유).
 fn resolve_banner_a64(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
-    let (start, end) = ctx.get_func("render.BannerWithInfo")?;
     let cave = find_cave_a64(ctx)?;
     let chan = format!("patch v{}", env!("CARGO_PKG_VERSION")).into_bytes();
-    assert!(chan.len() <= CAVE_NOTES_OFF - CAVE_CHAN_OFF);
+    assert!(chan.len() <= CAVE_INFO_OFF - CAVE_CHAN_OFF);
     let chan_off = cave + CAVE_CHAN_OFF;
     let chan_va = a64_va(ctx, chan_off)?;
 
     let d = ctx.data;
     let is_str_sp = |w: u32| w & 0xffc0_03e0 == 0xf900_03e0;
-    let mut matches = Vec::new();
-    let mut off = start + 8;
-    while off + 24 <= end {
-        let w = |k: usize| word(d, off + k * 4);
-        let x27_ok = word(d, off - 8) == 0x913f_fffb && word(d, off - 4) & 0xffc0_03ff == 0x9100_037b;
-        if !(x27_ok && is_str_sp(w(2)) && is_str_sp(w(3))) {
-            off += 4;
-            continue;
-        }
-        // 원본 형태
-        let (w0, w1, w4, w5) = (w(0), w(1), w(4), w(5));
-        if w0 & 0xffff_83e0 == 0xa940_0360 && a64::bcond(w5) == Some(a64::COND_NE) {
-            let (p, l) = (w0 & 31, (w0 >> 10) & 31);
-            if w1 & 0xff00_001f == 0xb400_0000 | l && w4 == 0xf100_181f | (l << 5) {
-                matches.push((off, p, l, a64::bcond_target(w5, off + 20)));
+    let (site, p, l, fmt_off) = ctx.resolve_in_funcs(
+        &["render.BannerWithInfo"],
+        "cli/render/product_name.go",
+        "BannerWithInfo ARM64 채널 검사",
+        |start, end| {
+            let mut matches = Vec::new();
+            let mut off = start;
+            while off + 24 <= end {
+                let w = |k: usize| word(d, off + k * 4);
+                if !(is_str_sp(w(2)) && is_str_sp(w(3))) {
+                    off += 4;
+                    continue;
+                }
+                let (w0, w1, w4, w5) = (w(0), w(1), w(4), w(5));
+                // 원본 형태 (프레임 크기에 따른 앞쪽 x27 설정 유무에 의존하지 않는다)
+                if w0 & 0xffc0_0000 == 0xa940_0000 && a64::bcond(w5) == Some(a64::COND_NE) {
+                    let (p, l) = (w0 & 31, (w0 >> 10) & 31);
+                    if p != l && w1 & 0xff00_001f == 0xb400_0000 | l && w4 == 0xf100_181f | (l << 5) {
+                        matches.push((off, p, l, a64::bcond_target(w5, off + 20)));
+                    }
+                }
+                // 이미 패치된 형태 (`"patch v"` 문자열 VA 역추적으로 확인)
+                if let Some((p, target_str)) = ctx.a64_adrp_add_target_off(off) {
+                    let is_chan = d.get(target_str..).is_some_and(|s| s.starts_with(b"patch v"));
+                    if is_chan && a64::is_movz(w4) && a64::is_b(w5) {
+                        if let Some(target_off) = ctx
+                            .off_to_va(off + 20)
+                            .map(|pc| a64::branch26_target(w5, pc))
+                            .and_then(|t| ctx.va_to_off(t))
+                        {
+                            matches.push((off, p, a64::rd(w4), target_off));
+                        }
+                    }
+                }
+                off += 4;
             }
-        }
-        // 이미 패치된 형태
-        if a64::is_adrp(w0) && a64::is_add_imm(w1) && a64::rd(w1) == a64::rd(w0) && a64::add_rn(w1) == a64::rd(w0)
-            && a64::is_movz(w4) && a64::is_b(w5)
-        {
-            let target = a64::branch26_target(w5, a64_va(ctx, off + 20)?);
-            let target = ctx.va_to_off(target).ok_or("분기 대상 변환 실패")?;
-            matches.push((off, a64::rd(w0), a64::rd(w4), target));
-        }
-        off += 4;
-    }
-    if matches.len() != 1 {
-        return Err(format!("BannerWithInfo ARM64 채널 검사 패턴 매칭 실패 (매칭 수: {})", matches.len()));
-    }
-    let (site, p, l, fmt_off) = matches[0];
+            matches
+        },
+    )?;
     let site_va = a64_va(ctx, site)?;
     Ok(vec![
         ByteEdit { offset: chan_off, payload: chan.clone() },
@@ -2106,70 +2983,74 @@ fn resolve_banner_a64(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
 }
 
 /// BuildHeader 끝의 `"\n" + strings.Join(lines, "\n")` (concatstring2) 호출을
-/// 동굴 트램펄린으로 돌려 세 번째 인자(릴리즈 노트)를 붙인 concatstring3 로 꼬리 분기한다.
-///   tramp: adrp x5, notes; add x5, x5, #lo; movz x6, #len; adrp x16, concatstring3; add x16, x16, #lo; br x16
-/// 동굴에서 concatstring3 까지는 b(±128MB) 범위를 넘으므로 x16(링커 예약 스크래치)으로 간접 분기한다.
-/// bl 이 아닌 br 이라 LR 은 BuildHeader 복귀 주소 그대로이고, BuildHeader 는 이미 concatstring3 를
-/// 직접 호출하므로 7워드 인자 스필 영역도 확보돼 있다.
-fn resolve_release_notes_a64(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
-    let (bh_start, bh_end) = ctx.get_func("render.BuildHeader")?;
+/// 동굴 트램펄린으로 돌려 세 번째 인자(적용 패치 정보)를 붙인 concatstring3 로 꼬리 분기한다.
+fn resolve_patch_info_a64(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
     let (concat2_start, _) = ctx.get_func("runtime.concatstring2")?;
     let (concat3_start, _) = ctx.get_func("runtime.concatstring3")?;
     let cave = find_cave_a64(ctx)?;
 
-    let notes = format!("\n\n{}", release_notes_text()).into_bytes();
-    if notes.len() > 0xffff {
-        return Err("릴리즈 노트가 너무 깁니다.".into());
+    let info = format!("\n\n{}", patch_info_text(ctx)).into_bytes();
+    if info.len() > 0xffff {
+        return Err("패치 정보 문자열이 너무 깁니다.".into());
     }
-    let notes_off = cave + CAVE_NOTES_OFF;
-    let tramp_off = (notes_off + notes.len() + 15) & !15;
+    let info_off = cave + CAVE_INFO_OFF;
+    let tramp_off = (info_off + info.len() + 15) & !15;
     if tramp_off + 24 > cave + CAVE_MIN {
-        return Err("릴리즈 노트가 여유 공간을 초과합니다.".into());
+        return Err("패치 정보 문자열이 여유 공간을 초과합니다.".into());
     }
-    let notes_va = a64_va(ctx, notes_off)?;
+    let info_va = a64_va(ctx, info_off)?;
     let tramp_va = a64_va(ctx, tramp_off)?;
     let c3_va = a64_va(ctx, concat3_start)?;
     let tramp = words(&[
-        a64::adrp(5, tramp_va, notes_va)?,
-        a64::add_imm(5, 5, notes_va & 0xfff),
-        a64::movz(6, notes.len() as u32),
+        a64::adrp(5, tramp_va, info_va)?,
+        a64::add_imm(5, 5, info_va & 0xfff),
+        a64::movz(6, info.len() as u32),
         a64::adrp(a64::X16, tramp_va + 12, c3_va)?,
         a64::add_imm(a64::X16, a64::X16, c3_va & 0xfff),
         a64::BR_X16,
     ]);
 
-    // orr x2, xzr, #1; mov x3, x0; mov x4, x1; mov x0, xzr; adrp x1, "\n"; add x1, x1, #lo; bl concatstring2
     let d = ctx.data;
-    let concat2_va = a64_va(ctx, concat2_start)?;
-    let mut matches = Vec::new();
-    let mut off = bh_start;
-    while off + 28 <= bh_end {
-        let w = |k: usize| word(d, off + k * 4);
-        if w(0) == 0xb240_03e2
-            && w(1) == 0xaa00_03e3
-            && w(2) == 0xaa01_03e4
-            && w(3) == 0xaa1f_03e0
-            && a64::is_adrp(w(4))
-            && a64::rd(w(4)) == 1
-            && w(5) & 0xffc0_03ff == 0x9100_0021
-            && a64::is_bl(w(6))
-        {
-            let call = off + 24;
-            // 다른 버전의 패처가 만든 트램펄린(노트 길이가 달라 위치가 다름)도 동굴 안이면 재패치를 허용한다
-            let target = a64::branch26_target(w(6), a64_va(ctx, call)?);
-            let target_off = ctx.va_to_off(target).unwrap_or(usize::MAX);
-            if target == concat2_va || (cave..cave + CAVE_MIN).contains(&target_off) {
-                matches.push(call);
+    let is_target_bl = |bl_off: usize| -> bool {
+        let Some(target_off) = ctx.a64_bl_target_off(bl_off) else {
+            return false;
+        };
+        target_off == concat2_start || (cave..cave + CAVE_MIN).contains(&target_off)
+    };
+    let call = ctx.resolve_in_funcs(
+        &["render.BuildHeader"],
+        "cli/render/header.go",
+        "BuildHeader ARM64 concatstring2",
+        |bh_start, bh_end| {
+            let join_calls: Vec<usize> = (bh_start..bh_end.saturating_sub(3))
+                .step_by(4)
+                .filter(|&p| ctx.call_target_symbol(p) == Some("strings.Join"))
+                .collect();
+            if !join_calls.is_empty() {
+                return (bh_start..bh_end.saturating_sub(3))
+                    .step_by(4)
+                    .filter(|&p| {
+                        is_target_bl(p) && join_calls.iter().any(|&jp| p > jp && p - jp <= 64)
+                    })
+                    .collect();
             }
-        }
-        off += 4;
-    }
-    if matches.len() != 1 {
-        return Err(format!("BuildHeader ARM64 concatstring2 패턴 매칭 실패 (매칭 수: {})", matches.len()));
-    }
-    let call = matches[0];
+            // strings.Join 심볼이 없는 합성 테스트 폴백: 앞 8워드 내 인자 세팅 확인
+            (bh_start..bh_end.saturating_sub(3))
+                .step_by(4)
+                .filter(|&p| {
+                    if !is_target_bl(p) {
+                        return false;
+                    }
+                    let lo = p.saturating_sub(32).max(bh_start);
+                    let has_len1 = (lo..p).step_by(4).any(|q| matches!(word(d, q), 0xb240_03e2 | 0xd280_0022));
+                    let has_adrp1 = (lo..p).step_by(4).any(|q| a64::is_adrp(word(d, q)) && a64::rd(word(d, q)) == 1);
+                    has_len1 && has_adrp1
+                })
+                .collect()
+        },
+    )?;
     Ok(vec![
-        ByteEdit { offset: notes_off, payload: notes },
+        ByteEdit { offset: info_off, payload: info },
         ByteEdit { offset: tramp_off, payload: tramp },
         ByteEdit {
             offset: call,
@@ -2181,20 +3062,22 @@ fn resolve_release_notes_a64(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, Strin
 fn resolve_banner(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
     match ctx.arch {
         Arch::X86_64 => {
-            // 제품명 옆 괄호 안에 표시: "Antigravity CLI 1.5.7 (patch v0.2.10)"
+            // 제품명 옆 괄호 안에 표시: "Antigravity CLI 1.5.7 (patch v0.3.0)"
             let chan = format!("patch v{}", env!("CARGO_PKG_VERSION")).into_bytes();
-            assert!(chan.len() <= CAVE_NOTES_OFF - CAVE_CHAN_OFF);
+            assert!(chan.len() <= CAVE_INFO_OFF - CAVE_CHAN_OFF);
 
             // BannerWithInfo 패치: 빈 채널 대신 주입된 채널 문자열 포맷 루틴 활성화.
-            // 패치된 형태도 받아 패치본을 다시 패치할 수 있게 한다 (두 저장 명령의 위치만 다르다).
-            let (chan_site, stores_off) = find_banner_site_x86(ctx)?;
-            let chan_site_end = chan_site + 55;
+            // 패치된 형태도 받아 패치본을 다시 패치할 수 있게 한다 (두 저장 명령의 위치·길이와 분기 끝을 동적으로 유지).
+            let bs = find_banner_site_x86(ctx)?;
+            let chan_site = bs.site;
+            let chan_site_end = bs.site_end;
+            let site_len = chan_site_end - chan_site;
             let own = banner_cave_x86(ctx)?;
             let (cave, limit) = pick_cave_x86(
                 ctx,
                 CavePart::Chan,
                 own,
-                release_notes_cave_x86(ctx).ok().flatten(),
+                patch_info_cave_x86(ctx).ok().flatten(),
             )?;
             let chan_off = cave + CAVE_CHAN_OFF;
             if chan_off + chan.len() > limit {
@@ -2212,10 +3095,9 @@ fn resolve_banner(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
 
             // 원본은 채널 분기 진입 시 제품명 문자열(rax=ptr, rbx=len)을 스택 슬롯에 저장하고,
             // Sprintf 이후 그 슬롯을 다시 읽어 concatstring2 로 이어 붙인다.
-            // 이 두 저장(mov %rbx,0x2b0(%rsp) / mov %rax,0x320(%rsp))을 건너뛰면
-            // 초기화되지 않은 슬롯을 이어 붙이다 SIGSEGV 가 나므로 그대로 보존한다.
-            let stores = chan_site + stores_off;
-            let mut chan_patch = ctx.data[stores..stores + 16].to_vec();
+            // 이 두 저장을 건너뛰면 초기화되지 않은 슬롯을 이어 붙이다 SIGSEGV 가 나므로 그대로 보존한다.
+            let stores = chan_site + bs.stores_off;
+            let mut chan_patch = ctx.data[stores..stores + bs.stores_len].to_vec();
             let pc = chan_site + chan_patch.len() + 7;
             let disp_chan = (chan_off as i64) - (pc as i64);
             chan_patch.extend_from_slice(&[0x48, 0x8d, 0x0d]);
@@ -2229,7 +3111,7 @@ fn resolve_banner(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
             chan_patch.push(0xe9);
             chan_patch.extend_from_slice(&(rel_skip as i32).to_le_bytes());
 
-            while chan_patch.len() < 55 {
+            while chan_patch.len() < site_len {
                 chan_patch.push(0x90);
             }
 
@@ -2243,54 +3125,104 @@ fn resolve_banner(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
     }
 }
 
-/// 릴리즈 노트 본문. `release-notes` 패치(배너 주입)와 `--notes` 출력이 같은 문구를 쓴다.
-fn release_notes_text() -> String {
-    const ITEMS: &[(&str, &str)] = &[
-        ("nodrip", "instant streaming (16ms typewriter drip removed)"),
-        ("batch", "full answer rendered at once on completion"),
-        ("cjk-bold", "**bold** kept before Korean particles"),
-        ("tilde-strike", "only '~~' strikes through, single '~' stays"),
-        ("code-theme", "readable code block theme for terminal colorScheme (--code-theme vs)"),
-        ("compact", "custom auto-compaction token limit (--compact 180k)"),
-        ("*-tier", "subagent tiers pinned: pro→carbon, flash→neon, flash_lite→hydrogen"),
-        ("banner", "patch version shown next to the product name"),
-    ];
-    let mut out = format!(
-        " \x1b[1mWhat's new in agy-cli-patch v{}:\x1b[0m",
-        env!("CARGO_PKG_VERSION")
-    );
-    for (id, desc) in ITEMS {
-        out.push_str(&format!("\n \x1b[32m•\x1b[0m \x1b[1m{id}\x1b[0m: {desc}"));
+/// 상단 배너 아래에 주입할 적용 패치 요약 본문.
+/// `ctx.selected_patches`가 비어 있으면(가용성 사전 검사 등) 전체 패치 기준으로 생성해 여유 공간을 검증한다.
+fn patch_info_text(ctx: &BinaryContext) -> String {
+    let ids: Vec<&'static str> = if ctx.selected_patches.is_empty() {
+        PATCH_REGISTRY
+            .iter()
+            .map(|p| p.id)
+            .filter(|&id| id != "patch-info")
+            .collect()
+    } else {
+        ctx.selected_patches
+            .iter()
+            .copied()
+            .filter(|&id| id != "patch-info")
+            .collect()
+    };
+
+    let has = |id: &str| ids.contains(&id);
+    let simple: Vec<&str> = PATCH_REGISTRY
+        .iter()
+        .map(|p| p.id)
+        .filter(|&id| {
+            !matches!(id, "patch-info" | "banner" | "code-theme" | "compact")
+                && tier_index(id).is_none()
+                && has(id)
+        })
+        .collect();
+
+    let row = |label: &str, val: String| format!(" \x1b[90m│ {label:<10}\x1b[0m  {val}");
+    let mut lines: Vec<String> = Vec::new();
+    let mut has_feature = false;
+
+    if !has("banner") {
+        lines.push(row("patch", format!("\x1b[36mv{}\x1b[0m", env!("CARGO_PKG_VERSION"))));
     }
-    out.push_str("\n \x1b[90mGitHub: https://github.com/KyongSik-Yoon/agy-cli-patch\x1b[0m");
-    out.push_str("\n \x1b[90mAccount: KyongSik-Yoon <sam1287@gmail.com>\x1b[0m");
-    out
+    if !simple.is_empty() {
+        lines.push(row("patches", simple.join("\x1b[90m · \x1b[0m")));
+        has_feature = true;
+    }
+    match (has("code-theme"), has("compact")) {
+        (true, true) => {
+            let short = format_compact_tokens(ctx.compact_tokens);
+            lines.push(row(
+                "theme",
+                format!(
+                    "\x1b[36m{}\x1b[0m  \x1b[90m·  compact\x1b[0m \x1b[36m{short}\x1b[0m",
+                    ctx.code_theme
+                ),
+            ));
+            has_feature = true;
+        }
+        (true, false) => {
+            lines.push(row("theme", format!("\x1b[36m{}\x1b[0m", ctx.code_theme)));
+            has_feature = true;
+        }
+        (false, true) => {
+            let short = format_compact_tokens(ctx.compact_tokens);
+            lines.push(row("compact", format!("\x1b[36m{short}\x1b[0m")));
+            has_feature = true;
+        }
+        (false, false) => {}
+    }
+    for (ti, spec) in TIERS.iter().enumerate() {
+        if has(spec.id) {
+            lines.push(row(spec.key, format!("\x1b[36m{}\x1b[0m", ctx.tier_models[ti])));
+            has_feature = true;
+        }
+    }
+    if !has_feature {
+        lines.push(row("patches", "\x1b[90mnone\x1b[0m".to_string()));
+    }
+    lines.join("\n")
 }
 
-fn resolve_release_notes(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
+fn resolve_patch_info(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
     match ctx.arch {
         Arch::X86_64 => {
             // BuildHeader 패치: concatstring2 호출을 트램펄린(concatstring3) 호출로 변경.
             // 이미 패치된 바이너리면 그때 쓴 동굴을 다시 쓴다.
             let call_site = find_build_header_call_x86(ctx)?;
             let (concat3_start, _) = ctx.get_func("runtime.concatstring3")?;
-            let own = release_notes_cave_x86(ctx)?;
+            let own = patch_info_cave_x86(ctx)?;
             let (cave_offset, limit) = pick_cave_x86(
                 ctx,
-                CavePart::Notes,
+                CavePart::Info,
                 own,
                 banner_cave_x86(ctx).ok().flatten(),
             )?;
 
-            let notes = format!("\n\n{}", release_notes_text()).into_bytes();
+            let info = format!("\n\n{}", patch_info_text(ctx)).into_bytes();
 
-            let notes_va = cave_offset + CAVE_NOTES_OFF;
-            let notes_len = notes.len();
-            let tramp_va = (notes_va + notes_len + 15) & !15;
+            let info_va = cave_offset + CAVE_INFO_OFF;
+            let info_len = info.len();
+            let tramp_va = (info_va + info_len + 15) & !15;
 
             // 트램펄린 루틴 생성:
-            // lea notes(%rip), %r8
-            // mov $notes_len, %r9d
+            // lea info(%rip), %r8
+            // mov $info_len, %r9d
             // jmp concatstring3   (tail call)
             //
             // call 이 아니라 jmp 여야 한다. call 로 들어가면 concatstring3 의 리턴 주소가
@@ -2300,12 +3232,12 @@ fn resolve_release_notes(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
             // (BuildHeader 의 outgoing 인자 영역은 7워드 스필을 충분히 수용함).
             let mut tramp = Vec::new();
             let pc = tramp_va + 7;
-            let disp = (notes_va as i64) - (pc as i64);
+            let disp = (info_va as i64) - (pc as i64);
             tramp.extend_from_slice(&[0x4c, 0x8d, 0x05]);
             tramp.extend_from_slice(&(disp as i32).to_le_bytes());
 
             tramp.extend_from_slice(&[0x41, 0xb9]);
-            tramp.extend_from_slice(&(notes_len as u32).to_le_bytes());
+            tramp.extend_from_slice(&(info_len as u32).to_le_bytes());
 
             let pc = tramp_va + tramp.len() + 5;
             let rel_c3 = (concat3_start as i64) - (pc as i64);
@@ -2313,19 +3245,19 @@ fn resolve_release_notes(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
             tramp.extend_from_slice(&(rel_c3 as i32).to_le_bytes());
 
             if tramp_va + tramp.len() > limit {
-                return Err("릴리즈 노트가 0xcc 여유 공간을 초과합니다.".into());
+                return Err("패치 정보 문자열이 0xcc 여유 공간을 초과합니다.".into());
             }
 
-            // 노트와 트램펄린 사이, 그리고 기존 트램펄린이 더 뒤에 있었으면 그 자리까지 0xcc 로 채운다
-            let mut notes = notes;
-            notes.resize(tramp_va - notes_va, 0xcc);
+            // 본문과 트램펄린 사이, 그리고 기존 트램펄린이 더 뒤에 있었으면 그 자리까지 0xcc 로 채운다
+            let mut info = info;
+            info.resize(tramp_va - info_va, 0xcc);
             if let Some((_, old_end)) = own {
                 tramp.resize(tramp.len().max(old_end.saturating_sub(tramp_va)), 0xcc);
             }
             let mut edits = vec![
                 ByteEdit {
-                    offset: notes_va,
-                    payload: notes,
+                    offset: info_va,
+                    payload: info,
                 },
                 ByteEdit {
                     offset: tramp_va,
@@ -2344,7 +3276,7 @@ fn resolve_release_notes(ctx: &BinaryContext) -> Result<Vec<ByteEdit>, String> {
 
             Ok(edits)
         }
-        Arch::Arm64 => resolve_release_notes_a64(ctx),
+        Arch::Arm64 => resolve_patch_info_a64(ctx),
     }
 }
 
@@ -2424,18 +3356,18 @@ const PATCH_REGISTRY: &[PatchSpec] = &[
     PatchSpec {
         id: "banner",
         title: "제품명 옆 패치 버전 표시 (Patch Version Tag)",
-        description: "상단 'Antigravity CLI 1.5.7' 옆에 '(patch v0.2.10)' 형태로 패치 버전 표시",
+        description: "상단 'Antigravity CLI 1.5.7' 옆에 '(patch v0.3.0)' 형태로 패치 버전 표시",
         symbol: "render.BannerWithInfo",
         default_on: true,
         resolver: resolve_banner,
     },
     PatchSpec {
-        id: "release-notes",
-        title: "상단 배너 릴리즈 노트 표시 (Release Notes)",
-        description: "로고 아래에 패치 기능 요약 및 GitHub 정보 표시 (기본 꺼짐, -p 로 명시해야 적용)",
+        id: "patch-info",
+        title: "상단 배너 적용 패치 정보 표시 (Patch Info)",
+        description: "로고 아래에 적용된 패치 목록과 모델 티어·컴팩션·코드 테마 설정 표시 (기본 꺼짐, -p 로 명시해야 적용)",
         symbol: "render.BuildHeader",
         default_on: false,
-        resolver: resolve_release_notes,
+        resolver: resolve_patch_info,
     },
 ];
 
@@ -3170,11 +4102,9 @@ fn edit_inline_buffer(buf: &mut Vec<char>, pos: &mut usize, max_len: usize, key:
         Key::Delete if *pos < buf.len() => {
             buf.remove(*pos);
         }
-        Key::Char(c) if !c.is_control() => {
-            if buf.len() < max_len {
-                buf.insert(*pos, *c);
-                *pos += 1;
-            }
+        Key::Char(c) if !c.is_control() && buf.len() < max_len => {
+            buf.insert(*pos, *c);
+            *pos += 1;
         }
         _ => {}
     }
@@ -4063,7 +4993,7 @@ fn parse_patch_list(spec_str: &str, args: &mut PatchArgs) -> Result<Vec<&'static
     let items: Vec<&str> = spec_str.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
     let mut out: Vec<&'static PatchSpec> = Vec::new();
     if items.is_empty() || items.contains(&"all") {
-        // 'all' 은 기본 활성(default_on) 패치 전체. 기본 꺼짐 패치는 'all,release-notes' 나 'all,compact=180k' 처럼 명시한다.
+        // 'all' 은 기본 활성(default_on) 패치 전체. 기본 꺼짐 패치는 'all,patch-info' 나 'all,compact=180k' 처럼 명시한다.
         out.extend(PATCH_REGISTRY.iter().filter(|p| p.default_on));
     }
     // 'all' 과 함께 준 ID 도 하나하나 검사한다 ('all,nodirp' 같은 오타를 조용히 무시하지 않도록)
@@ -4086,7 +5016,7 @@ fn parse_patch_list(spec_str: &str, args: &mut PatchArgs) -> Result<Vec<&'static
 
 fn build_patched_binary(
     src_bin: &Path,
-    ctx: &BinaryContext,
+    ctx: &mut BinaryContext,
     patches: &[&'static PatchSpec],
     dst_bin: &Path,
     symlink_name: Option<&str>,
@@ -4099,6 +5029,7 @@ fn build_patched_binary(
         }
     }
 
+    ctx.selected_patches = patches.iter().map(|p| p.id).collect();
     let mut resolved = Vec::with_capacity(patches.len());
     for &spec in patches {
         let edits = (spec.resolver)(ctx)?;
@@ -4181,7 +5112,7 @@ const CLI_IN_PLACE_HINT: &str = "원본에 직접 적용하려면 --in-place 를
 /// plan_output() 결과대로 바이너리를 만든다. 경고성 참고 사항은 먼저 출력한다.
 fn build_from_plan(
     src_bin: &Path,
-    ctx: &BinaryContext,
+    ctx: &mut BinaryContext,
     patches: &[&'static PatchSpec],
     plan: &OutputPlan,
 ) -> Result<(), String> {
@@ -4210,14 +5141,14 @@ fn print_help() {
   agy-cli-patch -p all --compact 180k -o agy-batch  자동 컴팩션 임계값을 180k 토큰으로 변경
   agy-cli-patch -p all --code-theme solarized-light -o agy-batch  코드 블록 테마 변경
   agy-cli-patch -p all,pro-tier,flash-tier,flash-lite-tier -o agy-batch  서브에이전트 티어 고정 (pro→carbon, flash→neon, flash_lite→hydrogen)
+  agy-cli-patch -p all,patch-info -o agy-batch  시작 화면 배너 아래에 적용된 패치·설정 요약 표시
   agy-cli-patch --preset                  기본 프리셋 2종(agy-batch, agy-nodrip) 일괄 생성
   agy-cli-patch -p all --in-place         원본 백업(antigravity.orig) 후 기본 agy에 직접 적용
   agy-cli-patch --restore                 antigravity.orig 백업에서 원본 복구
-  agy-cli-patch --notes                   패치 릴리즈 노트 출력
 
 옵션:
   --bin <경로>              원본 antigravity 바이너리 경로 직접 지정 (미지정 시 자동 탐색)
-  -p, --patches <ID>        쉼표로 구분된 패치 ID 또는 'all' (예: nodrip,batch,compact=180k)
+  -p, --patches <ID>        쉼표로 구분된 패치 ID 또는 'all' (예: nodrip,batch,compact=180k,patch-info)
   --compact <토큰>          자동 컴팩션 토큰 임계값 지정 (32k~1000k, 예: 180k, 180000; 지정 시 compact 자동 활성화)
   --code-theme <테마>       terminal 스킴 코드 블록 Chroma 테마 지정 (기본: vs, 예: vs, solarized-light, bw)
   --pro-tier <모델 ID>      'pro' 티어(invoke_subagent 등)에 쓸 모델 (기본: gemini-4-carbon-high; 지정 시 pro-tier 자동 활성화)
@@ -4227,7 +5158,6 @@ fn print_help() {
   --preset                  프롬프트 없이 agy-batch와 agy-nodrip 생성
   --in-place                원본 백업 후 기본 바이너리 덮어쓰기
   --restore                 --in-place 백업 복구
-  --notes                   패치 릴리즈 노트 출력 (agy 화면에 넣으려면 -p all,release-notes)
   --tiers                   바이너리에 고정된 서브에이전트 티어 표를 한 줄로 출력 (예: pro=gemini-4-carbon-high, 없으면 빈 줄)
   -h, --help                도움말 출력"
     );
@@ -4261,10 +5191,6 @@ fn run() -> Result<(), String> {
             }
             "--list" | "-l" => list_mode = true,
             "--tiers" => tiers_mode = true,
-            "--notes" => {
-                println!("{}", release_notes_text());
-                return Ok(());
-            }
             "--preset" => preset_mode = true,
             "--in-place" => in_place = true,
             "--restore" => restore_mode = true,
@@ -4391,7 +5317,7 @@ fn run() -> Result<(), String> {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.message(CLI_IN_PLACE_HINT))?;
         for ((_, patches), plan) in jobs.iter().zip(&plans) {
-            build_from_plan(&src_bin, &ctx, patches, plan)?;
+            build_from_plan(&src_bin, &mut ctx, patches, plan)?;
         }
         return Ok(());
     }
@@ -4429,13 +5355,13 @@ fn run() -> Result<(), String> {
         let backup_mmap = MmapFile::open(&backup_bin)?;
         let mut backup_ctx = BinaryContext::parse(backup_mmap.as_slice())?;
         final_args.apply_to(&mut backup_ctx);
-        build_patched_binary(&backup_bin, &backup_ctx, &chosen_patches, &target_bin, None)?;
+        build_patched_binary(&backup_bin, &mut backup_ctx, &chosen_patches, &target_bin, None)?;
         println!("[+] 기본 agy 바이너리에 패치 적용 완료: {}", target_bin.display());
         return Ok(());
     }
 
     let plan = plan_output(bin_dir, &target_bin, &src_bin, &out_name).map_err(|e| e.message(CLI_IN_PLACE_HINT))?;
-    build_from_plan(&src_bin, &ctx, &chosen_patches, &plan)
+    build_from_plan(&src_bin, &mut ctx, &chosen_patches, &plan)
 }
 
 fn main() {
@@ -4483,8 +5409,8 @@ mod tests {
         assert_eq!(parse("all").unwrap().0, defaults);
         assert_eq!(parse("").unwrap().0, defaults);
 
-        let (ids, ..) = parse("all,release-notes").unwrap();
-        assert_eq!(ids, [defaults.as_slice(), &["release-notes"]].concat());
+        let (ids, ..) = parse("all,patch-info").unwrap();
+        assert_eq!(ids, [defaults.as_slice(), &["patch-info"]].concat());
 
         let (ids, tokens, _) = parse("all,compact=200k").unwrap();
         assert_eq!(ids, [defaults.as_slice(), &["compact"]].concat());
@@ -4542,10 +5468,12 @@ mod tests {
             arch: Arch::X86_64,
             segments: Vec::new(),
             funcs: [("modelutils.modelIDForTier", (0usize, 64usize))].into_iter().collect(),
+            pcln: None,
             compact_tokens: DEFAULT_COMPACT_TOKENS,
             code_theme: DEFAULT_CODE_THEME.to_string(),
             tier_models: default_tier_models(),
             text_section: None,
+            selected_patches: Vec::new(),
         };
         assert_eq!(
             available_model_ids(&ctx),
@@ -4562,10 +5490,12 @@ mod tests {
             arch: Arch::X86_64,
             segments: Vec::new(),
             funcs: [("modelutils.modelIDForTier", (fn_start, fn_end))].into_iter().collect(),
+            pcln: None,
             compact_tokens: DEFAULT_COMPACT_TOKENS,
             code_theme: DEFAULT_CODE_THEME.to_string(),
             tier_models: models.map(str::to_string),
             text_section: None,
+            selected_patches: Vec::new(),
         }
     }
 
@@ -4676,10 +5606,12 @@ mod tests {
                 arch,
                 segments: Vec::new(),
                 funcs: [("modelutils.modelIDForTier", (fn_start, fn_end))].into_iter().collect(),
+                pcln: None,
                 compact_tokens: DEFAULT_COMPACT_TOKENS,
                 code_theme: DEFAULT_CODE_THEME.to_string(),
                 tier_models: [model.to_string(), TIERS[1].default_model.to_string(), TIERS[2].default_model.to_string()],
                 text_section: None,
+                selected_patches: Vec::new(),
             };
             resolve_pro_tier(&ctx)
         };
@@ -4690,10 +5622,12 @@ mod tests {
                 arch: Arch::X86_64,
                 segments: Vec::new(),
                 funcs: [("modelutils.modelIDForTier", (fn_start, fn_end))].into_iter().collect(),
+                pcln: None,
                 compact_tokens: DEFAULT_COMPACT_TOKENS,
                 code_theme: DEFAULT_CODE_THEME.to_string(),
                 tier_models: default_tier_models(),
                 text_section: None,
+                selected_patches: Vec::new(),
             }, 0)
         };
 
@@ -4779,10 +5713,12 @@ mod tests {
                 arch: Arch::X86_64,
                 segments: Vec::new(),
                 funcs,
+                pcln: None,
                 compact_tokens: tokens,
                 code_theme: DEFAULT_CODE_THEME.to_string(),
                 tier_models: default_tier_models(),
                 text_section: None,
+                selected_patches: Vec::new(),
             };
             let edits = resolve_compact(&ctx).expect("합성 바이너리에서 compact 매칭이 성공해야 함");
             assert_eq!(edits.len(), 4);
@@ -4871,10 +5807,12 @@ mod tests {
                 arch: Arch::X86_64,
                 segments: Vec::new(),
                 funcs,
+                pcln: None,
                 compact_tokens: DEFAULT_COMPACT_TOKENS,
                 code_theme: theme.to_string(),
                 tier_models: default_tier_models(),
                 text_section: None,
+                selected_patches: Vec::new(),
             }
         }
 
@@ -4953,10 +5891,12 @@ mod tests {
             arch: Arch::X86_64,
             segments: Vec::new(),
             funcs,
+            pcln: None,
             compact_tokens: DEFAULT_COMPACT_TOKENS,
             code_theme: "vs".to_string(),
             tier_models: default_tier_models(),
             text_section: None,
+            selected_patches: Vec::new(),
         };
         let edits = resolve_code_theme(&ctx).expect("정렬용 NOP이 있어도 code-theme 매칭이 성공해야 함");
         assert_eq!(edits.len(), 2);
@@ -5002,10 +5942,12 @@ mod tests {
                 arch: Arch::X86_64,
                 segments: Vec::new(),
                 funcs,
+                pcln: None,
                 compact_tokens: DEFAULT_COMPACT_TOKENS,
                 code_theme: theme.to_string(),
                 tier_models: default_tier_models(),
                 text_section: None,
+                selected_patches: Vec::new(),
             }
         }
         let ctx_for = |buf, theme| ctx_at(buf, theme, (fn_start, fn_end));
@@ -5049,10 +5991,12 @@ mod tests {
             arch: Arch::X86_64,
             segments: Vec::new(),
             funcs,
+            pcln: None,
             compact_tokens: DEFAULT_COMPACT_TOKENS,
             code_theme: "vs".to_string(),
             tier_models: default_tier_models(),
             text_section: None,
+            selected_patches: Vec::new(),
         };
         let edits = resolve_batch(&ctx).expect("정렬용 NOP이 있어도 batch 매칭이 성공해야 함");
         assert_eq!(edits.len(), 1);
@@ -5086,10 +6030,12 @@ mod tests {
                     arch: Arch::X86_64,
                     segments: Vec::new(),
                     funcs,
+                    pcln: None,
                     compact_tokens: DEFAULT_COMPACT_TOKENS,
                     code_theme: DEFAULT_CODE_THEME.to_string(),
                     tier_models: default_tier_models(),
                     text_section: None,
+                    selected_patches: Vec::new(),
                 };
                 resolve_banner(&ctx).unwrap_or_else(|e| panic!("{round}회차 banner 매칭 실패: {e}"))
             };
@@ -5120,10 +6066,12 @@ mod tests {
                 arch: Arch::X86_64,
                 segments: Vec::new(),
                 funcs: funcs.iter().map(|&(n, s, e)| (n, (s, e))).collect(),
+                pcln: None,
                 compact_tokens: DEFAULT_COMPACT_TOKENS,
                 code_theme: DEFAULT_CODE_THEME.to_string(),
                 tier_models: default_tier_models(),
                 text_section: None,
+                selected_patches: Vec::new(),
             };
             let mut all = Vec::new();
             for r in resolvers {
@@ -5136,7 +6084,7 @@ mod tests {
     }
 
     #[test]
-    fn x86_banner_and_release_notes_share_one_cave_across_repatches() {
+    fn x86_banner_and_patch_info_share_one_cave_across_repatches() {
         // 1.5.9 처럼 0xcc 동굴이 딱 한 곳뿐인 합성 바이너리
         let mut buf = vec![0u8; 8192];
         let cave = 4096usize;
@@ -5162,18 +6110,18 @@ mod tests {
             ("runtime.concatstring2", concat2, concat2 + 64),
             ("runtime.concatstring3", concat3, concat3 + 64),
         ];
-        let both: &[Resolver] = &[resolve_banner, resolve_release_notes];
+        let both: &[Resolver] = &[resolve_banner, resolve_patch_info];
 
         let mut expected = buf.clone();
         apply_x86(&mut expected, &funcs, both).unwrap();
         assert!(expected[cave + CAVE_CHAN_OFF..].starts_with(b"patch v"));
-        assert!(expected[cave + CAVE_NOTES_OFF..].starts_with(b"\n\n"));
+        assert!(expected[cave + CAVE_INFO_OFF..].starts_with(b"\n\n"));
 
         // 같은 조합을 다시 적용 / 하나씩 어느 순서로 적용해도 결과가 같아야 한다
         let mut again = expected.clone();
         apply_x86(&mut again, &funcs, both).unwrap();
         assert_eq!(again, expected);
-        for order in [[resolve_banner as Resolver, resolve_release_notes], [resolve_release_notes, resolve_banner]] {
+        for order in [[resolve_banner as Resolver, resolve_patch_info], [resolve_patch_info, resolve_banner]] {
             let mut b = buf.clone();
             for r in order {
                 apply_x86(&mut b, &funcs, &[r]).unwrap();
@@ -5182,10 +6130,10 @@ mod tests {
             assert_eq!(b, expected);
         }
 
-        // 배치를 알아볼 수 없는 옛 패치본: release-notes 동굴의 banner 몫이 비어 있지 않으면 그 몫에 덮어쓰지 않고
-        // 대체 배치로 다른 0xcc 구간에 쓴다 (노트 뒤에 남은 0xcc 꼬리는 고르지 않는다)
+        // 배치를 알아볼 수 없는 옛 패치본: patch-info 동굴의 banner 몫이 비어 있지 않으면 그 몫에 덮어쓰지 않고
+        // 대체 배치로 다른 0xcc 구간에 쓴다 (정보 뒤에 남은 0xcc 꼬리는 고르지 않는다)
         let mut odd = buf.clone();
-        apply_x86(&mut odd, &funcs, &[resolve_release_notes]).unwrap();
+        apply_x86(&mut odd, &funcs, &[resolve_patch_info]).unwrap();
         odd[cave + CAVE_CHAN_OFF] = 0x00;
         let before = odd.clone();
         apply_x86(&mut odd, &funcs, &[resolve_banner]).unwrap();
@@ -5207,16 +6155,18 @@ mod tests {
             arch: Arch::X86_64,
             segments: Vec::new(),
             funcs: HashMap::new(),
+            pcln: None,
             compact_tokens: DEFAULT_COMPACT_TOKENS,
             code_theme: DEFAULT_CODE_THEME.to_string(),
             tier_models: default_tier_models(),
             text_section: Some((1024, 2000)),
+            selected_patches: Vec::new(),
         };
         assert_eq!(code_cc_runs(&ctx), Ok(vec![(1100, 1140)]));
     }
 
     #[test]
-    fn x86_banner_and_release_notes_split_when_no_big_cave() {
+    fn x86_banner_and_patch_info_split_when_no_big_cave() {
         // agy 1.5.14 linux_x64 처럼 1024바이트 0xcc 동굴이 없고, 함수 사이 0xcc 구간만 있는 합성 바이너리
         let mut buf = vec![0u8; 16384];
         let bwi = (64usize, 256usize);
@@ -5240,22 +6190,35 @@ mod tests {
             ("runtime.concatstring2", concat2, concat2 + 64),
             ("runtime.concatstring3", concat3, concat3 + 64),
         ];
-        // 노트+트램펄린이 딱 들어가는 큰 구간, 채널용 40바이트 구간, 너무 작은 구간들
-        let notes_len = 2 + release_notes_text().len();
+        // 패치 정보+트램펄린이 딱 들어가는 큰 구간, 채널용 40바이트 구간, 너무 작은 구간들
+        let sample_ctx = BinaryContext {
+            data: &[],
+            format: Format::Elf64,
+            arch: Arch::X86_64,
+            segments: Vec::new(),
+            funcs: HashMap::new(),
+            pcln: None,
+            compact_tokens: DEFAULT_COMPACT_TOKENS,
+            code_theme: DEFAULT_CODE_THEME.to_string(),
+            tier_models: default_tier_models(),
+            text_section: None,
+            selected_patches: Vec::new(),
+        };
+        let info_len = 2 + patch_info_text(&sample_ctx).len();
         let n = 8192usize;
-        let notes_end = ((n + notes_len + 15) & !15) + 18;
+        let info_end = ((n + info_len + 15) & !15) + 18;
         buf[1024..1044].fill(0xcc); // 20바이트: 채널에도 작다
         buf[2048..2088].fill(0xcc); // 40바이트: 채널 자리
         buf[3072..3112].fill(0xcc); // 40바이트: 둘째 후보 (첫째만 쓴다)
         let original = buf.clone();
-        let both: &[Resolver] = &[resolve_banner, resolve_release_notes];
+        let both: &[Resolver] = &[resolve_banner, resolve_patch_info];
 
-        let with_notes_run = |end: usize| {
+        let with_info_run = |end: usize| {
             let mut b = original.clone();
             b[n..end].fill(0xcc);
             b
         };
-        let fresh = with_notes_run(notes_end);
+        let fresh = with_info_run(info_end);
         let mut expected = fresh.clone();
         apply_x86(&mut expected, &funcs, both).unwrap();
         let chan_off = (site as i64 + 23 + read_i32(&expected, site + 19) as i64) as usize;
@@ -5269,7 +6232,7 @@ mod tests {
         let mut again = expected.clone();
         apply_x86(&mut again, &funcs, both).unwrap();
         assert_eq!(again, expected);
-        for order in [[resolve_banner as Resolver, resolve_release_notes], [resolve_release_notes, resolve_banner]] {
+        for order in [[resolve_banner as Resolver, resolve_patch_info], [resolve_patch_info, resolve_banner]] {
             let mut b = fresh.clone();
             for r in order {
                 apply_x86(&mut b, &funcs, &[r]).unwrap();
@@ -5278,9 +6241,9 @@ mod tests {
             assert_eq!(b, expected);
         }
 
-        // 노트 구간이 1바이트 모자라면 release-notes 만 실패하고 banner 는 그대로 된다
-        let mut short = with_notes_run(notes_end - 1);
-        assert!(apply_x86(&mut short.clone(), &funcs, &[resolve_release_notes]).is_err());
+        // 패치 정보 구간이 1바이트 모자라면 patch-info 만 실패하고 banner 는 그대로 된다
+        let mut short = with_info_run(info_end - 1);
+        assert!(apply_x86(&mut short.clone(), &funcs, &[resolve_patch_info]).is_err());
         apply_x86(&mut short, &funcs, &[resolve_banner]).unwrap();
         assert_eq!((site as i64 + 23 + read_i32(&short, site + 19) as i64) as usize, 2048);
     }
@@ -5296,10 +6259,12 @@ mod tests {
             arch: Arch::Arm64,
             segments: Vec::new(),
             funcs: funcs.iter().map(|&(n, s, e)| (n, (s, e))).collect(),
+            pcln: None,
             compact_tokens: tokens,
             code_theme: theme.to_string(),
             tier_models: default_tier_models(),
             text_section: None,
+            selected_patches: Vec::new(),
         }
     }
 
@@ -5477,4 +6442,420 @@ mod tests {
         assert_eq!(detect_patched_tier(&a64, 2).as_deref(), Some("gemini-4-neon-medium"));
     }
 
+    #[test]
+    fn pclntab_symbol_lookup_and_filetab_fallback_work() {
+        // Go 1.20+ .gopclntab 합성: 심볼 이름이 미래 버전에서 바뀌어도 filetab("cli/render/markdown.go")과
+        // 문자열 VA 역추적("native" / "<style name=\"...\"")만으로 code-theme 자리를 정확히 찾아낸다.
+        assert_eq!(
+            short_go_symbol("github.com/a/b.(*Foo[github.com/c/d.Bar]).Baz"),
+            "b.(*Foo[github.com/c/d.Bar]).Baz"
+        );
+        assert_eq!(short_go_symbol("strings.Join"), "strings.Join");
+
+        let mut buf = vec![0u8; 4096];
+        let native_tag = b"<style name=\"native\">";
+        let vs_tag = b"<style name=\"vs\">";
+        buf[32..32 + native_tag.len()].copy_from_slice(native_tag);
+        let native_off = 32 + 13;
+        buf[96..96 + vs_tag.len()].copy_from_slice(vs_tag);
+        let vs_off = 96 + 13;
+
+        let go_text_off = 256usize;
+        // fn0 (@256..320): strings.Join
+        // fn1 (@320..512): 미래 버전에서 이름이 바뀐 함수 "google3/cli/render/render.futureThemeSelector"
+        //   앞에 "terminal" 비교 없이 곧장 lea "native"(%rip), %rcx; mov %rcx, 0x20(%rsp); movq $6, 0x28(%rsp)
+        let f1_start = 320usize;
+        let lea_off = f1_start + 16;
+        let lea_next = lea_off + 7;
+        let disp_native = (native_off as i64 - lea_next as i64) as i32;
+        buf[lea_off..lea_off + 3].copy_from_slice(&[0x48, 0x8d, 0x0d]); // lea disp(%rip), %rcx
+        buf[lea_off + 3..lea_next].copy_from_slice(&disp_native.to_le_bytes());
+        buf[lea_next..lea_next + 5].copy_from_slice(&[0x48, 0x89, 0x4c, 0x24, 0x20]); // disp8 store ptr
+        let mov_len_off = lea_next + 5;
+        buf[mov_len_off..mov_len_off + 5].copy_from_slice(&[0x48, 0xc7, 0x44, 0x24, 0x28]); // disp8 store len
+        buf[mov_len_off + 5..mov_len_off + 9].copy_from_slice(&6u32.to_le_bytes());
+
+        // .gopclntab 조립 (@1024)
+        let pcln_base = 1024usize;
+        let funcname_base = pcln_base + 128;
+        let n0 = b"strings.Join\0";
+        let n1 = b"google3/cli/render/render.futureThemeSelector\0";
+        buf[funcname_base..funcname_base + n0.len()].copy_from_slice(n0);
+        buf[funcname_base + n0.len()..funcname_base + n0.len() + n1.len()].copy_from_slice(n1);
+
+        let filetab_base = pcln_base + 256;
+        let f0 = b"strings/strings.go\0";
+        let f1 = b"google3/third_party/cli/render/markdown.go\0";
+        buf[filetab_base..filetab_base + f0.len()].copy_from_slice(f0);
+        buf[filetab_base + f0.len()..filetab_base + f0.len() + f1.len()].copy_from_slice(f1);
+
+        let cu_base = pcln_base + 384;
+        buf[cu_base..cu_base + 4].copy_from_slice(&0u32.to_le_bytes());
+        buf[cu_base + 4..cu_base + 8].copy_from_slice(&(f0.len() as u32).to_le_bytes());
+
+        // pctab: offset 0 은 미사용(0), offset 1 은 sdelta=+1 -> zigzag uvdelta=2 (fno = -1 + 1 = 0)
+        let pctab_base = pcln_base + 448;
+        buf[pctab_base + 1] = 0x02;
+
+        // ftab: nfunc=2 + sentinel 1개 = 24바이트, 뒤에 _func 메타데이터 2개(각 40바이트)
+        let ftab_base = pcln_base + 512;
+        let meta0_rel = 24u32;
+        let meta1_rel = 64u32;
+        buf[ftab_base..ftab_base + 4].copy_from_slice(&0u32.to_le_bytes());
+        buf[ftab_base + 4..ftab_base + 8].copy_from_slice(&meta0_rel.to_le_bytes());
+        buf[ftab_base + 8..ftab_base + 12].copy_from_slice(&((f1_start - go_text_off) as u32).to_le_bytes());
+        buf[ftab_base + 12..ftab_base + 16].copy_from_slice(&meta1_rel.to_le_bytes());
+        buf[ftab_base + 16..ftab_base + 20].copy_from_slice(&(512 - go_text_off as u32).to_le_bytes());
+
+        // _func 0 (strings.Join: nameOff=0, pcfile=1, cuOffset=0)
+        let m0 = ftab_base + meta0_rel as usize;
+        buf[m0 + 4..m0 + 8].copy_from_slice(&0i32.to_le_bytes());
+        buf[m0 + 20..m0 + 24].copy_from_slice(&1u32.to_le_bytes());
+        buf[m0 + 32..m0 + 36].copy_from_slice(&0u32.to_le_bytes());
+
+        // _func 1 (futureThemeSelector: nameOff=n0.len(), pcfile=1, cuOffset=1)
+        let m1 = ftab_base + meta1_rel as usize;
+        buf[m1 + 4..m1 + 8].copy_from_slice(&(n0.len() as i32).to_le_bytes());
+        buf[m1 + 20..m1 + 24].copy_from_slice(&1u32.to_le_bytes());
+        buf[m1 + 32..m1 + 36].copy_from_slice(&1u32.to_le_bytes());
+
+        let pcln = PclnTab {
+            nfunc: 2,
+            go_text_off,
+            funcname_base,
+            cu_base,
+            filetab_base,
+            pctab_base,
+            ftab_base,
+        };
+        assert_eq!(pcln.func_at_entry(&buf, 256), Some("strings.Join"));
+        assert_eq!(pcln.func_at_entry(&buf, 260), None);
+        assert_eq!(pcln.func_at_entry(&buf, f1_start), Some("google3/cli/render/render.futureThemeSelector"));
+        assert_eq!(pcln.func_first_file(&buf, 1), Some("google3/third_party/cli/render/markdown.go"));
+
+        fn make_ctx(b: &[u8], pcln: PclnTab) -> BinaryContext<'_> {
+            BinaryContext {
+                data: b,
+                format: Format::Elf64,
+                arch: Arch::X86_64,
+                segments: Vec::new(),
+                funcs: HashMap::new(), // 심볼 이름 매칭 실패 상황 시뮬레이션
+                pcln: Some(pcln),
+                compact_tokens: DEFAULT_COMPACT_TOKENS,
+                code_theme: "vs".to_string(),
+                tier_models: default_tier_models(),
+                text_section: None,
+                selected_patches: Vec::new(),
+            }
+        }
+
+        assert_eq!(detect_patched_code_theme(&make_ctx(&buf, pcln)), None);
+        let edits =
+            resolve_code_theme(&make_ctx(&buf, pcln)).expect("filetab 폴백 + 문자열 VA 역추적으로 매칭 성공해야 함");
+        apply(&mut buf, edits);
+        assert_eq!(read_i32(&buf, lea_off + 3), (vs_off as i64 - lea_next as i64) as i32);
+        assert_eq!(read_u32(&buf, mov_len_off + 5), 2);
+        assert_eq!(detect_patched_code_theme(&make_ctx(&buf, pcln)).as_deref(), Some("vs"));
+    }
+
+    #[test]
+    fn resolvers_tolerate_stack_offset_register_and_callgraph_variations() {
+        // 1) tilde-strike: disp32 스택 로드 + 정렬 NOP + 다른 인자 순서여도 CALL parser.ScanDelimiter 역참조로 매칭
+        let mut buf = vec![0x90u8; 1024];
+        let scan_delim = 640usize;
+        let parse_fn = (64usize, 256usize);
+        let mov_esi = parse_fn.0 + 20;
+        buf[mov_esi..mov_esi + 5].copy_from_slice(&[0xbe, 0x01, 0x00, 0x00, 0x00]); // mov $1, %esi
+        buf[mov_esi + 5..mov_esi + 13].copy_from_slice(&[0x8b, 0xbc, 0x24, 0x40, 0x01, 0x00, 0x00, 0x90]); // disp32 + nop
+        let call_sd = mov_esi + 13;
+        buf[call_sd] = 0xe8;
+        buf[call_sd + 1..call_sd + 5].copy_from_slice(&((scan_delim as i32) - (call_sd as i32 + 5)).to_le_bytes());
+
+        let ctx = BinaryContext {
+            data: &buf,
+            format: Format::Elf64,
+            arch: Arch::X86_64,
+            segments: Vec::new(),
+            funcs: [
+                ("extension.(*strikethroughParser).Parse", parse_fn),
+                ("parser.ScanDelimiter", (scan_delim, scan_delim + 64)),
+            ]
+            .into_iter()
+            .collect(),
+            pcln: None,
+            compact_tokens: DEFAULT_COMPACT_TOKENS,
+            code_theme: DEFAULT_CODE_THEME.to_string(),
+            tier_models: default_tier_models(),
+            text_section: None,
+            selected_patches: Vec::new(),
+        };
+        let edits = resolve_tilde_strike(&ctx).expect("CALL ScanDelimiter 역참조로 tilde-strike 매칭");
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].offset, mov_esi + 1);
+        assert_eq!(edits[0].payload, vec![0x02]);
+
+        // 2) banner: disp8(5바이트*2=10바이트) 스택 저장 + 49바이트 동적 "stab" 블록 패치 및 재패치
+        let mut bbuf = vec![0u8; 4096];
+        bbuf[2048..3072].fill(0xcc);
+        let bwi = (64usize, 256usize);
+        let bsite = bwi.0 + 16;
+        bbuf[bsite..bsite + 9].copy_from_slice(&[0x48, 0x85, 0xd2, 0x0f, 0x84, 0x80, 0x00, 0x00, 0x00]);
+        let disp8_stores = [0x48, 0x89, 0x5c, 0x24, 0x30, 0x48, 0x89, 0x44, 0x24, 0x38]; // 10바이트
+        bbuf[bsite + 9..bsite + 19].copy_from_slice(&disp8_stores);
+        bbuf[bsite + 19..bsite + 24].copy_from_slice(&[0x48, 0x8b, 0x4c, 0x24, 0x40]); // mov 0x40(%rsp),%rcx
+        bbuf[bsite + 24..bsite + 30].copy_from_slice(&[0x48, 0x83, 0xfa, 0x06, 0x75, 0x13]); // cmp $6,%rdx; jne +0x13 (-> bsite+49)
+        bbuf[bsite + 30..bsite + 36].copy_from_slice(&[0x81, 0x39, 0x73, 0x74, 0x61, 0x62]); // cmpl "stab",(%rcx)
+        bbuf[bsite + 36..bsite + 49].fill(0x90);
+
+        let mut prev_b = Vec::new();
+        for round in 0..2 {
+            let bctx = BinaryContext {
+                data: &bbuf,
+                format: Format::Elf64,
+                arch: Arch::X86_64,
+                segments: Vec::new(),
+                funcs: [("render.BannerWithInfo", bwi)].into_iter().collect(),
+                pcln: None,
+                compact_tokens: DEFAULT_COMPACT_TOKENS,
+                code_theme: DEFAULT_CODE_THEME.to_string(),
+                tier_models: default_tier_models(),
+                text_section: None,
+                selected_patches: Vec::new(),
+            };
+            let bedits = resolve_banner(&bctx).unwrap_or_else(|e| panic!("{round}회차 동적 banner 실패: {e}"));
+            assert_eq!(bedits[1].payload.len(), 49);
+            apply(&mut bbuf, bedits);
+            assert_eq!(&bbuf[bsite..bsite + 10], &disp8_stores);
+            if round == 0 {
+                prev_b = bbuf.clone();
+            }
+        }
+        assert_eq!(bbuf, prev_b);
+
+        // 3) patch-info: 인자 순서 변경 + NOP 삽입에도 CALL strings.Join -> CALL runtime.concatstring2 콜그래프로 매칭
+        let mut rbuf = vec![0u8; 4096];
+        rbuf[2048..3072].fill(0xcc);
+        let bh = (64usize, 256usize);
+        let (join_fn, c2_fn, c3_fn) = (512usize, 576usize, 640usize);
+        let call_join = bh.0 + 24;
+        rbuf[call_join] = 0xe8;
+        rbuf[call_join + 1..call_join + 5].copy_from_slice(&((join_fn as i32) - (call_join as i32 + 5)).to_le_bytes());
+        // 기존 하드코딩 바이트열(48 89 c7 48 89 de ...) 없이 전혀 다른 명령들과 NOP만 배치
+        rbuf[call_join + 5..call_join + 21].fill(0x90);
+        let call_c2 = call_join + 21;
+        rbuf[call_c2] = 0xe8;
+        rbuf[call_c2 + 1..call_c2 + 5].copy_from_slice(&((c2_fn as i32) - (call_c2 as i32 + 5)).to_le_bytes());
+        let rfuncs = [
+            ("render.BuildHeader", bh.0, bh.1),
+            ("strings.Join", join_fn, join_fn + 32),
+            ("runtime.concatstring2", c2_fn, c2_fn + 32),
+            ("runtime.concatstring3", c3_fn, c3_fn + 32),
+        ];
+        apply_x86(&mut rbuf, &rfuncs, &[resolve_patch_info]).expect("콜그래프 기반 patch-info 1회차");
+        let r_once = rbuf.clone();
+        apply_x86(&mut rbuf, &rfuncs, &[resolve_patch_info]).expect("콜그래프 기반 patch-info 2회차 재패치");
+        assert_eq!(rbuf, r_once);
+
+        // 4) cjk-bold: disp32 스택 오프셋(8바이트 movzbl)으로 인해 모든 분기 변위가 달라진 ScanDelimiter 매칭
+        let mut cbuf = vec![0x90u8; 512];
+        let sd = (32usize, 320usize);
+        let p = sd.0 + 16;
+        // left: test %r8b,%r8b (3B); je else1(+23 -> p+28); movzbl 0x126(%rsp),%edx (8B); test %dl,%dl (2B);
+        //       jne mov1(+19 -> p+36); movzbl 0x12a(%rsp),%ebx (8B); jmp after_mov1(+13 -> p+41)
+        // else1(p+28): movzbl 0x126(%rsp),%edx (8B); mov1(p+36): mov $1,%ebx (5B)
+        // after_mov1(p+41): test %dl,%dl (2B); je right_else(+14 -> p+57); mov %eax,%ecx (2B);
+        //                   movzbl 0x12a(%rsp),%edx (8B); xor %eax,%eax (2B); jmp end(+21 -> p+78)
+        // right_else(p+57): movzbl 0x12a(%rsp),%edx (8B); test2(p+65): test %dl,%dl (2B);
+        //                   je else2(+8 -> p+75); test %cl,%cl (2B); jne else2(+4 -> p+75); mov %eax,%ecx (2B); jmp end(+7)
+        // else2(p+75): mov %eax,%ecx (2B); mov $1,%eax (5B)
+        let mut seq = Vec::new();
+        seq.extend_from_slice(&[0x45, 0x84, 0xc0]); // 0..3: test %r8b,%r8b
+        seq.extend_from_slice(&[0x74, 23]); // 3..5: je +23 (-> 28)
+        seq.extend_from_slice(&[0x0f, 0xb6, 0x94, 0x24, 0x26, 0x01, 0x00, 0x00]); // 5..13
+        seq.extend_from_slice(&[0x84, 0xd2, 0x75, 19]); // 13..17 (-> 36)
+        seq.extend_from_slice(&[0x0f, 0xb6, 0x9c, 0x24, 0x2a, 0x01, 0x00, 0x00]); // 17..25
+        seq.extend_from_slice(&[0xeb, 14]); // 25..27 (-> 41)
+        seq.push(0x90); // 27..28 정렬 NOP
+        seq.extend_from_slice(&[0x0f, 0xb6, 0x94, 0x24, 0x26, 0x01, 0x00, 0x00]); // 28..36 (else1)
+        seq.extend_from_slice(&[0xbb, 0x01, 0x00, 0x00, 0x00]); // 36..41 (mov1)
+        seq.extend_from_slice(&[0x84, 0xd2, 0x74, 14]); // 41..45 (-> 59)
+        seq.extend_from_slice(&[0x89, 0xc1]); // 45..47
+        seq.extend_from_slice(&[0x0f, 0xb6, 0x94, 0x24, 0x2a, 0x01, 0x00, 0x00]); // 47..55
+        seq.extend_from_slice(&[0x31, 0xc0, 0xeb, 24]); // 55..59
+        seq.extend_from_slice(&[0x0f, 0xb6, 0x94, 0x24, 0x2a, 0x01, 0x00, 0x00]); // 59..67 (right_else)
+        seq.extend_from_slice(&[0x84, 0xd2, 0x74, 8]); // 67..71 (test2 + br2 @69 -> 79)
+        seq.extend_from_slice(&[0x84, 0xc9, 0x75, 4, 0x89, 0xc1, 0xeb, 7]); // 71..79
+        seq.extend_from_slice(&[0x89, 0xc1, 0xb8, 0x01, 0x00, 0x00, 0x00]); // 79..86 (else2)
+        cbuf[p..p + seq.len()].copy_from_slice(&seq);
+
+        apply_x86(&mut cbuf, &[("parser.ScanDelimiter", sd.0, sd.1)], &[resolve_cjk_bold])
+            .expect("disp32 + REX 변형 ScanDelimiter 매칭");
+        assert_eq!(cbuf[p + 3], 0xeb);
+        assert_eq!(cbuf[p + 69], 0xeb);
+        let c_once = cbuf.clone();
+        apply_x86(&mut cbuf, &[("parser.ScanDelimiter", sd.0, sd.1)], &[resolve_cjk_bold])
+            .expect("disp32 변형 ScanDelimiter 재패치");
+        assert_eq!(cbuf, c_once);
+    }
+
+    #[test]
+    fn real_agy_corpus_all_versions_resolve_and_repatch_cleanly() {
+        // 로컬에 실제 agy 원본 바이너리들이 있을 때만 실행 (CI 환경에서는 조용히 건너뜀, 디스크 쓰기 0)
+        let Some(home) = env::var_os("HOME").map(PathBuf::from) else {
+            return;
+        };
+        let base = home.join(".local/share/mise/installs/agy");
+        for ver in ["1.5.7", "1.5.9", "1.5.10", "1.5.12", "1.5.13", "1.5.14"] {
+            let orig_path = base.join(ver).join("antigravity.orig");
+            if !orig_path.exists() {
+                continue;
+            }
+            let mmap = MmapFile::open(&orig_path).unwrap_or_else(|e| panic!("{ver} 열기 실패: {e}"));
+            let mut buf = mmap.as_slice().to_vec();
+            drop(mmap);
+
+            // 1) 원본 해석 + 심볼 이름 제거 시 filetab 폴백이 정확히 같은 오프셋을 찾는지 교차 검증
+            let first_offsets: (Vec<(&str, Vec<usize>)>, [String; 3]) = {
+                let mut run_ctx = BinaryContext::parse(&buf).unwrap_or_else(|e| panic!("{ver} 파싱 실패: {e}"));
+                assert!(run_ctx.pcln.is_some());
+                assert_eq!(is_unpatched_cut(&run_ctx), Ok(true));
+
+                let fallback_model = KNOWN_MODEL_IDS
+                    .iter()
+                    .copied()
+                    .find(|m| find_model_id_offset(&run_ctx, m).is_ok());
+                if let Some(first_model) = fallback_model {
+                    for i in 0..run_ctx.tier_models.len() {
+                        if find_model_id_offset(&run_ctx, &run_ctx.tier_models[i]).is_err() {
+                            run_ctx.tier_models[i] = first_model.to_string();
+                        }
+                    }
+                }
+                let final_tiers = run_ctx.tier_models.clone();
+
+                let mut fb_run = BinaryContext::parse(&buf).unwrap();
+                fb_run.tier_models = final_tiers.clone();
+                for renamed in [
+                    "store.cutAtRuneBoundary",
+                    "render.renderPlannerBody",
+                    "parser.ScanDelimiter",
+                    "extension.(*strikethroughParser).Parse",
+                    "render.glamourStyleForScheme",
+                    "render.glamourStyle",
+                    "config.applyFeatureProviderCheckpointOverrideConfig",
+                    "utils.GetCheckpointConfig",
+                    "modelutils.modelIDForTier",
+                    "render.BannerWithInfo",
+                    "render.BuildHeader",
+                ] {
+                    fb_run.funcs.remove(renamed);
+                }
+
+                let mut all_edits = Vec::new();
+                let mut recorded = Vec::new();
+                for spec in PATCH_REGISTRY {
+                    if fallback_model.is_none() {
+                        if let Some(ti) = tier_index(spec.id) {
+                            // 모델 문자열 자체가 아직 없던 초기 버전은 티어 분기 사이트 매칭만 검증
+                            assert!(tier_site_found(&run_ctx, TIERS[ti].tier), "{ver} {}: 티어 분기 실패", spec.id);
+                            assert_eq!(
+                                find_tier_site_x86(&run_ctx, TIERS[ti].tier),
+                                find_tier_site_x86(&fb_run, TIERS[ti].tier),
+                                "{ver} {}: filetab 폴백 불일치",
+                                spec.id
+                            );
+                            continue;
+                        }
+                    }
+                    let edits = (spec.resolver)(&run_ctx)
+                        .unwrap_or_else(|e| panic!("{ver} [{}] 1회차 매칭 실패: {e}", spec.id));
+                    let fb_edits = (spec.resolver)(&fb_run)
+                        .unwrap_or_else(|e| panic!("{ver} [{}] filetab 폴백 실패: {e}", spec.id));
+                    let a: Vec<usize> = edits.iter().map(|e| e.offset).collect();
+                    let b: Vec<usize> = fb_edits.iter().map(|e| e.offset).collect();
+                    assert_eq!(a, b, "{ver} [{}] 심볼 경로와 filetab 폴백 오프셋이 다름", spec.id);
+                    recorded.push((spec.id, a));
+                    all_edits.extend(edits);
+                }
+                apply(&mut buf, all_edits);
+                (recorded, final_tiers)
+            };
+
+            // 2) 패치 적용된 인메모리 바이너리를 다시 열어 재패치 멱등성 검증
+            let once = buf.clone();
+            {
+                let mut repatch_ctx = BinaryContext::parse(&buf).unwrap_or_else(|e| panic!("{ver} 재파싱 실패: {e}"));
+                assert_eq!(is_unpatched_cut(&repatch_ctx), Ok(false));
+                assert_eq!(detect_patched_code_theme(&repatch_ctx).as_deref(), Some(DEFAULT_CODE_THEME));
+                assert_eq!(detect_patched_compact_tokens(&repatch_ctx), Some(DEFAULT_COMPACT_TOKENS));
+                repatch_ctx.tier_models = first_offsets.1;
+                let mut all_re_edits = Vec::new();
+                for (id, orig_offs) in &first_offsets.0 {
+                    let spec = PATCH_REGISTRY.iter().find(|p| p.id == *id).unwrap();
+                    let edits = (spec.resolver)(&repatch_ctx)
+                        .unwrap_or_else(|e| panic!("{ver} [{id}] 2회차 재패치 실패: {e}"));
+                    let re_offs: Vec<usize> = edits.iter().map(|e| e.offset).collect();
+                    assert_eq!(&re_offs, orig_offs, "{ver} [{id}] 재패치 오프셋 불일치");
+                    all_re_edits.extend(edits);
+                }
+                apply(&mut buf, all_re_edits);
+            }
+            assert_eq!(buf, once, "{ver} 전체 패치 재적용 결과가 1회차와 바이트 단위로 같아야 함");
+        }
+    }
+
+    #[test]
+    fn patch_info_text_reflects_selected_patches_and_settings() {
+        let ver = format!("v{}", env!("CARGO_PKG_VERSION"));
+        let mut ctx = BinaryContext {
+            data: &[],
+            format: Format::Elf64,
+            arch: Arch::X86_64,
+            segments: Vec::new(),
+            funcs: HashMap::new(),
+            pcln: None,
+            compact_tokens: 180_000,
+            code_theme: "solarized-light".to_string(),
+            tier_models: [
+                "gemini-4-carbon-high".to_string(),
+                "gemini-4-neon-medium".to_string(),
+                "gemini-4-hydrogen-low".to_string(),
+            ],
+            text_section: None,
+            selected_patches: vec!["nodrip", "batch", "code-theme", "compact", "pro-tier", "banner", "patch-info"],
+        };
+        let txt = patch_info_text(&ctx);
+        assert!(!txt.contains(&ver), "banner 활성 시 중복 버전 줄을 생략해야 함");
+        assert!(!txt.contains("banner"), "patches 목록에서 banner 를 제외해야 함");
+        assert!(txt.contains("│ patches   \x1b[0m  nodrip\x1b[90m · \x1b[0mbatch"));
+        assert!(txt.contains("│ theme     \x1b[0m  \x1b[36msolarized-light\x1b[0m  \x1b[90m·  compact\x1b[0m \x1b[36m180k\x1b[0m"));
+        assert!(!txt.contains("tokens"));
+        assert!(txt.contains("│ pro       \x1b[0m  \x1b[36mgemini-4-carbon-high\x1b[0m"));
+        assert!(!txt.contains("│ flash"));
+        assert!(!txt.contains("patch-info"));
+
+        // banner 미선택 + compact 단독 선택 시 버전 줄과 compact 단독 줄 표시
+        ctx.selected_patches = vec!["nodrip", "compact", "patch-info"];
+        let no_banner = patch_info_text(&ctx);
+        assert!(no_banner.contains(&format!("│ patch     \x1b[0m  \x1b[36m{ver}\x1b[0m")));
+        assert!(no_banner.contains("│ compact   \x1b[0m  \x1b[36m180k\x1b[0m"));
+        assert!(!no_banner.contains("│ theme"));
+
+        // patch-info 단독 선택 시 버전 줄 + patches none 표시
+        ctx.selected_patches = vec!["patch-info"];
+        let only_info = patch_info_text(&ctx);
+        assert!(only_info.contains(&ver));
+        assert!(only_info.contains("│ patches   \x1b[0m  \x1b[90mnone\x1b[0m"));
+
+        // 사전 가용성 검사(빈 selected_patches): 전체 기능 기준, 대체 배치 최소(256B) 이상 및 동굴 한도 이내
+        ctx.selected_patches.clear();
+        let full = patch_info_text(&ctx);
+        assert!(full.contains("│ pro       \x1b[0m"));
+        assert!(full.contains("│ flash     \x1b[0m"));
+        assert!(full.contains("│ flash_lite\x1b[0m"));
+        assert!(full.contains("│ theme     \x1b[0m"));
+        assert!(full.contains("compact\x1b[0m \x1b[36m180k\x1b[0m"));
+        assert!(2 + full.len() + 18 >= 256);
+        assert!(2 + full.len() + 32 <= CAVE_MIN - CAVE_INFO_OFF);
+    }
 }

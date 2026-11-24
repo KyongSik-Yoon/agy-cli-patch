@@ -4,7 +4,7 @@
 
 `agy`(Antigravity CLI — **Linux & macOS**, **x86_64 & ARM64/Apple Silicon**) 바이너리의 스트리밍 출력 방식, 마크다운 렌더링 결함, 서브에이전트 모델 티어를 동적 심볼/시그니처 탐색으로 패치하는 초고속 모듈형 도구(Rust)입니다.
 
-릴리즈마다 바뀌는 고정 주소에 의존하지 않고, `mmap` 제로카피 매핑으로 **ELF64**(Linux) 및 **Mach-O 64**(macOS)의 텍스트 섹션과 Go `.gopclntab` 심볼 테이블을 파싱하여 대상 함수를 찾고, 아키텍처별(`x86_64` / `ARM64`) 기계어 시그니처를 검증한 뒤 패치합니다(외부 크레이트 의존성 0, Linux `FICLONE` reflink 및 macOS `codesign -f -s -` 자동 서명 지원). 단, `banner`·`release-notes` 패치는 Linux ARM64에서 지원하지 않고(실행 세그먼트에 문자열·트램펄린을 넣을 여유 공간이 없음), macOS Intel(x86_64)에서는 `release-notes`만 쓸 수 없습니다(노트를 넣을 0xcc 패딩이 부족). macOS Apple Silicon에서는 티어 고정 패치(`pro-tier`·`flash-tier`·`flash-lite-tier`)를 포함한 모든 패치를 쓸 수 있습니다.
+릴리즈마다 바뀌는 고정 주소나 스택 변위에 의존하지 않고, `mmap` 제로카피 매핑으로 **ELF64**(Linux) 및 **Mach-O 64**(macOS)의 텍스트 섹션과 Go `.gopclntab`(`ftab`·`funcname`·`cutab`·`filetab`) 메타데이터를 파싱하여 대상 함수를 찾고, 심볼 이름이 바뀌어도 소스 파일 경로(`filetab`)로 폴백합니다. 함수 내부에서는 `CALL`/`BL` 피호출 심볼 역탐색·문자열 VA 역참조·CFG 분기 추적으로 아키텍처별(`x86_64` / `ARM64`) 패치 지점을 검증한 뒤 적용합니다(외부 크레이트 의존성 0, Linux `FICLONE` reflink 및 macOS `codesign -f -s -` 자동 서명 지원). 단, `banner`·`patch-info` 패치는 Linux ARM64에서 지원하지 않고(실행 세그먼트에 문자열·트램펄린을 넣을 여유 공간이 없음), macOS Intel(x86_64)에서는 `patch-info`만 쓸 수 없습니다(정보 문자열을 넣을 0xcc 패딩이 부족). macOS Apple Silicon에서는 티어 고정 패치(`pro-tier`·`flash-tier`·`flash-lite-tier`)를 포함한 모든 패치를 쓸 수 있습니다.
 
 ## 지원하는 패치 목록 (`--list`)
 
@@ -19,8 +19,8 @@
 | `pro-tier` | `modelutils.modelIDForTier` | `invoke_subagent` 등에서 `pro` 티어가 서버가 계정별로 정한 모델(예: `gemini-4-hydrogen-tiered-xhigh`) 대신 고른 모델(기본 `gemini-4-carbon-high`)로 실행되도록 고정 (**기본 꺼짐**) |
 | `flash-tier` | `modelutils.modelIDForTier` | `flash` 티어를 고른 모델(기본 `gemini-4-neon-medium`)로 고정. `flash_lite`가 없을 때 agy 유틸리티 작업도 이 티어를 씀 (Neon은 1.5.12+, **기본 꺼짐**) |
 | `flash-lite-tier` | `modelutils.modelIDForTier` | `flash_lite` 티어를 고른 모델(기본 `gemini-4-hydrogen-low`)로 고정. agy 유틸리티 작업도 이 티어를 먼저 씀 (Hydrogen은 1.5.9+, **기본 꺼짐**) |
-| `banner` | `render.BannerWithInfo` | 상단 `Antigravity CLI 1.5.7` 옆에 `(patch v0.2.10)` 형태로 패치 버전 표시 (Linux ARM64 제외) |
-| `release-notes` | `render.BuildHeader` | 로고 아래에 패치 기능 요약 및 GitHub 저장소 정보 표시 (Linux ARM64·macOS Intel 제외, **기본 꺼짐** — `-p all,release-notes`처럼 명시해야 적용) |
+| `banner` | `render.BannerWithInfo` | 상단 `Antigravity CLI 1.5.7` 옆에 `(patch v0.3.0)` 형태로 패치 버전 표시 (Linux ARM64 제외) |
+| `patch-info` | `render.BuildHeader` | 로고 아래에 적용된 패치 목록과 모델 티어·컴팩션·코드 테마 설정 표시 (Linux ARM64·macOS Intel 제외, **기본 꺼짐** — `-p all,patch-info`처럼 명시해야 적용) |
 
 ## 설치 및 빌드
 
@@ -72,11 +72,8 @@ agy-cli-patch --list
 # 기본 활성 패치 전체를 적용해 agy-batch 생성 ('all'은 기본 꺼짐 패치를 포함하지 않음)
 agy-cli-patch -p all -o agy-batch
 
-# 릴리즈 노트 배너까지 포함
-agy-cli-patch -p all,release-notes -o agy-batch
-
-# 릴리즈 노트를 터미널에서 확인 (바이너리는 건드리지 않음)
-agy-cli-patch --notes
+# 시작 화면 배너 아래에 적용된 패치·설정 요약까지 표시
+agy-cli-patch -p all,patch-info -o agy-batch
 
 # 바이너리에 고정된 서브에이전트 티어 표를 한 줄로 확인 (읽기 전용, 고정 안 됐으면 빈 줄)
 agy-cli-patch --tiers
